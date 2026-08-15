@@ -32,7 +32,7 @@ DEFAULT_AGENTS = {
 ROOM_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
 MENTION_RE = re.compile(r"^@([a-z0-9_,@-]+)\s+(.*)$", re.DOTALL)
 REPLY_TOKEN_RE = re.compile(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})")
-TUI_TIMESTAMP_RE = re.compile(r"[ \t]{2,}\d{1,2}:\d{2}\s+[AP]M[ \t]*(?:\n[ \t]*)?")
+TUI_TIMESTAMP_RE = re.compile(r"[ \t]{2,}\d{1,2}:\d{2}\s+[AP]M[ \t█]*(?:\n[ \t]*)?")
 
 
 class ChatError(RuntimeError):
@@ -224,16 +224,17 @@ def extract_reply(terminal: str, token: str) -> str:
         compact = "".join(value.split())
         return re.compile(r"[ \t\r\n]*".join(re.escape(char) for char in compact))
 
+    clean_terminal = TUI_TIMESTAMP_RE.sub(" ", terminal)
     start = wrapped_literal(f"HGCHAT_REPLY_BEGIN {token}")
     end = wrapped_literal(f"HGCHAT_REPLY_END {token}")
-    start_matches = list(start.finditer(terminal))
+    start_matches = list(start.finditer(clean_terminal))
     if not start_matches:
         raise ChatError("agent response marker was not found")
     body_start = start_matches[-1].end()
-    end_match = end.search(terminal, body_start)
+    end_match = end.search(clean_terminal, body_start)
     if end_match is None:
         raise ChatError("agent response did not finish")
-    body = TUI_TIMESTAMP_RE.sub(" ", terminal[body_start : end_match.start()]).strip()
+    body = clean_terminal[body_start : end_match.start()].strip()
     if not body:
         raise ChatError("agent returned an empty response")
     return body

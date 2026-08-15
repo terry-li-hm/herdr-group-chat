@@ -126,6 +126,20 @@ def test_extract_reply_accepts_terminal_wrapping_inside_markers() -> None:
     assert extract_reply(terminal, token) == "wrapped answer"
 
 
+def test_extract_reply_ignores_grok_timestamp_on_marker_line() -> None:
+    token = "d" * 32
+    terminal = (
+        "HGCHAT_REPLY_BEGIN               1:55 PM   █\n"
+        f"{token[:30]}\n"
+        f"{token[30:]}\n"
+        "Grok answer\n"
+        "HGCHAT_REPLY_END\n"
+        f"{token[:30]}\n"
+        f"{token[30:]}\n"
+    )
+    assert extract_reply(terminal, token) == "Grok answer"
+
+
 def test_extract_reply_removes_grok_tui_timestamp_chrome() -> None:
     token = "b" * 32
     terminal = (
