@@ -1,0 +1,29 @@
+[project]
+name = "herdr-group-chat"
+version = "0.1.0"
+description = "A thin local group-chat TUI for agents already running in Herdr."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "pytest>=9.0",
+  "ruff>=0.14",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["assays"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP", "RUF", "SIM", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+"assays/*" = ["S101"]

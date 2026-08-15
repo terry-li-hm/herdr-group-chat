@@ -1,0 +1,439 @@
+#!/usr/bin/env -S uv run --script --python 3.13
+# /// script
+# requires-python = ">=3.13"
+# dependencies = []
+# ///
+"""A thin local group-chat TUI for agents already running in Herdr."""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import json
+import os
+import re
+import subprocess
+import sys
+import textwrap
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Sequence
+
+DEFAULT_AGENTS = {
+    "pi": "pi-peer",
+    "claude": "claude-peer",
+    "grok": "grok-peer",
+}
+ROOM_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
+MENTION_RE = re.compile(r"^@([a-z0-9_,@-]+)\s+(.*)$", re.DOTALL)
+REPLY_TOKEN_RE = re.compile(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})")
+TUI_TIMESTAMP_RE = re.compile(r"[ \t]{2,}\d{1,2}:\d{2}\s+[AP]M[ \t]*(?:\n[ \t]*)?")
+
+
+class ChatError(RuntimeError):
+    """A user-visible relay failure."""
+
+
+class AgentClient(Protocol):
+    def live_targets(self) -> set[str]: ...
+
+    def turn(self, target: str, prompt: str) -> tuple[str, str]: ...
+
+
+@dataclass(frozen=True)
+class Route:
+    recipients: tuple[str, ...]
+    body: str
+
+
+def utc_now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def parse_route(text: str, known_agents: Sequence[str]) -> Route:
+    stripped = text.strip()
+    if not stripped:
+        raise ChatError("message is empty")
+    match = MENTION_RE.match(stripped)
+    if not match:
+        return Route(tuple(known_agents), stripped)
+
+    raw_recipients, body = match.groups()
+    requested = [item.removeprefix("@").strip() for item in raw_recipients.split(",")]
+    if "all" in requested:
+        recipients = list(known_agents)
+    else:
+        recipients = []
+        for name in requested:
+            if name not in known_agents:
+                raise ChatError(f"unknown participant: @{name}")
+            if name not in recipients:
+                recipients.append(name)
+    if not recipients:
+        raise ChatError("no recipients selected")
+    if not body.strip():
+        raise ChatError("message is empty")
+    return Route(tuple(recipients), body.strip())
+
+
+class Transcript:
+    def __init__(self, state_dir: Path, room: str) -> None:
+        if not ROOM_RE.fullmatch(room):
+            raise ChatError("room must match [a-z0-9][a-z0-9_-]{0,31}")
+        self.state_dir = state_dir.expanduser()
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.state_dir, 0o700)
+        self.path = self.state_dir / f"{room}.jsonl"
+        self.cursor_path = self.state_dir / f"{room}.state.json"
+
+    def read(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        messages: list[dict[str, Any]] = []
+        for line_number, line in enumerate(
+            self.path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ChatError(f"invalid transcript line {line_number}: {error}") from error
+            if not isinstance(item, dict) or not isinstance(item.get("seq"), int):
+                raise ChatError(f"invalid transcript line {line_number}")
+            messages.append(item)
+        return messages
+
+    def append(self, sender: str, recipients: Iterable[str], body: str) -> dict[str, Any]:
+        messages = self.read()
+        item = {
+            "seq": (messages[-1]["seq"] + 1) if messages else 1,
+            "at": utc_now(),
+            "sender": sender,
+            "recipients": list(recipients),
+            "body": body.strip(),
+        }
+        with self.path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(self.path, 0o600)
+        return item
+
+    def cursors(self) -> dict[str, int]:
+        if not self.cursor_path.exists():
+            return {}
+        try:
+            data = json.loads(self.cursor_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as error:
+            raise ChatError(f"invalid room state: {error}") from error
+        if not isinstance(data, dict) or not all(
+            isinstance(key, str) and isinstance(value, int) for key, value in data.items()
+        ):
+            raise ChatError("invalid room state")
+        return data
+
+    def save_cursors(self, cursors: dict[str, int]) -> None:
+        temporary = self.cursor_path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(cursors, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        temporary.replace(self.cursor_path)
+
+
+class HerdrClient:
+    def __init__(
+        self,
+        herdr_bin: str = "herdr",
+        timeout_ms: int = 180_000,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    ) -> None:
+        self.herdr_bin = herdr_bin
+        self.timeout_ms = timeout_ms
+        self.runner = runner
+
+    def _run(self, arguments: list[str], timeout: float = 30) -> subprocess.CompletedProcess[str]:
+        try:
+            result = self.runner(
+                [self.herdr_bin, *arguments],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ChatError(f"Herdr command failed: {error}") from error
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            raise ChatError(f"Herdr command failed: {detail}")
+        return result
+
+    def live_targets(self) -> set[str]:
+        result = self._run(["agent", "list"])
+        try:
+            payload = json.loads(result.stdout)
+            agents = payload["result"]["agents"]
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raise ChatError("Herdr returned an invalid agent list") from error
+        return {item["name"] for item in agents if isinstance(item, dict) and item.get("name")}
+
+    def turn(self, target: str, prompt: str) -> tuple[str, str]:
+        result = self._run(
+            [
+                "agent",
+                "prompt",
+                target,
+                prompt,
+                "--wait",
+                "--until",
+                "idle",
+                "--until",
+                "done",
+                "--until",
+                "blocked",
+                "--timeout",
+                str(self.timeout_ms),
+            ],
+            timeout=(self.timeout_ms / 1000) + 20,
+        )
+        try:
+            status = json.loads(result.stdout)["result"]["agent"]["agent_status"]
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raise ChatError(f"Herdr returned an invalid result for {target}") from error
+        if status == "blocked":
+            return "blocked", ""
+
+        terminal = self._run(
+            ["agent", "read", target, "--source", "recent-unwrapped", "--lines", "240"]
+        ).stdout
+        token_match = REPLY_TOKEN_RE.search(prompt)
+        if token_match is None:
+            raise ChatError("relay prompt has no reply token")
+        return status, extract_reply(terminal, token_match.group(1))
+
+
+def extract_reply(terminal: str, token: str) -> str:
+    start = f"HGCHAT_REPLY_BEGIN {token}"
+    end = f"HGCHAT_REPLY_END {token}"
+    start_index = terminal.rfind(start)
+    if start_index < 0:
+        raise ChatError("agent response marker was not found")
+    body_start = start_index + len(start)
+    end_index = terminal.find(end, body_start)
+    if end_index < 0:
+        raise ChatError("agent response did not finish")
+    body = TUI_TIMESTAMP_RE.sub(" ", terminal[body_start:end_index]).strip()
+    if not body:
+        raise ChatError("agent returned an empty response")
+    return body
+
+
+def format_context(messages: Sequence[dict[str, Any]]) -> str:
+    if not messages:
+        return "(No new group messages.)"
+    return "\n\n".join(f"[{item['sender']}] {item['body']}" for item in messages)
+
+
+def build_prompt(agent: str, messages: Sequence[dict[str, Any]], token: str) -> str:
+    return (
+        f"You are @{agent}, a full participant in a local group chat with a human, "
+        "Pi, Claude Code, and Grok Build. Keep your normal capabilities and instructions. "
+        "Respond to the room as yourself. Use your ordinary tools when the task requires "
+        "them, but do not use Herdr to relay this reply because the group-chat relay handles "
+        "delivery.\n\n"
+        "New room messages since your last delivered turn:\n\n"
+        f"{format_context(messages)}\n\n"
+        "Return one direct group-chat message. Wrap only that message between these marker "
+        "lines:\n"
+        f"HGCHAT_REPLY_BEGIN {token}\n"
+        f"HGCHAT_REPLY_END {token}\n"
+    )
+
+
+class GroupChat:
+    def __init__(
+        self,
+        transcript: Transcript,
+        agents: dict[str, str],
+        client: AgentClient,
+        max_turns: int = 3,
+    ) -> None:
+        if max_turns < 1:
+            raise ChatError("max turns must be positive")
+        self.transcript = transcript
+        self.agents = agents
+        self.client = client
+        self.max_turns = max_turns
+
+    def dispatch(self, text: str) -> list[dict[str, Any]]:
+        route = parse_route(text, tuple(self.agents))
+        selected = route.recipients[: self.max_turns]
+        targets = self.client.live_targets()
+        missing = [name for name in selected if self.agents[name] not in targets]
+        if missing:
+            labels = ", ".join(f"@{name}" for name in missing)
+            raise ChatError(f"participant not live in Herdr: {labels}")
+
+        created = [self.transcript.append("human", selected, route.body)]
+        cursors = self.transcript.cursors()
+        for agent in selected:
+            messages = [
+                item
+                for item in self.transcript.read()
+                if item["seq"] > cursors.get(agent, 0) and item["sender"] != agent
+            ]
+            token = uuid.uuid4().hex
+            prompt = build_prompt(agent, messages, token)
+            try:
+                status, reply = self.client.turn(self.agents[agent], prompt)
+                if status == "blocked":
+                    item = self.transcript.append(
+                        "system",
+                        ("human",),
+                        f"@{agent} is blocked and needs attention in Herdr.",
+                    )
+                else:
+                    item = self.transcript.append(agent, ("human", "all"), reply)
+            except ChatError as error:
+                item = self.transcript.append("system", ("human",), f"@{agent}: {error}")
+            created.append(item)
+            cursors[agent] = item["seq"]
+            self.transcript.save_cursors(cursors)
+        return created
+
+
+def parse_agent_overrides(values: Sequence[str]) -> dict[str, str]:
+    agents = dict(DEFAULT_AGENTS)
+    for value in values:
+        if "=" not in value:
+            raise ChatError("--agent must be NAME=HERDR_TARGET")
+        name, target = value.split("=", 1)
+        if name not in DEFAULT_AGENTS or not target:
+            raise ChatError(f"invalid agent mapping: {value}")
+        agents[name] = target
+    return agents
+
+
+def message_lines(messages: Sequence[dict[str, Any]], width: int) -> list[str]:
+    lines: list[str] = []
+    for item in messages:
+        prefix = f"{item['sender']}> "
+        paragraphs = str(item["body"]).splitlines() or [""]
+        first = True
+        for paragraph in paragraphs:
+            wrapped = textwrap.wrap(
+                paragraph,
+                width=max(10, width - len(prefix)),
+                replace_whitespace=False,
+                drop_whitespace=True,
+            ) or [""]
+            for line in wrapped:
+                lines.append((prefix if first else " " * len(prefix)) + line)
+                first = False
+        lines.append("")
+    return lines
+
+
+def draw_tui(
+    screen: curses.window,
+    transcript: Transcript,
+    room: str,
+    buffer: str,
+    status: str,
+) -> None:
+    screen.erase()
+    height, width = screen.getmaxyx()
+    header = f" Herdr group chat: {room} | @pi @claude @grok @all | Ctrl-Q exits "
+    try:
+        screen.addnstr(0, 0, header, width - 1, curses.A_REVERSE)
+        lines = message_lines(transcript.read(), width - 2)
+        available = max(1, height - 4)
+        for row, line in enumerate(lines[-available:], start=1):
+            screen.addnstr(row, 1, line, width - 2)
+        screen.addnstr(height - 3, 0, status, width - 1, curses.A_DIM)
+        prompt = f"> {buffer}"
+        screen.addnstr(height - 2, 0, prompt, width - 1)
+        screen.move(height - 2, min(width - 1, len(prompt)))
+    except curses.error:
+        pass
+    screen.refresh()
+
+
+def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
+    curses.curs_set(1)
+    screen.keypad(True)
+    buffer = ""
+    status = "Plain messages address @all. Responses are serialized and capped at three."
+    while True:
+        draw_tui(screen, chat.transcript, room, buffer, status)
+        key = screen.get_wch()
+        if key in ("\x03", "\x11"):
+            return
+        if key in ("\n", "\r"):
+            if not buffer.strip():
+                continue
+            status = "Waiting for the addressed agents..."
+            draw_tui(screen, chat.transcript, room, "", status)
+            try:
+                chat.dispatch(buffer)
+                status = "Delivered."
+            except ChatError as error:
+                status = str(error)
+            buffer = ""
+            continue
+        if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+            buffer = buffer[:-1]
+            continue
+        if isinstance(key, str) and key.isprintable():
+            buffer += key
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--room", default="cockpit")
+    parser.add_argument("--state-dir", type=Path, default=Path("~/.local/state/herdr-group-chat"))
+    parser.add_argument("--max-turns", type=int, default=3)
+    parser.add_argument("--timeout-ms", type=int, default=180_000)
+    parser.add_argument("--agent", action="append", default=[], metavar="NAME=TARGET")
+    parser.add_argument("--once", metavar="MESSAGE")
+    parser.add_argument("--show", action="store_true")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        transcript = Transcript(args.state_dir, args.room)
+        if args.show:
+            for line in message_lines(transcript.read(), 100):
+                print(line)
+            return 0
+        agents = parse_agent_overrides(args.agent)
+        chat = GroupChat(
+            transcript,
+            agents,
+            HerdrClient(timeout_ms=args.timeout_ms),
+            max_turns=args.max_turns,
+        )
+        if args.once is not None:
+            for item in chat.dispatch(args.once):
+                print(f"{item['sender']}> {item['body']}")
+            return 0
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            raise ChatError("interactive mode requires a TTY; use --once or --show")
+        curses.wrapper(run_tui, chat, args.room)
+        return 0
+    except ChatError as error:
+        print(f"herdr-group-chat: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
