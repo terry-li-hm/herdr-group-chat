@@ -1,0 +1,287 @@
+#!/usr/bin/env -S uv run --script --python 3.13
+# /// script
+# requires-python = ">=3.13"
+# dependencies = []
+# ///
+"""Start missing Herdr peers, then replace this setup pane with a fresh room."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from contextlib import suppress
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+PARTICIPANTS = (
+    ("pi", "pi-peer"),
+    ("claude", "claude-peer"),
+    ("codex", "codex-peer"),
+    ("grok", "grok-peer"),
+)
+
+
+class BootstrapError(RuntimeError):
+    """A user-visible setup failure."""
+
+
+def run_json(herdr_bin: str, arguments: list[str], timeout: int = 30) -> dict[str, Any]:
+    result = subprocess.run(
+        [herdr_bin, *arguments],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=timeout,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown Herdr error"
+        raise BootstrapError(detail)
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise BootstrapError("Herdr returned invalid JSON") from error
+    if not isinstance(payload, dict):
+        raise BootstrapError("Herdr returned an invalid response")
+    return payload
+
+
+def wait_for_shell(herdr_bin: str, pane_id: str, timeout: float = 10) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        payload = run_json(herdr_bin, ["pane", "process-info", "--pane", pane_id])
+        processes = (
+            payload.get("result", {}).get("process_info", {}).get("foreground_processes", [])
+        )
+        if len(processes) == 1 and processes[0].get("name") in {
+            "bash",
+            "fish",
+            "nu",
+            "sh",
+            "zsh",
+        }:
+            return
+        time.sleep(0.1)
+    raise BootstrapError("new tab did not reach an interactive shell")
+
+
+def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> None:
+    """Dismiss Codex's notice without trusting hooks the user has not reviewed."""
+    payload = run_json(
+        herdr_bin,
+        ["pane", "read", pane_id, "--source", "visible", "--lines", "80"],
+    )
+    text = payload.get("result", {}).get("read", {}).get("text", "")
+    if "Press t to trust all; enter to review hooks; esc to close" not in text:
+        return
+    run_json(herdr_bin, ["agent", "send-keys", name, "esc"])
+    print("notice @codex unreviewed hooks left inactive", flush=True)
+
+
+def ensure_agents_workspace(herdr_bin: str, cwd: str) -> tuple[str, str | None]:
+    listed = run_json(herdr_bin, ["workspace", "list"])
+    workspaces = listed.get("result", {}).get("workspaces", [])
+    for workspace in workspaces:
+        if isinstance(workspace, dict) and workspace.get("label") == "agents":
+            return str(workspace["workspace_id"]), None
+    created = run_json(
+        herdr_bin,
+        ["workspace", "create", "--cwd", cwd, "--label", "agents", "--no-focus"],
+    )
+    return (
+        str(created["result"]["workspace"]["workspace_id"]),
+        str(created["result"]["tab"]["tab_id"]),
+    )
+
+
+def plugin_context() -> dict[str, Any]:
+    try:
+        context = json.loads(os.environ.get("HERDR_PLUGIN_CONTEXT_JSON", "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return context if isinstance(context, dict) else {}
+
+
+def chat_workspace(herdr_bin: str, cwd: str) -> tuple[str, str | None]:
+    listed = run_json(herdr_bin, ["workspace", "list"])
+    workspaces = listed.get("result", {}).get("workspaces", [])
+    for preferred_label in ("group-chat", "herdr-group-chat"):
+        for workspace in workspaces:
+            if isinstance(workspace, dict) and workspace.get("label") == preferred_label:
+                workspace_id = str(workspace["workspace_id"])
+                run_json(herdr_bin, ["workspace", "rename", workspace_id, "group-chat"])
+                return workspace_id, None
+    for workspace in workspaces:
+        if isinstance(workspace, dict) and workspace.get("label") != "agents":
+            workspace_id = str(workspace["workspace_id"])
+            run_json(herdr_bin, ["workspace", "rename", workspace_id, "group-chat"])
+            return workspace_id, None
+    created = run_json(
+        herdr_bin,
+        ["workspace", "create", "--cwd", cwd, "--label", "group-chat", "--no-focus"],
+    )
+    return (
+        str(created["result"]["workspace"]["workspace_id"]),
+        str(created["result"]["tab"]["tab_id"]),
+    )
+
+
+def launch_room(open_existing: bool) -> int:
+    herdr_bin = os.environ.get("HERDR_BIN_PATH", "herdr")
+    context = plugin_context()
+    cwd = str(context.get("focused_pane_cwd") or context.get("workspace_cwd") or Path.cwd())
+    workspace_id, placeholder_tab_id = chat_workspace(herdr_bin, cwd)
+
+    if open_existing:
+        panes = run_json(herdr_bin, ["pane", "list", "--workspace", workspace_id])
+        for pane in panes.get("result", {}).get("panes", []):
+            if isinstance(pane, dict) and pane.get("label") in {"Group chat", "New group chat"}:
+                response = run_json(herdr_bin, ["tab", "focus", str(pane["tab_id"])])
+                print(json.dumps(response, separators=(",", ":")))
+                return 0
+
+    plugin_id = os.environ.get("HERDR_PLUGIN_ID", "terry.herdr-group-chat")
+    entrypoint = "room" if open_existing else "new-room"
+    response = run_json(
+        herdr_bin,
+        [
+            "plugin",
+            "pane",
+            "open",
+            "--plugin",
+            plugin_id,
+            "--entrypoint",
+            entrypoint,
+            "--placement",
+            "tab",
+            "--workspace",
+            workspace_id,
+            "--cwd",
+            cwd,
+            "--focus",
+        ],
+    )
+    tab_id = response["result"]["plugin_pane"]["pane"]["tab_id"]
+    run_json(herdr_bin, ["tab", "rename", str(tab_id), "group-chat"])
+    if placeholder_tab_id:
+        with suppress(BootstrapError):
+            run_json(herdr_bin, ["tab", "close", placeholder_tab_id])
+    print(json.dumps(response, separators=(",", ":")))
+    return 0
+
+
+def main() -> int:
+    herdr_bin = os.environ.get("HERDR_BIN_PATH", "herdr")
+    workspace_id = os.environ.get("HERDR_WORKSPACE_ID", "").strip()
+    tab_id = os.environ.get("HERDR_TAB_ID", "").strip()
+    if not workspace_id:
+        raise BootstrapError("New group chat must run inside a Herdr workspace")
+
+    context = plugin_context()
+    agent_cwd = str(context.get("focused_pane_cwd") or context.get("workspace_cwd") or Path.cwd())
+    agents_workspace_id, placeholder_tab_id = ensure_agents_workspace(herdr_bin, agent_cwd)
+
+    listed = run_json(herdr_bin, ["agent", "list"])
+    agents = listed.get("result", {}).get("agents", [])
+    live_agents = {
+        item["name"]: item for item in agents if isinstance(item, dict) and item.get("name")
+    }
+
+    failures: list[str] = []
+    for kind, name in PARTICIPANTS:
+        live_agent = live_agents.get(name)
+        if live_agent is not None:
+            if live_agent.get("workspace_id") != agents_workspace_id:
+                run_json(
+                    herdr_bin,
+                    [
+                        "pane",
+                        "move",
+                        str(live_agent["pane_id"]),
+                        "--new-tab",
+                        "--workspace",
+                        agents_workspace_id,
+                        "--label",
+                        kind,
+                        "--no-focus",
+                    ],
+                )
+                print(f"hide   @{kind} in agents workspace", flush=True)
+            print(f"ready  @{kind} (existing {name})", flush=True)
+            continue
+        print(f"start  @{kind}", flush=True)
+        try:
+            created = run_json(
+                herdr_bin,
+                [
+                    "tab",
+                    "create",
+                    "--workspace",
+                    agents_workspace_id,
+                    "--cwd",
+                    agent_cwd,
+                    "--label",
+                    kind,
+                    "--no-focus",
+                ],
+            )
+            pane_id = created["result"]["root_pane"]["pane_id"]
+            wait_for_shell(herdr_bin, pane_id)
+            run_json(
+                herdr_bin,
+                [
+                    "agent",
+                    "start",
+                    name,
+                    "--kind",
+                    kind,
+                    "--pane",
+                    pane_id,
+                    "--timeout",
+                    "120000",
+                ],
+                timeout=140,
+            )
+            dismiss_inactive_hook_notice(herdr_bin, name, pane_id)
+            print(f"ready  @{kind}", flush=True)
+        except (BootstrapError, KeyError, TypeError) as error:
+            failures.append(f"@{kind}: {error}")
+            print(f"failed @{kind}", flush=True)
+
+    if placeholder_tab_id:
+        with suppress(BootstrapError):
+            run_json(herdr_bin, ["tab", "close", placeholder_tab_id])
+
+    if tab_id:
+        with suppress(BootstrapError):
+            run_json(herdr_bin, ["tab", "rename", tab_id, "group-chat"])
+
+    if failures:
+        print("\nUnavailable participants:", flush=True)
+        for failure in failures:
+            print(f"- {failure}", flush=True)
+        print("\nOpening the room with the available peers...", flush=True)
+    else:
+        print("\nAll participants ready. Opening the room...", flush=True)
+
+    room = datetime.now().strftime("chat-%Y%m%d-%H%M%S")
+    executable = Path(__file__).resolve().parent / "herdr-group-chat"
+    os.execv(str(executable), [str(executable), "--room", room])
+
+
+if __name__ == "__main__":
+    try:
+        if sys.argv[1:] == ["--launch"]:
+            raise SystemExit(launch_room(open_existing=False))
+        if sys.argv[1:] == ["--open"]:
+            raise SystemExit(launch_room(open_existing=True))
+        if sys.argv[1:]:
+            raise BootstrapError(f"unknown arguments: {' '.join(sys.argv[1:])}")
+        raise SystemExit(main())
+    except BootstrapError as error:
+        print(f"new-room: {error}", file=sys.stderr)
+        raise SystemExit(2) from error

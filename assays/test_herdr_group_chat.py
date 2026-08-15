@@ -28,14 +28,31 @@ extract_grok_session_reply = namespace["extract_grok_session_reply"]
 build_prompt = namespace["build_prompt"]
 parse_route = namespace["parse_route"]
 resolve_state_dir = namespace["resolve_state_dir"]
+participant_status = namespace["participant_status"]
+handle_local_command = namespace["handle_local_command"]
 
 
 class FakeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.focused: list[str] = []
 
     def live_targets(self) -> set[str]:
         return {"pi-peer", "claude-peer", "codex-peer", "grok-peer"}
+
+    def states(self) -> dict[str, str]:
+        return {
+            "pi-peer": "idle",
+            "claude-peer": "working",
+            "codex-peer": "done",
+            "grok-peer": "blocked",
+        }
+
+    def focus(self, target: str) -> None:
+        self.focused.append(target)
+
+    def focus_workspace(self, label: str) -> None:
+        self.focused.append(f"workspace:{label}")
 
     def turn(self, target: str, prompt: str) -> tuple[str, str]:
         self.calls.append((target, prompt))
@@ -65,6 +82,25 @@ def test_plain_message_routes_to_all_in_stable_order() -> None:
     assert parse_route("hello", ("pi", "claude", "codex", "grok")) == Route(
         ("pi", "claude", "codex", "grok"), "hello"
     )
+
+
+def test_participant_status_normalizes_ready_and_preserves_attention_states(
+    tmp_path: Path,
+) -> None:
+    chat, _, _ = make_chat(tmp_path)
+    assert participant_status(chat, "Ready.") == (
+        "Ready. @pi ready · @claude working · @codex ready · @grok blocked"
+    )
+
+
+def test_local_navigation_commands_focus_agents_without_entering_transcript(tmp_path: Path) -> None:
+    chat, client, transcript = make_chat(tmp_path)
+    assert handle_local_command("/show codex", chat) == "Focused @codex."
+    assert handle_local_command("/agents", chat) == "Focused the agents workspace."
+    assert handle_local_command("/show nobody", chat) == "Unknown participant: nobody"
+    assert handle_local_command("ordinary message", chat) is None
+    assert client.focused == ["codex-peer", "workspace:agents"]
+    assert transcript.read() == []
 
 
 def test_mentions_route_to_named_agents_and_reject_unknown() -> None:
@@ -269,12 +305,13 @@ def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:
     project = tomllib.loads((EFFECTOR.parent / "pyproject.toml").read_text(encoding="utf-8"))
     assert manifest["min_herdr_version"] == "0.8.0"
     assert manifest["version"] == project["project"]["version"]
-    assert [action["id"] for action in manifest["actions"]] == ["open"]
-    assert [pane["id"] for pane in manifest["panes"]] == ["room"]
-    assert manifest["panes"][0]["placement"] == "tab"
+    assert [action["id"] for action in manifest["actions"]] == ["new", "open"]
+    assert [pane["id"] for pane in manifest["panes"]] == ["new-room", "room"]
+    assert all(pane["placement"] == "tab" for pane in manifest["panes"])
     assert "events" not in manifest
     assert "startup" not in manifest
-    for command in (manifest["actions"][0]["command"], manifest["panes"][0]["command"]):
+    commands = [item["command"] for item in (*manifest["actions"], *manifest["panes"])]
+    for command in commands:
         target = EFFECTOR.parent / command[0]
         assert target.is_file()
         assert access(target, X_OK)

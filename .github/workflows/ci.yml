@@ -24,7 +24,6 @@ jobs:
           enable-cache: true
       - run: uv sync --locked
       - run: uv run pytest -q
-      - run: uv run ruff check herdr-group-chat assays/test_herdr_group_chat.py
-      - run: uv run ruff format --check herdr-group-chat assays/test_herdr_group_chat.py
-      - run: sh -n open-room
-      - run: test -x herdr-group-chat && test -x open-room
+      - run: uv run ruff check herdr-group-chat new-room assays/test_herdr_group_chat.py
+      - run: uv run ruff format --check herdr-group-chat new-room assays/test_herdr_group_chat.py
+      - run: test -x herdr-group-chat && test -x new-room

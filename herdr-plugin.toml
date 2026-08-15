@@ -6,10 +6,22 @@ description = "A shared local room for full native AI coding agents managed by H
 platforms = ["macos", "linux"]
 
 [[actions]]
+id = "new"
+title = "New group chat"
+contexts = ["workspace", "tab", "pane"]
+command = ["./new-room", "--launch"]
+
+[[actions]]
 id = "open"
 title = "Open group chat"
 contexts = ["workspace", "tab", "pane"]
-command = ["./open-room"]
+command = ["./new-room", "--open"]
+
+[[panes]]
+id = "new-room"
+title = "New group chat"
+placement = "tab"
+command = ["./new-room"]
 
 [[panes]]
 id = "room"

@@ -69,9 +69,20 @@ The plugin declares one action and one managed room pane. Herdr supplies
 standalone CLI use retains `~/.local/state/herdr-group-chat/`. An explicit
 `--state-dir` always wins.
 
-Invoking **Open group chat** opens and focuses a persistent `group-chat` tab in
-the Herdr TUI. The transcript and input remain visible there while you switch
-among the Pi, Claude, Codex, and Grok tabs.
+Invoking **New group chat** opens a visible setup tab, reuses any live named
+peers, creates tabs for missing Pi, Claude, Codex, and Grok participants, and
+then becomes a fresh `group-chat` room. **Open group chat** opens the existing
+default room without starting models. The transcript and input remain visible
+while you switch among participant tabs.
+
+Compact mode keeps the room alone in the initiating workspace and places the
+four native agent tabs in a secondary `agents` workspace. Enter `/agents` to
+reveal that workspace or `/show pi`, `/show claude`, `/show codex`, or `/show
+grok` to focus one native agent directly. Use Herdr's workspace switcher or
+**Open group chat** to return.
+
+If Codex reports unreviewed lifecycle hooks during startup, setup dismisses the
+notice and leaves those hooks inactive; it never selects **trust all** for you.
 
 The plugin contains no network client and does not broaden agent permissions.
 It relays prompts through Herdr to each native agent, so the agent provider's
@@ -91,6 +102,8 @@ recovers only the token-bound reply from the active local Grok session history.
 
 - Turns are serial and capped at four by default.
 - Every addressed agent must already be live in Herdr.
+- New-room setup starts all four default participants; participant selection is
+  not yet configurable.
 - Rooms are local to one Herdr installation; this is not a network chat server.
 - Grok session recovery depends on the local `~/.grok/sessions` history layout.
 - The preview release supports macOS and Linux.

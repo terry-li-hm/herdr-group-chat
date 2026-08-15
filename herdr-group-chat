@@ -45,6 +45,12 @@ class ChatError(RuntimeError):
 class AgentClient(Protocol):
     def live_targets(self) -> set[str]: ...
 
+    def states(self) -> dict[str, str]: ...
+
+    def focus(self, target: str) -> None: ...
+
+    def focus_workspace(self, label: str) -> None: ...
+
     def turn(self, target: str, prompt: str) -> tuple[str, str]: ...
 
 
@@ -181,14 +187,48 @@ class HerdrClient:
             raise ChatError(f"Herdr command failed: {detail}")
         return result
 
-    def live_targets(self) -> set[str]:
+    def _agents(self) -> list[dict[str, Any]]:
         result = self._run(["agent", "list"])
         try:
             payload = json.loads(result.stdout)
             agents = payload["result"]["agents"]
         except (json.JSONDecodeError, KeyError, TypeError) as error:
             raise ChatError("Herdr returned an invalid agent list") from error
-        return {item["name"] for item in agents if isinstance(item, dict) and item.get("name")}
+        if not isinstance(agents, list):
+            raise ChatError("Herdr returned an invalid agent list")
+        return [item for item in agents if isinstance(item, dict)]
+
+    def live_targets(self) -> set[str]:
+        return {item["name"] for item in self._agents() if item.get("name")}
+
+    def states(self) -> dict[str, str]:
+        return {
+            item["name"]: str(item.get("agent_status", "unknown"))
+            for item in self._agents()
+            if item.get("name")
+        }
+
+    def focus(self, target: str) -> None:
+        result = self._run(["agent", "get", target])
+        try:
+            workspace_id = json.loads(result.stdout)["result"]["agent"]["workspace_id"]
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raise ChatError(f"Herdr returned invalid agent details for {target}") from error
+        self._run(["workspace", "focus", workspace_id])
+        self._run(["agent", "focus", target])
+
+    def focus_workspace(self, label: str) -> None:
+        result = self._run(["workspace", "list"])
+        try:
+            workspaces = json.loads(result.stdout)["result"]["workspaces"]
+            workspace_id = next(
+                item["workspace_id"]
+                for item in workspaces
+                if isinstance(item, dict) and item.get("label") == label
+            )
+        except (json.JSONDecodeError, KeyError, StopIteration, TypeError) as error:
+            raise ChatError(f"Herdr workspace is unavailable: {label}") from error
+        self._run(["workspace", "focus", workspace_id])
 
     def turn(self, target: str, prompt: str) -> tuple[str, str]:
         result = self._run(
@@ -219,6 +259,8 @@ class HerdrClient:
         terminal = self._run(
             ["agent", "read", target, "--source", "recent-unwrapped", "--lines", "240"]
         ).stdout
+        if "Press t to trust all; enter to review hooks; esc to close" in terminal:
+            return "blocked", ""
         token_match = REPLY_TOKEN_RE.search(prompt)
         if token_match is None:
             raise ChatError("relay prompt has no reply token")
@@ -421,6 +463,39 @@ def message_lines(messages: Sequence[dict[str, Any]], width: int) -> list[str]:
     return lines
 
 
+def participant_status(chat: GroupChat, prefix: str = "") -> str:
+    try:
+        target_states = chat.client.states()
+    except ChatError:
+        target_states = {}
+    labels = []
+    for name, target in chat.agents.items():
+        state = target_states.get(target, "offline")
+        if state in {"idle", "done"}:
+            state = "ready"
+        labels.append(f"@{name} {state}")
+    summary = " · ".join(labels)
+    return f"{prefix} {summary}".strip()
+
+
+def handle_local_command(text: str, chat: GroupChat) -> str | None:
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return None
+    if stripped == "/agents":
+        chat.client.focus_workspace("agents")
+        return "Focused the agents workspace."
+    if stripped == "/help":
+        return "Commands: /agents · /show pi|claude|codex|grok"
+    if stripped.startswith("/show "):
+        name = stripped.removeprefix("/show ").strip().lower()
+        if name not in chat.agents:
+            return f"Unknown participant: {name}"
+        chat.client.focus(chat.agents[name])
+        return f"Focused @{name}."
+    return "Unknown command. Use /help."
+
+
 def draw_tui(
     screen: curses.window,
     transcript: Transcript,
@@ -453,9 +528,7 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
     screen.keypad(True)
     buffer = ""
     participants = tuple(chat.agents)
-    status = (
-        f"Plain messages address @all. Responses are serialized and capped at {chat.max_turns}."
-    )
+    status = participant_status(chat, "Ready.")
     while True:
         draw_tui(screen, chat.transcript, room, buffer, status, participants)
         key = screen.get_wch()
@@ -464,11 +537,19 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
         if key in ("\n", "\r"):
             if not buffer.strip():
                 continue
+            try:
+                command_status = handle_local_command(buffer, chat)
+            except ChatError as error:
+                command_status = str(error)
+            if command_status is not None:
+                status = command_status
+                buffer = ""
+                continue
             status = "Waiting for the addressed agents..."
             draw_tui(screen, chat.transcript, room, "", status, participants)
             try:
                 chat.dispatch(buffer)
-                status = "Delivered."
+                status = participant_status(chat, "Delivered.")
             except ChatError as error:
                 status = str(error)
             buffer = ""

@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Add a visible New group chat setup flow that reuses live peers, starts missing
+  Pi, Claude, Codex, and Grok tabs, and opens a fresh room.
+- Add compact mode: keep native agent tabs in an `agents` workspace and expose
+  `/agents` and `/show <agent>` navigation from the room.
+
 ## [0.1.0] - 2026-08-15
 
 - Open the room as a named, persistent Herdr tab instead of an easy-to-lose overlay.
