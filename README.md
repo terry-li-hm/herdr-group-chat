@@ -1,4 +1,4 @@
-# herdr-group-chat
+# Herdr Group Chat
 
 A thin Herdr plugin and local group-chat TUI for full native agents. It keeps
 Pi, Claude Code, Codex, and Grok Build in their own terminal sessions while a
