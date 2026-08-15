@@ -16,16 +16,14 @@ Prerequisites are Herdr 0.8.0 or newer, [`uv`](https://docs.astral.sh/uv/), and
 installed, authenticated Pi, Claude Code, Codex, and Grok Build CLIs. The room
 executable uses `uv` to run Python 3.13.
 
-This is currently a local pre-publication build. Link the checkout while
-developing:
+Install the pinned release from GitHub:
 
 ```bash
-herdr plugin link .
+herdr plugin install terry-li-hm/herdr-group-chat --ref v0.2.0
 herdr plugin action invoke new --plugin terry.herdr-group-chat
 ```
 
-After a public release exists, pin installation to its tag with
-`herdr plugin install terry-li-hm/herdr-group-chat --ref <tag>`.
+For local development, use `herdr plugin link .` from the checkout instead.
 
 ## Use
 
