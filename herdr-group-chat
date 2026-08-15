@@ -27,10 +27,12 @@ if TYPE_CHECKING:
 DEFAULT_AGENTS = {
     "pi": "pi-peer",
     "claude": "claude-peer",
+    "codex": "codex-peer",
     "grok": "grok-peer",
 }
+DEFAULT_STATE_DIR = Path("~/.local/state/herdr-group-chat")
 ROOM_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
-MENTION_RE = re.compile(r"^@([a-z0-9_,@-]+)\s+(.*)$", re.DOTALL)
+MENTION_RE = re.compile(r"^@([a-z0-9_,@-]+)\s+(.*)$", re.DOTALL | re.IGNORECASE)
 REPLY_TOKEN_RE = re.compile(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})")
 TUI_TIMESTAMP_RE = re.compile(r"[ \t]{2,}\d{1,2}:\d{2}\s+[AP]M[ \t█]*(?:\n[ \t]*)?")
 
@@ -61,10 +63,12 @@ def parse_route(text: str, known_agents: Sequence[str]) -> Route:
         raise ChatError("message is empty")
     match = MENTION_RE.match(stripped)
     if not match:
+        if stripped.startswith("@"):
+            raise ChatError("invalid mention syntax; use @name MESSAGE")
         return Route(tuple(known_agents), stripped)
 
     raw_recipients, body = match.groups()
-    requested = [item.removeprefix("@").strip() for item in raw_recipients.split(",")]
+    requested = [item.removeprefix("@").strip().lower() for item in raw_recipients.split(",")]
     if "all" in requested:
         recipients = list(known_agents)
     else:
@@ -165,6 +169,7 @@ class HerdrClient:
                 [self.herdr_bin, *arguments],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=timeout,
                 check=False,
             )
@@ -246,10 +251,16 @@ def format_context(messages: Sequence[dict[str, Any]]) -> str:
     return "\n\n".join(f"[{item['sender']}] {item['body']}" for item in messages)
 
 
-def build_prompt(agent: str, messages: Sequence[dict[str, Any]], token: str) -> str:
+def build_prompt(
+    agent: str,
+    messages: Sequence[dict[str, Any]],
+    token: str,
+    participants: Sequence[str],
+) -> str:
+    roster = ", ".join(["a human", *(f"@{name}" for name in participants)])
     return (
-        f"You are @{agent}, a full participant in a local group chat with a human, "
-        "Pi, Claude Code, and Grok Build. Keep your normal capabilities and instructions. "
+        f"You are @{agent}, a full participant in a local group chat with {roster}. "
+        "Keep your normal capabilities and instructions. "
         "Respond to the room as yourself. Use your ordinary tools when the task requires "
         "them, but do not use Herdr to relay this reply because the group-chat relay handles "
         "delivery.\n\n"
@@ -268,7 +279,7 @@ class GroupChat:
         transcript: Transcript,
         agents: dict[str, str],
         client: AgentClient,
-        max_turns: int = 3,
+        max_turns: int = 4,
     ) -> None:
         if max_turns < 1:
             raise ChatError("max turns must be positive")
@@ -295,7 +306,7 @@ class GroupChat:
                 if item["seq"] > cursors.get(agent, 0) and item["sender"] != agent
             ]
             token = uuid.uuid4().hex
-            prompt = build_prompt(agent, messages, token)
+            prompt = build_prompt(agent, messages, token, tuple(self.agents))
             try:
                 status, reply = self.client.turn(self.agents[agent], prompt)
                 if status == "blocked":
@@ -309,7 +320,8 @@ class GroupChat:
             except ChatError as error:
                 item = self.transcript.append("system", ("human",), f"@{agent}: {error}")
             created.append(item)
-            cursors[agent] = item["seq"]
+            if item["sender"] == agent:
+                cursors[agent] = item["seq"]
             self.transcript.save_cursors(cursors)
         return created
 
@@ -324,6 +336,18 @@ def parse_agent_overrides(values: Sequence[str]) -> dict[str, str]:
             raise ChatError(f"invalid agent mapping: {value}")
         agents[name] = target
     return agents
+
+
+def resolve_state_dir(
+    explicit: Path | None,
+    environ: dict[str, str] | os._Environ[str] = os.environ,
+) -> Path:
+    if explicit is not None:
+        return explicit
+    plugin_state = environ.get("HERDR_PLUGIN_STATE_DIR", "").strip()
+    if plugin_state:
+        return Path(plugin_state)
+    return DEFAULT_STATE_DIR
 
 
 def message_lines(messages: Sequence[dict[str, Any]], width: int) -> list[str]:
@@ -352,10 +376,12 @@ def draw_tui(
     room: str,
     buffer: str,
     status: str,
+    participants: Sequence[str],
 ) -> None:
     screen.erase()
     height, width = screen.getmaxyx()
-    header = f" Herdr group chat: {room} | @pi @claude @grok @all | Ctrl-Q exits "
+    mentions = " ".join(f"@{name}" for name in participants)
+    header = f" Herdr group chat: {room} | {mentions} @all | Ctrl-Q exits "
     try:
         screen.addnstr(0, 0, header, width - 1, curses.A_REVERSE)
         lines = message_lines(transcript.read(), width - 2)
@@ -375,9 +401,12 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
     curses.curs_set(1)
     screen.keypad(True)
     buffer = ""
-    status = "Plain messages address @all. Responses are serialized and capped at three."
+    participants = tuple(chat.agents)
+    status = (
+        f"Plain messages address @all. Responses are serialized and capped at {chat.max_turns}."
+    )
     while True:
-        draw_tui(screen, chat.transcript, room, buffer, status)
+        draw_tui(screen, chat.transcript, room, buffer, status, participants)
         key = screen.get_wch()
         if key in ("\x03", "\x11"):
             return
@@ -385,7 +414,7 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
             if not buffer.strip():
                 continue
             status = "Waiting for the addressed agents..."
-            draw_tui(screen, chat.transcript, room, "", status)
+            draw_tui(screen, chat.transcript, room, "", status, participants)
             try:
                 chat.dispatch(buffer)
                 status = "Delivered."
@@ -403,8 +432,8 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--room", default="cockpit")
-    parser.add_argument("--state-dir", type=Path, default=Path("~/.local/state/herdr-group-chat"))
-    parser.add_argument("--max-turns", type=int, default=3)
+    parser.add_argument("--state-dir", type=Path)
+    parser.add_argument("--max-turns", type=int, default=4)
     parser.add_argument("--timeout-ms", type=int, default=180_000)
     parser.add_argument("--agent", action="append", default=[], metavar="NAME=TARGET")
     parser.add_argument("--once", metavar="MESSAGE")
@@ -415,7 +444,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        transcript = Transcript(args.state_dir, args.room)
+        transcript = Transcript(resolve_state_dir(args.state_dir), args.room)
         if args.show:
             for line in message_lines(transcript.read(), 100):
                 print(line)
@@ -424,7 +453,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         chat = GroupChat(
             transcript,
             agents,
-            HerdrClient(timeout_ms=args.timeout_ms),
+            HerdrClient(
+                herdr_bin=os.environ.get("HERDR_BIN_PATH", "herdr"),
+                timeout_ms=args.timeout_ms,
+            ),
             max_turns=args.max_turns,
         )
         if args.once is not None:

@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+herdr_bin=${HERDR_BIN_PATH:-herdr}
+plugin_id=${HERDR_PLUGIN_ID:-terry.herdr-group-chat}
+
+set -- "$herdr_bin" plugin pane open \
+    --plugin "$plugin_id" \
+    --entrypoint room \
+    --placement overlay \
+    --focus
+
+if [ -n "${HERDR_PLUGIN_ROOT:-}" ]; then
+    set -- "$@" --cwd "$HERDR_PLUGIN_ROOT"
+fi
+
+exec "$@"
