@@ -12,15 +12,16 @@ receives only group messages added since its previous delivered turn.
 
 ## Install
 
+Prerequisites are Herdr 0.8.0 or newer, [`uv`](https://docs.astral.sh/uv/),
+and live agents named `pi-peer`, `claude-peer`, `codex-peer`, and `grok-peer`.
+The room executable uses `uv` to run Python 3.13.
+
 Install the tagged release from GitHub:
 
 ```bash
 herdr plugin install terry-li-hm/herdr-group-chat --ref v0.1.0
 herdr plugin action invoke open --plugin terry.herdr-group-chat
 ```
-
-The agents must already be running in Herdr under the default names
-`pi-peer`, `claude-peer`, `codex-peer`, and `grok-peer`.
 
 ## Use
 
