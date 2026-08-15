@@ -1,7 +1,7 @@
 [project]
 name = "herdr-group-chat"
-version = "0.1.0"
-description = "A thin local group-chat TUI for agents already running in Herdr."
+version = "0.2.0"
+description = "A Herdr plugin for shared local rooms of full native AI coding agents."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = []

@@ -237,7 +237,9 @@ def test_failed_turn_does_not_drop_context_and_later_agents_continue(tmp_path: P
 
 def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:
     manifest = tomllib.loads((EFFECTOR.parent / "herdr-plugin.toml").read_text(encoding="utf-8"))
+    project = tomllib.loads((EFFECTOR.parent / "pyproject.toml").read_text(encoding="utf-8"))
     assert manifest["min_herdr_version"] == "0.8.0"
+    assert manifest["version"] == project["project"]["version"]
     assert [action["id"] for action in manifest["actions"]] == ["open"]
     assert [pane["id"] for pane in manifest["panes"]] == ["room"]
     assert "events" not in manifest

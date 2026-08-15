@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.5"
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run pytest -q
+      - run: uv run ruff check herdr-group-chat assays/test_herdr_group_chat.py
+      - run: uv run ruff format --check herdr-group-chat assays/test_herdr_group_chat.py
+      - run: sh -n open-room
+      - run: test -x herdr-group-chat && test -x open-room
