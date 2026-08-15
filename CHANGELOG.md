@@ -12,5 +12,7 @@ All notable changes to this project are documented here.
 - Store plugin rooms under Herdr's plugin-owned state directory.
 - Reject malformed mentions instead of accidentally broadcasting them.
 - Preserve undelivered context when an agent turn fails.
+- Preserve each agent's disclosure boundary and request a route receipt for bounded
+  disclosures.
 - Add the local serial group-chat relay, append-only transcripts, bounded
   turns, agent mentions, and terminal reply-marker extraction.

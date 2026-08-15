@@ -73,6 +73,10 @@ The plugin contains no network client and does not broaden agent permissions.
 It relays prompts through Herdr to each native agent, so the agent provider's
 own data-handling terms still apply. Room transcripts contain message content;
 Herdr stores them locally and the relay creates them with user-only permissions.
+Each participant applies its own disclosure rules. For an explicitly bounded
+disclosure, an eligible participant verifies its active route and records a
+non-secret `ROUTE_RECEIPT`; addressing `@all` never transfers one agent's
+eligibility to another.
 
 ## Limitations
 

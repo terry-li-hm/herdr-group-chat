@@ -134,6 +134,8 @@ def test_codex_is_addressable_and_roster_is_derived() -> None:
     assert route == Route(("codex",), "review")
     prompt = build_prompt("codex", [], "a" * 32, ("pi", "claude", "codex", "grok"))
     assert "a human, @pi, @claude, @codex, @grok" in prompt
+    assert "another participant's eligibility never transfers to you" in prompt
+    assert "ROUTE_RECEIPT" in prompt
 
 
 def test_state_dir_precedence(tmp_path: Path) -> None:
