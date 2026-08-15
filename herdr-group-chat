@@ -220,16 +220,20 @@ class HerdrClient:
 
 
 def extract_reply(terminal: str, token: str) -> str:
-    start = f"HGCHAT_REPLY_BEGIN {token}"
-    end = f"HGCHAT_REPLY_END {token}"
-    start_index = terminal.rfind(start)
-    if start_index < 0:
+    def wrapped_literal(value: str) -> re.Pattern[str]:
+        compact = "".join(value.split())
+        return re.compile(r"[ \t\r\n]*".join(re.escape(char) for char in compact))
+
+    start = wrapped_literal(f"HGCHAT_REPLY_BEGIN {token}")
+    end = wrapped_literal(f"HGCHAT_REPLY_END {token}")
+    start_matches = list(start.finditer(terminal))
+    if not start_matches:
         raise ChatError("agent response marker was not found")
-    body_start = start_index + len(start)
-    end_index = terminal.find(end, body_start)
-    if end_index < 0:
+    body_start = start_matches[-1].end()
+    end_match = end.search(terminal, body_start)
+    if end_match is None:
         raise ChatError("agent response did not finish")
-    body = TUI_TIMESTAMP_RE.sub(" ", terminal[body_start:end_index]).strip()
+    body = TUI_TIMESTAMP_RE.sub(" ", terminal[body_start : end_match.start()]).strip()
     if not body:
         raise ChatError("agent returned an empty response")
     return body

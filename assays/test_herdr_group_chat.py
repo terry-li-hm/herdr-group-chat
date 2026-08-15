@@ -112,6 +112,20 @@ def test_extract_reply_uses_the_last_marker_pair() -> None:
     assert extract_reply(terminal, token) == "actual answer"
 
 
+def test_extract_reply_accepts_terminal_wrapping_inside_markers() -> None:
+    token = "c" * 32
+    terminal = (
+        "HGCHAT_REPLY_BEGIN\n"
+        f" {token[:20]}\n"
+        f" {token[20:]}\n"
+        "wrapped answer\n"
+        "HGCHAT_REPLY_END\n"
+        f" {token[:17]}\n"
+        f" {token[17:]}\n"
+    )
+    assert extract_reply(terminal, token) == "wrapped answer"
+
+
 def test_extract_reply_removes_grok_tui_timestamp_chrome() -> None:
     token = "b" * 32
     terminal = (
