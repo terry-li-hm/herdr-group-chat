@@ -15,7 +15,7 @@ receives only group messages added since its previous delivered turn.
 Install the tagged release from GitHub:
 
 ```bash
-herdr plugin install terry-li-hm/herdr-group-chat --ref v0.2.0
+herdr plugin install terry-li-hm/herdr-group-chat --ref v0.1.0
 herdr plugin action invoke open --plugin terry.herdr-group-chat
 ```
 

@@ -16,7 +16,7 @@ Publication requires explicit approval. After approval:
 1. Create the public `terry-li-hm/herdr-group-chat` repository and push `main`
    plus the release tag.
 2. Unlink the local development copy, install the tag with
-   `herdr plugin install terry-li-hm/herdr-group-chat --ref v0.2.0`, and rerun
+   `herdr plugin install terry-li-hm/herdr-group-chat --ref v0.1.0`, and rerun
    the four-agent smoke test.
 3. Enable GitHub private vulnerability reporting.
 4. Add the `herdr-plugin` repository topic. Confirm the listing appears in
