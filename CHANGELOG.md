@@ -14,5 +14,7 @@ All notable changes to this project are documented here.
 - Preserve undelivered context when an agent turn fails.
 - Preserve each agent's disclosure boundary and request a route receipt for bounded
   disclosures.
+- Allow time for native approval prompts and recover token-bound Grok replies that
+  its alternate-screen viewport hides.
 - Add the local serial group-chat relay, append-only transcripts, bounded
   turns, agent mentions, and terminal reply-marker extraction.

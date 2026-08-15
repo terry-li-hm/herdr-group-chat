@@ -78,11 +78,17 @@ disclosure, an eligible participant verifies its active route and records a
 non-secret `ROUTE_RECEIPT`; addressing `@all` never transfers one agent's
 eligibility to another.
 
+The relay waits up to ten minutes for an agent turn so an interactive approval
+can be completed in the native agent pane. Grok's alternate-screen TUI can hide
+a completed reply above the visible viewport; when that happens, the plugin
+recovers only the token-bound reply from the active local Grok session history.
+
 ## Limitations
 
 - Turns are serial and capped at four by default.
 - Every addressed agent must already be live in Herdr.
 - Rooms are local to one Herdr installation; this is not a network chat server.
+- Grok session recovery depends on the local `~/.grok/sessions` history layout.
 - The preview release supports macOS and Linux.
 
 ## Development

@@ -24,6 +24,7 @@ GroupChat = namespace["GroupChat"]
 Route = namespace["Route"]
 Transcript = namespace["Transcript"]
 extract_reply = namespace["extract_reply"]
+extract_grok_session_reply = namespace["extract_grok_session_reply"]
 build_prompt = namespace["build_prompt"]
 parse_route = namespace["parse_route"]
 resolve_state_dir = namespace["resolve_state_dir"]
@@ -192,6 +193,32 @@ def test_extract_reply_removes_grok_tui_timestamp_chrome() -> None:
         f"HGCHAT_REPLY_END {token}\n"
     )
     assert extract_reply(terminal, token) == "I am here with my ordinary tools."
+
+
+def test_extract_grok_session_reply_recovers_hidden_alternate_screen_output(
+    tmp_path: Path,
+) -> None:
+    token = "e" * 32
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    history = session_dir / "chat_history.jsonl"
+    history.write_text(
+        "\n".join(
+            [
+                '{"type":"assistant","content":"older answer"}',
+                '{"malformed":',
+                '{"type":"assistant","content":"HGCHAT_REPLY_BEGIN '
+                + token
+                + "\\nrecovered Grok reply\\nHGCHAT_REPLY_END "
+                + token
+                + '"}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert extract_grok_session_reply(session_dir, token) == "recovered Grok reply"
 
 
 def test_missing_live_agent_fails_before_writing(tmp_path: Path) -> None:
