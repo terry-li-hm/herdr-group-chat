@@ -32,6 +32,8 @@ DEFAULT_AGENTS = {
     "grok": "grok-peer",
 }
 DEFAULT_STATE_DIR = Path("~/.local/state/herdr-group-chat")
+ROOM_ENV = "HERDR_GROUP_CHAT_ROOM"
+AGENTS_WORKSPACE_ENV = "HERDR_GROUP_CHAT_AGENTS_WORKSPACE_ID"
 ROOM_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
 MENTION_RE = re.compile(r"^@([a-z0-9_,@-]+)\s+(.*)$", re.DOTALL | re.IGNORECASE)
 REPLY_TOKEN_RE = re.compile(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})")
@@ -49,7 +51,7 @@ class AgentClient(Protocol):
 
     def focus(self, target: str) -> None: ...
 
-    def focus_workspace(self, label: str) -> None: ...
+    def focus_workspace(self, workspace_id: str) -> None: ...
 
     def turn(self, target: str, prompt: str) -> tuple[str, str]: ...
 
@@ -217,17 +219,7 @@ class HerdrClient:
         self._run(["workspace", "focus", workspace_id])
         self._run(["agent", "focus", target])
 
-    def focus_workspace(self, label: str) -> None:
-        result = self._run(["workspace", "list"])
-        try:
-            workspaces = json.loads(result.stdout)["result"]["workspaces"]
-            workspace_id = next(
-                item["workspace_id"]
-                for item in workspaces
-                if isinstance(item, dict) and item.get("label") == label
-            )
-        except (json.JSONDecodeError, KeyError, StopIteration, TypeError) as error:
-            raise ChatError(f"Herdr workspace is unavailable: {label}") from error
+    def focus_workspace(self, workspace_id: str) -> None:
         self._run(["workspace", "focus", workspace_id])
 
     def turn(self, target: str, prompt: str) -> tuple[str, str]:
@@ -373,6 +365,7 @@ class GroupChat:
         agents: dict[str, str],
         client: AgentClient,
         max_turns: int = 4,
+        agents_workspace_id: str | None = None,
     ) -> None:
         if max_turns < 1:
             raise ChatError("max turns must be positive")
@@ -380,6 +373,7 @@ class GroupChat:
         self.agents = agents
         self.client = client
         self.max_turns = max_turns
+        self.agents_workspace_id = agents_workspace_id
 
     def dispatch(self, text: str) -> list[dict[str, Any]]:
         route = parse_route(text, tuple(self.agents))
@@ -483,7 +477,9 @@ def handle_local_command(text: str, chat: GroupChat) -> str | None:
     if not stripped.startswith("/"):
         return None
     if stripped == "/agents":
-        chat.client.focus_workspace("agents")
+        if not chat.agents_workspace_id:
+            return "The agents workspace is unavailable; use /show <agent>."
+        chat.client.focus_workspace(chat.agents_workspace_id)
         return "Focused the agents workspace."
     if stripped == "/help":
         return "Commands: /agents · /show pi|claude|codex|grok"
@@ -563,11 +559,12 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--room", default="cockpit")
+    parser.add_argument("--room", default=os.environ.get(ROOM_ENV, "cockpit"))
     parser.add_argument("--state-dir", type=Path)
     parser.add_argument("--max-turns", type=int, default=4)
     parser.add_argument("--timeout-ms", type=int, default=600_000)
     parser.add_argument("--agent", action="append", default=[], metavar="NAME=TARGET")
+    parser.add_argument("--agents-workspace", default=os.environ.get(AGENTS_WORKSPACE_ENV))
     parser.add_argument("--once", metavar="MESSAGE")
     parser.add_argument("--show", action="store_true")
     return parser
@@ -590,6 +587,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 timeout_ms=args.timeout_ms,
             ),
             max_turns=args.max_turns,
+            agents_workspace_id=args.agents_workspace,
         )
         if args.once is not None:
             for item in chat.dispatch(args.once):

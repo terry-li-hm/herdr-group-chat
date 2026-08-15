@@ -8,6 +8,16 @@ All notable changes to this project are documented here.
   Pi, Claude, Codex, and Grok tabs, and opens a fresh room.
 - Add compact mode: keep native agent tabs in an `agents` workspace and expose
   `/agents` and `/show <agent>` navigation from the room.
+- Record exact plugin-owned workspace and pane identifiers so generic user
+  workspace labels are never claimed or focused.
+- Reopen the last room after its pane closes and replace the previous
+  plugin-owned pane when starting a fresh room.
+- Align installation, security, development, and release guidance with Herdr's
+  0.8 plugin contract.
+- Keep pane entrypoints rooted in the installed plugin so actions work from any
+  project directory while agent tabs still inherit the invoking project.
+- Partition launcher identity by Herdr server instance, serialize competing setup
+  processes, and retain partial-failure cleanup state for safe retries.
 
 ## [0.1.0] - 2026-08-15
 

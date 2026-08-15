@@ -12,16 +12,20 @@ receives only group messages added since its previous delivered turn.
 
 ## Install
 
-Prerequisites are Herdr 0.8.0 or newer, [`uv`](https://docs.astral.sh/uv/),
-and live agents named `pi-peer`, `claude-peer`, `codex-peer`, and `grok-peer`.
-The room executable uses `uv` to run Python 3.13.
+Prerequisites are Herdr 0.8.0 or newer, [`uv`](https://docs.astral.sh/uv/), and
+installed, authenticated Pi, Claude Code, Codex, and Grok Build CLIs. The room
+executable uses `uv` to run Python 3.13.
 
-Install the tagged release from GitHub:
+This is currently a local pre-publication build. Link the checkout while
+developing:
 
 ```bash
-herdr plugin install terry-li-hm/herdr-group-chat --ref v0.1.0
-herdr plugin action invoke open --plugin terry.herdr-group-chat
+herdr plugin link .
+herdr plugin action invoke new --plugin terry.herdr-group-chat
 ```
+
+After a public release exists, pin installation to its tag with
+`herdr plugin install terry-li-hm/herdr-group-chat --ref <tag>`.
 
 ## Use
 
@@ -51,29 +55,29 @@ The standalone CLI remains available:
 ./herdr-group-chat --show
 ```
 
-For local development, link the checkout instead:
-
-```bash
-herdr plugin link . --enabled
-herdr plugin action invoke open --plugin terry.herdr-group-chat
-```
-
 Uninstall a GitHub-managed copy with:
 
 ```bash
 herdr plugin uninstall terry.herdr-group-chat
 ```
 
-The plugin declares one action and one managed room pane. Herdr supplies
-`HERDR_PLUGIN_STATE_DIR`, so plugin rooms stay in Herdr's plugin state location;
-standalone CLI use retains `~/.local/state/herdr-group-chat/`. An explicit
-`--state-dir` always wins.
+The manifest declares two actions and two managed pane entrypoints: **New group
+chat**, **Open group chat**, the visible setup pane, and the room pane. Herdr
+supplies `HERDR_PLUGIN_STATE_DIR`, so transcripts and the plugin's exact
+workspace and pane identifiers stay in a server-instance-scoped, locked state file. This
+keeps multiple Herdr sessions separate and serializes overlapping launcher and
+setup processes. The launcher never claims a workspace merely because its label
+is `agents` or `group-chat`. Standalone CLI use retains
+`~/.local/state/herdr-group-chat/`; an explicit `--state-dir` always wins.
 
 Invoking **New group chat** opens a visible setup tab, reuses any live named
 peers, creates tabs for missing Pi, Claude, Codex, and Grok participants, and
-then becomes a fresh `group-chat` room. **Open group chat** opens the existing
-default room without starting models. The transcript and input remain visible
-while you switch among participant tabs.
+then becomes a fresh `group-chat` room. It replaces the previous plugin-owned
+room pane but retains that room's transcript. **Open group chat** focuses the
+exact recorded plugin pane or reopens the last room without starting models.
+The transcript and input remain visible while you switch among participant
+tabs. Failed cleanup remains recorded for a later retry instead of silently
+losing ownership of the old pane.
 
 Compact mode keeps the room alone in the initiating workspace and places the
 four native agent tabs in a secondary `agents` workspace. Enter `/agents` to
@@ -84,14 +88,16 @@ grok` to focus one native agent directly. Use Herdr's workspace switcher or
 If Codex reports unreviewed lifecycle hooks during startup, setup dismisses the
 notice and leaves those hooks inactive; it never selects **trust all** for you.
 
-The plugin contains no network client and does not broaden agent permissions.
-It relays prompts through Herdr to each native agent, so the agent provider's
-own data-handling terms still apply. Room transcripts contain message content;
-Herdr stores them locally and the relay creates them with user-only permissions.
-Each participant applies its own disclosure rules. For an explicitly bounded
-disclosure, an eligible participant verifies its active route and records a
-non-secret `ROUTE_RECEIPT`; addressing `@all` never transfers one agent's
-eligibility to another.
+Like every Herdr plugin, this is ordinary local code running as your user and it
+can call the full Herdr CLI. Review the manifest and executable scripts before
+installing, and pin a trusted release tag. The plugin contains no separate
+network client and does not broaden agent permissions, but the native agents it
+prompts may use their normal network connections and tools. Room transcripts
+contain message content; the relay stores them locally with user-only
+permissions. Each participant applies its own disclosure rules. For an
+explicitly bounded disclosure, an eligible participant verifies its active
+route and records a non-secret `ROUTE_RECEIPT`; addressing `@all` never
+transfers one agent's eligibility to another.
 
 The relay waits up to ten minutes for an agent turn so an interactive approval
 can be completed in the native agent pane. Grok's alternate-screen TUI can hide
@@ -114,9 +120,8 @@ Run the focused gate with:
 
 ```bash
 uv run --with pytest pytest -q
-ruff check herdr-group-chat assays/test_herdr_group_chat.py
-ruff format --check herdr-group-chat assays/test_herdr_group_chat.py
-sh -n open-room
+uv run ruff check herdr-group-chat new-room assays
+uv run ruff format --check herdr-group-chat new-room assays
 ```
 
 See [SECURITY.md](SECURITY.md) for private vulnerability reporting and

@@ -12,10 +12,16 @@ import os
 import subprocess
 import sys
 import time
-from contextlib import suppress
-from datetime import datetime
+import uuid
+from contextlib import contextmanager, suppress
+from datetime import UTC, datetime
+from fcntl import LOCK_EX, LOCK_UN, flock
+from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator, Mapping
 
 PARTICIPANTS = (
     ("pi", "pi-peer"),
@@ -23,24 +29,44 @@ PARTICIPANTS = (
     ("codex", "codex-peer"),
     ("grok", "grok-peer"),
 )
+LAUNCHER_STATE_PREFIX = "launcher-state-"
+LAUNCHER_STATE_VERSION = 1
+ROOM_ENV = "HERDR_GROUP_CHAT_ROOM"
+AGENTS_WORKSPACE_ENV = "HERDR_GROUP_CHAT_AGENTS_WORKSPACE_ID"
+AGENT_CWD_ENV = "HERDR_GROUP_CHAT_AGENT_CWD"
+ROOM_OPERATION_ENV = "HERDR_GROUP_CHAT_OPERATION_ID"
 
 
 class BootstrapError(RuntimeError):
     """A user-visible setup failure."""
 
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
-def run_json(herdr_bin: str, arguments: list[str], timeout: int = 30) -> dict[str, Any]:
-    result = subprocess.run(
-        [herdr_bin, *arguments],
-        capture_output=True,
-        text=True,
-        errors="replace",
-        timeout=timeout,
-        check=False,
-    )
+
+def run_json(herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            [herdr_bin, *arguments],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise BootstrapError(f"Herdr command timed out: {error}", code="command_timeout") from error
+    except OSError as error:
+        raise BootstrapError(
+            f"Herdr command failed: {error}", code="command_spawn_failed"
+        ) from error
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "unknown Herdr error"
-        raise BootstrapError(detail)
+        code = None
+        with suppress(json.JSONDecodeError, KeyError, TypeError):
+            code = str(json.loads(detail)["error"]["code"])
+        raise BootstrapError(detail, code=code)
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as error:
@@ -48,6 +74,204 @@ def run_json(herdr_bin: str, arguments: list[str], timeout: int = 30) -> dict[st
     if not isinstance(payload, dict):
         raise BootstrapError("Herdr returned an invalid response")
     return payload
+
+
+def plugin_state_dir() -> Path:
+    configured = os.environ.get("HERDR_PLUGIN_STATE_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path("~/.local/state/herdr-group-chat").expanduser()
+
+
+def session_key(environ: Mapping[str, str] = os.environ) -> str:
+    socket_path = environ.get("HERDR_SOCKET_PATH", "").strip()
+    if not socket_path:
+        raise BootstrapError("launcher state requires Herdr plugin socket context")
+    try:
+        socket_stat = Path(socket_path).stat()
+    except OSError as error:
+        raise BootstrapError(f"Herdr plugin socket is unavailable: {error}") from error
+    identity = (
+        f"{socket_path}\0{socket_stat.st_dev}\0{socket_stat.st_ino}\0{socket_stat.st_ctime_ns}"
+    )
+    return sha256(identity.encode()).hexdigest()[:16]
+
+
+def launcher_state_path(state_dir: Path) -> Path:
+    return state_dir / f"{LAUNCHER_STATE_PREFIX}{session_key()}.json"
+
+
+def load_state_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"schema_version": LAUNCHER_STATE_VERSION}
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise BootstrapError(f"invalid launcher state: {error}") from error
+    if not isinstance(state, dict) or state.get("schema_version") != LAUNCHER_STATE_VERSION:
+        raise BootstrapError("invalid launcher state schema")
+    string_fields = (
+        "chat_workspace_id",
+        "agents_workspace_id",
+        "room_pane_id",
+        "room_tab_id",
+        "last_room_id",
+        "chat_placeholder_tab_id",
+        "agents_placeholder_tab_id",
+        "pending_chat_workspace_label",
+        "pending_agents_workspace_label",
+        "pending_room_id",
+        "pending_room_operation_id",
+        "agents_cwd",
+    )
+    if any(field in state and not isinstance(state[field], str) for field in string_fields):
+        raise BootstrapError("invalid launcher state fields")
+    stale_panes = state.get("stale_room_pane_ids", [])
+    if not isinstance(stale_panes, list) or not all(
+        isinstance(pane_id, str) for pane_id in stale_panes
+    ):
+        raise BootstrapError("invalid launcher stale pane state")
+    pending_started = state.get("pending_room_started_unix_ms")
+    if pending_started is not None and not isinstance(pending_started, int):
+        raise BootstrapError("invalid pending room state")
+    participant_panes = state.get("participant_pane_ids", {})
+    if not isinstance(participant_panes, dict) or not all(
+        isinstance(kind, str) and isinstance(pane_id, str)
+        for kind, pane_id in participant_panes.items()
+    ):
+        raise BootstrapError("invalid participant pane state")
+    participant_tabs = state.get("participant_tab_ids", {})
+    if not isinstance(participant_tabs, dict) or not all(
+        isinstance(kind, str) and isinstance(tab_id, str)
+        for kind, tab_id in participant_tabs.items()
+    ):
+        raise BootstrapError("invalid participant tab state")
+    pending_tabs = state.get("pending_participant_tabs", {})
+    if not isinstance(pending_tabs, dict) or not all(
+        isinstance(kind, str) and isinstance(details, dict)
+        for kind, details in pending_tabs.items()
+    ):
+        raise BootstrapError("invalid pending participant state")
+    return state
+
+
+def load_launcher_state(state_dir: Path, state_path: Path | None = None) -> dict[str, Any]:
+    return load_state_file(state_path or launcher_state_path(state_dir))
+
+
+def save_launcher_state(
+    state_dir: Path, state: dict[str, Any], state_path: Path | None = None
+) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(state_dir, 0o700)
+    state = {**state, "schema_version": LAUNCHER_STATE_VERSION}
+    path = state_path or launcher_state_path(state_dir)
+    if state_path is not None:
+        assert_server_identity(state_dir, state_path)
+    temporary = state_dir / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+        os.chmod(path, 0o600)
+    finally:
+        with suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+def assert_server_identity(state_dir: Path, state_path: Path) -> None:
+    if launcher_state_path(state_dir) != state_path:
+        raise BootstrapError("Herdr server changed during group-chat setup; retry the action")
+
+
+@contextmanager
+def launcher_state_lock(state_dir: Path) -> Iterator[Path]:
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(state_dir, 0o700)
+    state_path = launcher_state_path(state_dir)
+    lock_path = state_path.with_suffix(".lock")
+    with lock_path.open("a+b") as stream:
+        os.chmod(lock_path, 0o600)
+        flock(stream.fileno(), LOCK_EX)
+        try:
+            yield state_path
+        finally:
+            flock(stream.fileno(), LOCK_UN)
+
+
+TOPOLOGY_FIELDS = (
+    "chat_workspace_id",
+    "agents_workspace_id",
+    "room_pane_id",
+    "room_tab_id",
+    "chat_placeholder_tab_id",
+    "agents_placeholder_tab_id",
+    "stale_room_pane_ids",
+    "pending_chat_workspace_label",
+    "pending_agents_workspace_label",
+    "pending_room_id",
+    "pending_room_operation_id",
+    "pending_room_started_unix_ms",
+    "agents_cwd",
+    "participant_pane_ids",
+    "participant_tab_ids",
+    "pending_participant_tabs",
+)
+
+
+def clear_topology(state: dict[str, Any]) -> None:
+    for field in TOPOLOGY_FIELDS:
+        state.pop(field, None)
+
+
+def load_validated_launcher_state(
+    state_dir: Path, herdr_bin: str, state_path: Path | None = None
+) -> dict[str, Any]:
+    state = load_launcher_state(state_dir, state_path)
+    pane_id = state.get("room_pane_id")
+    if not pane_id:
+        return state
+    try:
+        response = run_json(herdr_bin, ["plugin", "pane", "focus", pane_id])
+    except BootstrapError as error:
+        if error.code == "plugin_pane_not_found":
+            state.pop("room_pane_id", None)
+            state.pop("room_tab_id", None)
+            return state
+        raise
+    try:
+        pane = response["result"]["plugin_pane"]["pane"]
+        matches = (
+            str(pane["pane_id"]) == pane_id
+            and str(pane["workspace_id"]) == state.get("chat_workspace_id")
+            and str(pane["tab_id"]) == state.get("room_tab_id")
+        )
+    except (KeyError, TypeError):
+        matches = False
+    if not matches:
+        clear_topology(state)
+    return state
+
+
+def workspaces(herdr_bin: str) -> list[dict[str, Any]]:
+    listed = run_json(herdr_bin, ["workspace", "list"])
+    return [
+        workspace
+        for workspace in listed.get("result", {}).get("workspaces", [])
+        if isinstance(workspace, dict) and workspace.get("workspace_id")
+    ]
+
+
+def workspace_ids(herdr_bin: str) -> set[str]:
+    return {str(workspace["workspace_id"]) for workspace in workspaces(herdr_bin)}
+
+
+def new_room_id() -> str:
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    return f"chat-{timestamp}-{uuid.uuid4().hex[:6]}"
 
 
 def wait_for_shell(herdr_bin: str, pane_id: str, timeout: float = 10) -> None:
@@ -82,19 +306,84 @@ def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> Non
     print("notice @codex unreviewed hooks left inactive", flush=True)
 
 
-def ensure_agents_workspace(herdr_bin: str, cwd: str) -> tuple[str, str | None]:
-    listed = run_json(herdr_bin, ["workspace", "list"])
-    workspaces = listed.get("result", {}).get("workspaces", [])
-    for workspace in workspaces:
-        if isinstance(workspace, dict) and workspace.get("label") == "agents":
-            return str(workspace["workspace_id"]), None
-    created = run_json(
-        herdr_bin,
-        ["workspace", "create", "--cwd", cwd, "--label", "agents", "--no-focus"],
+def ensure_owned_workspace(
+    herdr_bin: str,
+    cwd: str,
+    state_dir: Path,
+    state: dict[str, Any],
+    state_path: Path,
+    *,
+    workspace_field: str,
+    placeholder_field: str,
+    pending_label_field: str,
+    display_label: str,
+) -> tuple[str, str | None]:
+    listed = workspaces(herdr_bin)
+    existing = state.get(workspace_field)
+    matched = next(
+        (workspace for workspace in listed if str(workspace["workspace_id"]) == existing),
+        None,
     )
-    return (
-        str(created["result"]["workspace"]["workspace_id"]),
-        str(created["result"]["tab"]["tab_id"]),
+    if matched is None:
+        pending_label = state.get(pending_label_field)
+        if not pending_label:
+            pending_label = f"hgchat-{display_label}-{uuid.uuid4().hex[:10]}"
+            state[pending_label_field] = pending_label
+            save_launcher_state(state_dir, state, state_path)
+        matched = next(
+            (workspace for workspace in listed if workspace.get("label") == pending_label),
+            None,
+        )
+        if matched is None:
+            assert_server_identity(state_dir, state_path)
+            created = run_json(
+                herdr_bin,
+                [
+                    "workspace",
+                    "create",
+                    "--cwd",
+                    cwd,
+                    "--label",
+                    pending_label,
+                    "--no-focus",
+                ],
+                timeout=None,
+            )
+            workspace_id = str(created["result"]["workspace"]["workspace_id"])
+            placeholder_tab_id = str(created["result"]["tab"]["tab_id"])
+        else:
+            workspace_id = str(matched["workspace_id"])
+            placeholder_tab_id = str(matched["active_tab_id"])
+        state[workspace_field] = workspace_id
+        state[placeholder_field] = placeholder_tab_id
+        state.pop(pending_label_field, None)
+        save_launcher_state(state_dir, state, state_path)
+    else:
+        workspace_id = str(matched["workspace_id"])
+        placeholder_tab_id = state.get(placeholder_field)
+    if matched is None or matched.get("label") != display_label:
+        assert_server_identity(state_dir, state_path)
+        run_json(
+            herdr_bin,
+            ["workspace", "rename", workspace_id, display_label],
+            timeout=None,
+        )
+    return workspace_id, placeholder_tab_id
+
+
+def ensure_agents_workspace(
+    herdr_bin: str, cwd: str, state_dir: Path, state: dict[str, Any], state_path: Path
+) -> tuple[str, str | None]:
+    return ensure_owned_workspace(
+        herdr_bin,
+        cwd,
+        state_dir,
+        state,
+        state_path,
+        workspace_field="agents_workspace_id",
+        placeholder_field="agents_placeholder_tab_id",
+        pending_label_field="pending_agents_workspace_label",
+        display_label="agents",
     )
 
 
@@ -106,49 +395,168 @@ def plugin_context() -> dict[str, Any]:
     return context if isinstance(context, dict) else {}
 
 
-def chat_workspace(herdr_bin: str, cwd: str) -> tuple[str, str | None]:
-    listed = run_json(herdr_bin, ["workspace", "list"])
-    workspaces = listed.get("result", {}).get("workspaces", [])
-    for preferred_label in ("group-chat", "herdr-group-chat"):
-        for workspace in workspaces:
-            if isinstance(workspace, dict) and workspace.get("label") == preferred_label:
-                workspace_id = str(workspace["workspace_id"])
-                run_json(herdr_bin, ["workspace", "rename", workspace_id, "group-chat"])
-                return workspace_id, None
-    for workspace in workspaces:
-        if isinstance(workspace, dict) and workspace.get("label") != "agents":
-            workspace_id = str(workspace["workspace_id"])
-            run_json(herdr_bin, ["workspace", "rename", workspace_id, "group-chat"])
-            return workspace_id, None
-    created = run_json(
+def ensure_chat_workspace(
+    herdr_bin: str, cwd: str, state_dir: Path, state: dict[str, Any], state_path: Path
+) -> tuple[str, str | None]:
+    return ensure_owned_workspace(
         herdr_bin,
-        ["workspace", "create", "--cwd", cwd, "--label", "group-chat", "--no-focus"],
+        cwd,
+        state_dir,
+        state,
+        state_path,
+        workspace_field="chat_workspace_id",
+        placeholder_field="chat_placeholder_tab_id",
+        pending_label_field="pending_chat_workspace_label",
+        display_label="group-chat",
     )
-    return (
-        str(created["result"]["workspace"]["workspace_id"]),
-        str(created["result"]["tab"]["tab_id"]),
+
+
+def clean_stale_room_panes(
+    herdr_bin: str,
+    state: dict[str, Any],
+    state_dir: Path | None = None,
+    state_path: Path | None = None,
+) -> None:
+    remaining: list[str] = []
+    for pane_id in dict.fromkeys(state.get("stale_room_pane_ids", [])):
+        try:
+            if state_dir is not None and state_path is not None:
+                assert_server_identity(state_dir, state_path)
+            run_json(herdr_bin, ["plugin", "pane", "close", pane_id])
+        except BootstrapError as error:
+            if error.code != "plugin_pane_not_found":
+                remaining.append(pane_id)
+    if remaining:
+        state["stale_room_pane_ids"] = remaining
+    else:
+        state.pop("stale_room_pane_ids", None)
+
+
+def close_tracked_tab(
+    herdr_bin: str,
+    state: dict[str, Any],
+    state_field: str,
+    tab_id: str | None,
+    state_dir: Path | None = None,
+    state_path: Path | None = None,
+) -> None:
+    if not tab_id:
+        return
+    try:
+        if state_dir is not None and state_path is not None:
+            assert_server_identity(state_dir, state_path)
+        run_json(herdr_bin, ["tab", "close", tab_id])
+    except BootstrapError as error:
+        if error.code != "tab_not_found":
+            return
+    state.pop(state_field, None)
+
+
+INDETERMINATE_OPEN_CODES = {"client_disconnected", "command_timeout", "server_unavailable"}
+PENDING_ROOM_GRACE_MS = 60_000
+
+
+def reconcile_pending_room(state: dict[str, Any]) -> None:
+    if not state.get("pending_room_id"):
+        return
+    started = state.get("pending_room_started_unix_ms", 0)
+    age_ms = int(time.time() * 1000) - started
+    if age_ms < PENDING_ROOM_GRACE_MS:
+        raise BootstrapError(
+            "a previous room launch is still pending; try Open group chat again shortly",
+            code="room_launch_pending",
+        )
+    state.pop("pending_room_id", None)
+    state.pop("pending_room_operation_id", None)
+    state.pop("pending_room_started_unix_ms", None)
+
+
+def register_room_pane(
+    state: dict[str, Any],
+    *,
+    workspace_id: str,
+    pane_id: str,
+    tab_id: str,
+    room: str,
+    operation_id: str,
+) -> None:
+    pending_operation = state.get("pending_room_operation_id")
+    if pending_operation and pending_operation != operation_id:
+        raise BootstrapError("this room launch was superseded by a newer operation")
+    if not pending_operation and state.get("room_pane_id") not in {None, "", pane_id}:
+        raise BootstrapError("this room launch is no longer current")
+    previous_pane_id = state.get("room_pane_id")
+    if previous_pane_id and previous_pane_id != pane_id:
+        stale_panes = state.setdefault("stale_room_pane_ids", [])
+        if previous_pane_id not in stale_panes:
+            stale_panes.append(previous_pane_id)
+    state.update(
+        {
+            "chat_workspace_id": workspace_id,
+            "room_pane_id": pane_id,
+            "room_tab_id": tab_id,
+            "last_room_id": room,
+        }
     )
+    state.pop("pending_room_id", None)
+    state.pop("pending_room_operation_id", None)
+    state.pop("pending_room_started_unix_ms", None)
 
 
 def launch_room(open_existing: bool) -> int:
     herdr_bin = os.environ.get("HERDR_BIN_PATH", "herdr")
     context = plugin_context()
     cwd = str(context.get("focused_pane_cwd") or context.get("workspace_cwd") or Path.cwd())
-    workspace_id, placeholder_tab_id = chat_workspace(herdr_bin, cwd)
+    state_dir = plugin_state_dir()
+    with launcher_state_lock(state_dir) as state_path:
+        state = load_launcher_state(state_dir, state_path)
+        reconcile_pending_room(state)
+        save_launcher_state(state_dir, state, state_path)
+        state = load_validated_launcher_state(state_dir, herdr_bin, state_path)
+        close_tracked_tab(
+            herdr_bin,
+            state,
+            "chat_placeholder_tab_id",
+            state.get("chat_placeholder_tab_id"),
+            state_dir,
+            state_path,
+        )
+        close_tracked_tab(
+            herdr_bin,
+            state,
+            "agents_placeholder_tab_id",
+            state.get("agents_placeholder_tab_id"),
+            state_dir,
+            state_path,
+        )
+        clean_stale_room_panes(herdr_bin, state, state_dir, state_path)
+        save_launcher_state(state_dir, state, state_path)
 
-    if open_existing:
-        panes = run_json(herdr_bin, ["pane", "list", "--workspace", workspace_id])
-        for pane in panes.get("result", {}).get("panes", []):
-            if isinstance(pane, dict) and pane.get("label") in {"Group chat", "New group chat"}:
-                response = run_json(herdr_bin, ["tab", "focus", str(pane["tab_id"])])
+        previous_pane_id = state.get("room_pane_id")
+        if open_existing and previous_pane_id:
+            try:
+                assert_server_identity(state_dir, state_path)
+                response = run_json(herdr_bin, ["plugin", "pane", "focus", previous_pane_id])
+            except BootstrapError as error:
+                if error.code != "plugin_pane_not_found":
+                    raise
+                state.pop("room_pane_id", None)
+                state.pop("room_tab_id", None)
+                save_launcher_state(state_dir, state, state_path)
+            else:
                 print(json.dumps(response, separators=(",", ":")))
                 return 0
 
-    plugin_id = os.environ.get("HERDR_PLUGIN_ID", "terry.herdr-group-chat")
-    entrypoint = "room" if open_existing else "new-room"
-    response = run_json(
-        herdr_bin,
-        [
+        workspace_id, placeholder_tab_id = ensure_chat_workspace(
+            herdr_bin, cwd, state_dir, state, state_path
+        )
+        save_launcher_state(state_dir, state, state_path)
+
+        plugin_id = os.environ.get("HERDR_PLUGIN_ID", "terry.herdr-group-chat")
+        entrypoint = "room" if open_existing else "new-room"
+        room = state.get("last_room_id", "cockpit") if open_existing else new_room_id()
+        operation_id = uuid.uuid4().hex
+        pane_arguments = [
             "plugin",
             "pane",
             "open",
@@ -160,31 +568,127 @@ def launch_room(open_existing: bool) -> int:
             "tab",
             "--workspace",
             workspace_id,
-            "--cwd",
-            cwd,
-            "--focus",
-        ],
-    )
-    tab_id = response["result"]["plugin_pane"]["pane"]["tab_id"]
-    run_json(herdr_bin, ["tab", "rename", str(tab_id), "group-chat"])
-    if placeholder_tab_id:
-        with suppress(BootstrapError):
-            run_json(herdr_bin, ["tab", "close", placeholder_tab_id])
+            "--env",
+            f"{ROOM_ENV}={room}",
+            "--env",
+            f"{AGENT_CWD_ENV}={cwd}",
+            "--env",
+            f"{ROOM_OPERATION_ENV}={operation_id}",
+        ]
+        agents_workspace_id = state.get("agents_workspace_id")
+        if agents_workspace_id and agents_workspace_id in workspace_ids(herdr_bin):
+            pane_arguments.extend(["--env", f"{AGENTS_WORKSPACE_ENV}={agents_workspace_id}"])
+        pane_arguments.append("--focus")
+        state["pending_room_id"] = room
+        state["pending_room_operation_id"] = operation_id
+        state["pending_room_started_unix_ms"] = int(time.time() * 1000)
+        save_launcher_state(state_dir, state, state_path)
+        try:
+            assert_server_identity(state_dir, state_path)
+            response = run_json(herdr_bin, pane_arguments, timeout=None)
+        except BootstrapError as error:
+            if error.code not in INDETERMINATE_OPEN_CODES:
+                state.pop("pending_room_id", None)
+                state.pop("pending_room_operation_id", None)
+                state.pop("pending_room_started_unix_ms", None)
+                save_launcher_state(state_dir, state, state_path)
+            raise
+        pane = response["result"]["plugin_pane"]["pane"]
+        pane_id = str(pane["pane_id"])
+        tab_id = str(pane["tab_id"])
+        register_room_pane(
+            state,
+            workspace_id=workspace_id,
+            pane_id=pane_id,
+            tab_id=tab_id,
+            room=room,
+            operation_id=operation_id,
+        )
+        save_launcher_state(state_dir, state, state_path)
+        assert_server_identity(state_dir, state_path)
+        run_json(herdr_bin, ["tab", "rename", tab_id, "group-chat"])
+        close_tracked_tab(
+            herdr_bin,
+            state,
+            "chat_placeholder_tab_id",
+            placeholder_tab_id,
+            state_dir,
+            state_path,
+        )
+        clean_stale_room_panes(herdr_bin, state, state_dir, state_path)
+        save_launcher_state(state_dir, state, state_path)
     print(json.dumps(response, separators=(",", ":")))
     return 0
 
 
-def main() -> int:
-    herdr_bin = os.environ.get("HERDR_BIN_PATH", "herdr")
-    workspace_id = os.environ.get("HERDR_WORKSPACE_ID", "").strip()
-    tab_id = os.environ.get("HERDR_TAB_ID", "").strip()
-    if not workspace_id:
-        raise BootstrapError("New group chat must run inside a Herdr workspace")
+def same_cwd(left: str, right: str) -> bool:
+    return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
 
-    context = plugin_context()
-    agent_cwd = str(context.get("focused_pane_cwd") or context.get("workspace_cwd") or Path.cwd())
-    agents_workspace_id, placeholder_tab_id = ensure_agents_workspace(herdr_bin, agent_cwd)
 
+def infer_owned_agents_cwd(herdr_bin: str, agents_workspace_id: str, requested_cwd: str) -> str:
+    listed = run_json(herdr_bin, ["agent", "list"])
+    expected_names = {name for _, name in PARTICIPANTS}
+    owned_cwds = {
+        str(item.get("cwd") or item.get("foreground_cwd"))
+        for item in listed.get("result", {}).get("agents", [])
+        if isinstance(item, dict)
+        and item.get("name") in expected_names
+        and str(item.get("workspace_id")) == agents_workspace_id
+        and (item.get("cwd") or item.get("foreground_cwd"))
+    }
+    return owned_cwds.pop() if len(owned_cwds) == 1 else requested_cwd
+
+
+def close_pending_participant_tab(
+    herdr_bin: str,
+    agents_workspace_id: str,
+    pending: dict[str, Any],
+    state_dir: Path,
+    state_path: Path,
+) -> None:
+    tab_id = pending.get("tab_id")
+    if not tab_id and pending.get("label"):
+        listed = run_json(herdr_bin, ["tab", "list", "--workspace", agents_workspace_id])
+        matches = [
+            tab
+            for tab in listed.get("result", {}).get("tabs", [])
+            if isinstance(tab, dict) and tab.get("label") == pending["label"]
+        ]
+        if len(matches) == 1:
+            tab_id = matches[0].get("tab_id")
+    if tab_id:
+        assert_server_identity(state_dir, state_path)
+        try:
+            run_json(herdr_bin, ["tab", "close", str(tab_id)])
+        except BootstrapError as error:
+            if error.code != "tab_not_found":
+                raise
+
+
+def close_recorded_participant(
+    herdr_bin: str,
+    pane_id: str,
+    tab_id: str | None,
+    state_dir: Path,
+    state_path: Path,
+) -> None:
+    assert_server_identity(state_dir, state_path)
+    arguments = ["tab", "close", tab_id] if tab_id else ["pane", "close", pane_id]
+    try:
+        run_json(herdr_bin, arguments)
+    except BootstrapError as error:
+        if error.code not in {"tab_not_found", "pane_not_found"}:
+            raise
+
+
+def start_participants(
+    herdr_bin: str,
+    agent_cwd: str,
+    agents_workspace_id: str,
+    state_dir: Path,
+    state_path: Path,
+    state: dict[str, Any],
+) -> list[str]:
     listed = run_json(herdr_bin, ["agent", "list"])
     agents = listed.get("result", {}).get("agents", [])
     live_agents = {
@@ -192,29 +696,85 @@ def main() -> int:
     }
 
     failures: list[str] = []
+    participant_panes = state.setdefault("participant_pane_ids", {})
+    participant_tabs = state.setdefault("participant_tab_ids", {})
+    pending_tabs = state.setdefault("pending_participant_tabs", {})
     for kind, name in PARTICIPANTS:
         live_agent = live_agents.get(name)
         if live_agent is not None:
-            if live_agent.get("workspace_id") != agents_workspace_id:
-                run_json(
-                    herdr_bin,
-                    [
-                        "pane",
-                        "move",
-                        str(live_agent["pane_id"]),
-                        "--new-tab",
-                        "--workspace",
-                        agents_workspace_id,
-                        "--label",
-                        kind,
-                        "--no-focus",
-                    ],
+            live_cwd = str(live_agent.get("cwd") or live_agent.get("foreground_cwd") or "")
+            recorded_pane_id = participant_panes.get(kind)
+            if (
+                str(live_agent.get("workspace_id")) != agents_workspace_id
+                or not live_cwd
+                or not same_cwd(live_cwd, agent_cwd)
+                or recorded_pane_id != str(live_agent.get("pane_id"))
+            ):
+                failures.append(
+                    f"@{kind}: {name} is already in use outside this plugin-owned project"
                 )
-                print(f"hide   @{kind} in agents workspace", flush=True)
+                print(f"failed @{kind}", flush=True)
+                continue
+            participant_panes[kind] = str(live_agent["pane_id"])
+            participant_tabs[kind] = str(live_agent["tab_id"])
+            pending = pending_tabs.get(kind)
+            if pending and pending.get("tab_id") != live_agent.get("tab_id"):
+                try:
+                    close_pending_participant_tab(
+                        herdr_bin, agents_workspace_id, pending, state_dir, state_path
+                    )
+                except BootstrapError as error:
+                    failures.append(f"@{kind}: pending-tab cleanup failed: {error}")
+                    print(f"cleanup @{kind} pending", flush=True)
+                    save_launcher_state(state_dir, state, state_path)
+                    continue
+            pending_tabs.pop(kind, None)
+            save_launcher_state(state_dir, state, state_path)
             print(f"ready  @{kind} (existing {name})", flush=True)
             continue
         print(f"start  @{kind}", flush=True)
+        recorded_pane_id = participant_panes.get(kind)
+        if recorded_pane_id:
+            try:
+                close_recorded_participant(
+                    herdr_bin,
+                    recorded_pane_id,
+                    participant_tabs.get(kind),
+                    state_dir,
+                    state_path,
+                )
+            except BootstrapError as error:
+                failures.append(f"@{kind}: previous-tab cleanup failed: {error}")
+                print(f"cleanup @{kind} previous", flush=True)
+                continue
+            participant_panes.pop(kind, None)
+            participant_tabs.pop(kind, None)
+            save_launcher_state(state_dir, state, state_path)
+        pending = pending_tabs.get(kind)
+        if pending:
+            age_ms = int(time.time() * 1000) - int(pending.get("started_unix_ms", 0))
+            if age_ms < PENDING_ROOM_GRACE_MS:
+                failures.append(f"@{kind}: previous agent start is still pending")
+                print(f"pending @{kind}", flush=True)
+                continue
+            try:
+                close_pending_participant_tab(
+                    herdr_bin, agents_workspace_id, pending, state_dir, state_path
+                )
+            except BootstrapError as error:
+                failures.append(f"@{kind}: pending-tab cleanup failed: {error}")
+                print(f"cleanup @{kind} pending", flush=True)
+                continue
+            pending_tabs.pop(kind, None)
+            save_launcher_state(state_dir, state, state_path)
         try:
+            pending_label = f"hgchat-{kind}-{uuid.uuid4().hex[:10]}"
+            pending_tabs[kind] = {
+                "label": pending_label,
+                "started_unix_ms": int(time.time() * 1000),
+            }
+            save_launcher_state(state_dir, state, state_path)
+            assert_server_identity(state_dir, state_path)
             created = run_json(
                 herdr_bin,
                 [
@@ -225,12 +785,22 @@ def main() -> int:
                     "--cwd",
                     agent_cwd,
                     "--label",
-                    kind,
+                    pending_label,
                     "--no-focus",
                 ],
+                timeout=None,
             )
-            pane_id = created["result"]["root_pane"]["pane_id"]
+            pane_id = str(created["result"]["root_pane"]["pane_id"])
+            participant_tab_id = str(created["result"]["tab"]["tab_id"])
+            pending_tabs[kind] = {
+                "label": pending_label,
+                "pane_id": pane_id,
+                "tab_id": participant_tab_id,
+                "started_unix_ms": int(time.time() * 1000),
+            }
+            save_launcher_state(state_dir, state, state_path)
             wait_for_shell(herdr_bin, pane_id)
+            assert_server_identity(state_dir, state_path)
             run_json(
                 herdr_bin,
                 [
@@ -244,21 +814,112 @@ def main() -> int:
                     "--timeout",
                     "120000",
                 ],
-                timeout=140,
+                timeout=None,
             )
-            dismiss_inactive_hook_notice(herdr_bin, name, pane_id)
+            participant_panes[kind] = pane_id
+            participant_tabs[kind] = participant_tab_id
+            pending_tabs.pop(kind, None)
+            save_launcher_state(state_dir, state, state_path)
+            with suppress(BootstrapError):
+                assert_server_identity(state_dir, state_path)
+                run_json(herdr_bin, ["tab", "rename", participant_tab_id, kind])
+            with suppress(BootstrapError):
+                assert_server_identity(state_dir, state_path)
+                dismiss_inactive_hook_notice(herdr_bin, name, pane_id)
             print(f"ready  @{kind}", flush=True)
         except (BootstrapError, KeyError, TypeError) as error:
+            if not isinstance(error, BootstrapError) or error.code not in INDETERMINATE_OPEN_CODES:
+                pending = pending_tabs.get(kind)
+                if pending:
+                    try:
+                        close_pending_participant_tab(
+                            herdr_bin,
+                            agents_workspace_id,
+                            pending,
+                            state_dir,
+                            state_path,
+                        )
+                    except BootstrapError as cleanup_error:
+                        failures.append(f"@{kind}: pending-tab cleanup failed: {cleanup_error}")
+                    else:
+                        pending_tabs.pop(kind, None)
+                save_launcher_state(state_dir, state, state_path)
             failures.append(f"@{kind}: {error}")
             print(f"failed @{kind}", flush=True)
+    if not participant_panes:
+        state.pop("participant_pane_ids", None)
+    if not participant_tabs:
+        state.pop("participant_tab_ids", None)
+    if not pending_tabs:
+        state.pop("pending_participant_tabs", None)
+    save_launcher_state(state_dir, state, state_path)
+    return failures
 
-    if placeholder_tab_id:
-        with suppress(BootstrapError):
-            run_json(herdr_bin, ["tab", "close", placeholder_tab_id])
 
-    if tab_id:
-        with suppress(BootstrapError):
-            run_json(herdr_bin, ["tab", "rename", tab_id, "group-chat"])
+def main() -> int:
+    herdr_bin = os.environ.get("HERDR_BIN_PATH", "herdr")
+    workspace_id = os.environ.get("HERDR_WORKSPACE_ID", "").strip()
+    tab_id = os.environ.get("HERDR_TAB_ID", "").strip()
+    if not workspace_id:
+        raise BootstrapError("New group chat must run inside a Herdr workspace")
+
+    context = plugin_context()
+    requested_agent_cwd = os.environ.get(AGENT_CWD_ENV, "").strip() or str(
+        context.get("focused_pane_cwd") or context.get("workspace_cwd") or Path.cwd()
+    )
+    state_dir = plugin_state_dir()
+    pane_id = os.environ.get("HERDR_PANE_ID", "").strip()
+    operation_id = os.environ.get(ROOM_OPERATION_ENV, "").strip()
+    room = os.environ.get(ROOM_ENV, "").strip() or new_room_id()
+    if not pane_id or not tab_id or not operation_id:
+        raise BootstrapError("New group chat is missing its Herdr pane context")
+    with launcher_state_lock(state_dir) as state_path:
+        state = load_launcher_state(state_dir, state_path)
+        register_room_pane(
+            state,
+            workspace_id=workspace_id,
+            pane_id=pane_id,
+            tab_id=tab_id,
+            room=room,
+            operation_id=operation_id,
+        )
+        existing_agents_workspace = str(state.get("agents_workspace_id") or "")
+        agent_cwd = str(state.get("agents_cwd") or "")
+        if not agent_cwd:
+            agent_cwd = (
+                infer_owned_agents_cwd(herdr_bin, existing_agents_workspace, requested_agent_cwd)
+                if existing_agents_workspace
+                else requested_agent_cwd
+            )
+            state["agents_cwd"] = agent_cwd
+        agents_workspace_id, placeholder_tab_id = ensure_agents_workspace(
+            herdr_bin, agent_cwd, state_dir, state, state_path
+        )
+        save_launcher_state(state_dir, state, state_path)
+
+        failures = start_participants(
+            herdr_bin,
+            agent_cwd,
+            agents_workspace_id,
+            state_dir,
+            state_path,
+            state,
+        )
+
+        close_tracked_tab(
+            herdr_bin,
+            state,
+            "agents_placeholder_tab_id",
+            placeholder_tab_id,
+            state_dir,
+            state_path,
+        )
+        if tab_id:
+            with suppress(BootstrapError):
+                assert_server_identity(state_dir, state_path)
+                run_json(herdr_bin, ["tab", "rename", tab_id, "group-chat"])
+        clean_stale_room_panes(herdr_bin, state, state_dir, state_path)
+        save_launcher_state(state_dir, state, state_path)
 
     if failures:
         print("\nUnavailable participants:", flush=True)
@@ -268,9 +929,49 @@ def main() -> int:
     else:
         print("\nAll participants ready. Opening the room...", flush=True)
 
-    room = datetime.now().strftime("chat-%Y%m%d-%H%M%S")
     executable = Path(__file__).resolve().parent / "herdr-group-chat"
-    os.execv(str(executable), [str(executable), "--room", room])
+    os.execv(
+        str(executable),
+        [
+            str(executable),
+            "--room",
+            room,
+            "--agents-workspace",
+            agents_workspace_id,
+        ],
+    )
+
+
+def room_entrypoint() -> int:
+    workspace_id = os.environ.get("HERDR_WORKSPACE_ID", "").strip()
+    pane_id = os.environ.get("HERDR_PANE_ID", "").strip()
+    tab_id = os.environ.get("HERDR_TAB_ID", "").strip()
+    operation_id = os.environ.get(ROOM_OPERATION_ENV, "").strip()
+    room = os.environ.get(ROOM_ENV, "").strip()
+    if not all((workspace_id, pane_id, tab_id, operation_id, room)):
+        raise BootstrapError("Group chat is missing its Herdr pane context")
+    state_dir = plugin_state_dir()
+    with launcher_state_lock(state_dir) as state_path:
+        state = load_launcher_state(state_dir, state_path)
+        register_room_pane(
+            state,
+            workspace_id=workspace_id,
+            pane_id=pane_id,
+            tab_id=tab_id,
+            room=room,
+            operation_id=operation_id,
+        )
+        clean_stale_room_panes(
+            os.environ.get("HERDR_BIN_PATH", "herdr"), state, state_dir, state_path
+        )
+        save_launcher_state(state_dir, state, state_path)
+        agents_workspace_id = str(state.get("agents_workspace_id") or "")
+    executable = Path(__file__).resolve().parent / "herdr-group-chat"
+    arguments = [str(executable), "--room", room]
+    if agents_workspace_id:
+        arguments.extend(["--agents-workspace", agents_workspace_id])
+    os.execv(str(executable), arguments)
+    return 0
 
 
 if __name__ == "__main__":
@@ -279,6 +980,8 @@ if __name__ == "__main__":
             raise SystemExit(launch_room(open_existing=False))
         if sys.argv[1:] == ["--open"]:
             raise SystemExit(launch_room(open_existing=True))
+        if sys.argv[1:] == ["--room-entrypoint"]:
+            raise SystemExit(room_entrypoint())
         if sys.argv[1:]:
             raise BootstrapError(f"unknown arguments: {' '.join(sys.argv[1:])}")
         raise SystemExit(main())

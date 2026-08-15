@@ -51,8 +51,8 @@ class FakeClient:
     def focus(self, target: str) -> None:
         self.focused.append(target)
 
-    def focus_workspace(self, label: str) -> None:
-        self.focused.append(f"workspace:{label}")
+    def focus_workspace(self, workspace_id: str) -> None:
+        self.focused.append(f"workspace:{workspace_id}")
 
     def turn(self, target: str, prompt: str) -> tuple[str, str]:
         self.calls.append((target, prompt))
@@ -74,6 +74,7 @@ def make_chat(tmp_path: Path, max_turns: int = 4) -> tuple[object, FakeClient, o
         },
         client,
         max_turns=max_turns,
+        agents_workspace_id="w-agents",
     )
     return chat, client, transcript
 
@@ -99,8 +100,19 @@ def test_local_navigation_commands_focus_agents_without_entering_transcript(tmp_
     assert handle_local_command("/agents", chat) == "Focused the agents workspace."
     assert handle_local_command("/show nobody", chat) == "Unknown participant: nobody"
     assert handle_local_command("ordinary message", chat) is None
-    assert client.focused == ["codex-peer", "workspace:agents"]
+    assert client.focused == ["codex-peer", "workspace:w-agents"]
     assert transcript.read() == []
+
+
+def test_agents_command_does_not_guess_a_workspace_by_label(tmp_path: Path) -> None:
+    transcript = Transcript(tmp_path, "test-room")
+    client = FakeClient()
+    chat = GroupChat(transcript, {"pi": "pi-peer"}, client)
+
+    assert handle_local_command("/agents", chat) == (
+        "The agents workspace is unavailable; use /show <agent>."
+    )
+    assert client.focused == []
 
 
 def test_mentions_route_to_named_agents_and_reject_unknown() -> None:
