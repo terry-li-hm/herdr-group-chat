@@ -69,6 +69,10 @@ The plugin declares one action and one managed room pane. Herdr supplies
 standalone CLI use retains `~/.local/state/herdr-group-chat/`. An explicit
 `--state-dir` always wins.
 
+Invoking **Open group chat** opens and focuses a persistent `group-chat` tab in
+the Herdr TUI. The transcript and input remain visible there while you switch
+among the Pi, Claude, Codex, and Grok tabs.
+
 The plugin contains no network client and does not broaden agent permissions.
 It relays prompts through Herdr to each native agent, so the agent provider's
 own data-handling terms still apply. Room transcripts contain message content;

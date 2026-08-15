@@ -271,6 +271,7 @@ def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:
     assert manifest["version"] == project["project"]["version"]
     assert [action["id"] for action in manifest["actions"]] == ["open"]
     assert [pane["id"] for pane in manifest["panes"]] == ["room"]
+    assert manifest["panes"][0]["placement"] == "tab"
     assert "events" not in manifest
     assert "startup" not in manifest
     for command in (manifest["actions"][0]["command"], manifest["panes"][0]["command"]):

@@ -7,11 +7,17 @@ plugin_id=${HERDR_PLUGIN_ID:-terry.herdr-group-chat}
 set -- "$herdr_bin" plugin pane open \
     --plugin "$plugin_id" \
     --entrypoint room \
-    --placement overlay \
+    --placement tab \
     --focus
 
 if [ -n "${HERDR_PLUGIN_ROOT:-}" ]; then
     set -- "$@" --cwd "$HERDR_PLUGIN_ROOT"
 fi
 
-exec "$@"
+response=$("$@")
+printf '%s\n' "$response"
+
+tab_id=$(printf '%s\n' "$response" | sed -n 's/.*"tab_id":"\([^"]*\)".*/\1/p')
+if [ -n "$tab_id" ]; then
+    "$herdr_bin" tab rename "$tab_id" group-chat >/dev/null 2>&1 || true
+fi

@@ -14,5 +14,5 @@ command = ["./open-room"]
 [[panes]]
 id = "room"
 title = "Group chat"
-placement = "overlay"
+placement = "tab"
 command = ["./herdr-group-chat"]
