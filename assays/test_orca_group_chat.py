@@ -161,6 +161,43 @@ def test_turn_falls_back_to_bounded_terminal_read(tmp_path: Path) -> None:
     ]
 
 
+def test_stale_wait_still_collects_a_delayed_token_bound_response_file(tmp_path: Path) -> None:
+    token = "e" * 32
+    response_file = tmp_path / "responses" / f"{token}.txt"
+    writer: threading.Thread | None = None
+
+    def write_response() -> None:
+        response_file.parent.mkdir(parents=True, exist_ok=True)
+        response_file.write_text(
+            f"HGCHAT_REPLY_BEGIN {token}\ndelayed answer\nHGCHAT_REPLY_END {token}\n",
+            encoding="utf-8",
+        )
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        nonlocal writer
+        if argv[1:3] == ["terminal", "wait"]:
+            writer = threading.Timer(0.02, write_response)
+            writer.start()
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                stdout='{"ok":false,"error":{"code":"terminal_handle_stale",'
+                '"message":"terminal_handle_stale"}}',
+                stderr="",
+            )
+        return subprocess.CompletedProcess(argv, 0, stdout=json_result("{}"), stderr="")
+
+    client = OrcaClient(orca_bin="orca-test", state_dir=tmp_path, runner=runner)
+    assert client.turn(
+        "term_pi",
+        f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+        1_000,
+    ) == ("done", "delayed answer")
+    assert writer is not None
+    writer.join(timeout=1)
+    assert response_file.stat().st_mode & 0o777 == 0o600
+
+
 def test_cancel_targets_only_the_exact_terminal_handle() -> None:
     calls: list[list[str]] = []
 
