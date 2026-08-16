@@ -1208,6 +1208,32 @@ def test_herdr_turn_unmarked_streak_resets_when_terminal_content_changes(
     assert len(reads) > streak_limit
 
 
+def test_setup_failures_are_recorded_as_system_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcript = Transcript(tmp_path, "room")
+    monkeypatch.setenv("HERDR_GROUP_CHAT_SETUP_FAILURES", "@pi: start failed\n@claude: pane lost\n")
+
+    namespace["record_setup_failures"](transcript)
+
+    assert [(item["sender"], item["body"]) for item in transcript.read()] == [
+        ("system", "setup: @pi: start failed"),
+        ("system", "setup: @claude: pane lost"),
+    ]
+
+
+def test_setup_failures_absent_or_empty_record_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcript = Transcript(tmp_path, "room")
+    monkeypatch.delenv("HERDR_GROUP_CHAT_SETUP_FAILURES", raising=False)
+    namespace["record_setup_failures"](transcript)
+    monkeypatch.setenv("HERDR_GROUP_CHAT_SETUP_FAILURES", "")
+    namespace["record_setup_failures"](transcript)
+
+    assert transcript.read() == []
+
+
 def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:
     manifest = tomllib.loads((EFFECTOR.parent / "herdr-plugin.toml").read_text(encoding="utf-8"))
     project = tomllib.loads((EFFECTOR.parent / "pyproject.toml").read_text(encoding="utf-8"))

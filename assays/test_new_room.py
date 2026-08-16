@@ -916,3 +916,113 @@ def test_started_participant_tabs_are_labeled_for_group_chat(
     reads = [call for call in calls if call[:2] == ["pane", "read"]]
     assert reads and all(call[2] == "w-agents:p-codex" for call in reads)
     assert not any(call[:2] == ["agent", "send-keys"] for call in calls)
+
+
+def launch_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, captured: dict[str, object]
+) -> None:
+    """Set the pane context main() requires and capture the exec'd room process."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("HERDR_WORKSPACE_ID", "w-chat")
+    monkeypatch.setenv("HERDR_TAB_ID", "w-chat:t-room")
+    monkeypatch.setenv("HERDR_PANE_ID", "w-chat:p-room")
+    monkeypatch.setenv(module.ROOM_OPERATION_ENV, "operation-test")
+    monkeypatch.setattr(
+        module.os,
+        "execv",
+        lambda path, argv: captured.update(path=path, argv=argv, env=dict(os.environ)),
+    )
+
+
+def test_launch_hands_participant_failures_to_the_room_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "PARTICIPANTS", (("pi", "pi-peer"),))
+    captured: dict[str, object] = {}
+    launch_env(tmp_path, monkeypatch, captured)
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        if arguments == ["workspace", "list"]:
+            return {"result": {"workspaces": []}}
+        if arguments[:2] == ["workspace", "create"]:
+            return {
+                "result": {
+                    "workspace": {"workspace_id": "w-agents"},
+                    "tab": {"tab_id": "w-agents:t1"},
+                }
+            }
+        if arguments == ["agent", "list"]:
+            return {
+                "result": {
+                    "agents": [
+                        {
+                            "name": "pi-peer",
+                            "workspace_id": "w-other",
+                            "cwd": str(tmp_path),
+                            "pane_id": "w-other:p1",
+                            "tab_id": "w-other:t1",
+                        }
+                    ]
+                }
+            }
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+
+    module.main()
+
+    env = captured["env"]
+    assert env[module.SETUP_FAILURES_ENV] == (
+        "@pi: pi-peer is already in use outside this plugin-owned project"
+    )
+    argv = captured["argv"]
+    assert argv[0].endswith("herdr-group-chat") and "--room" in argv
+
+
+def test_launch_without_failures_clears_stale_setup_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "PARTICIPANTS", (("pi", "pi-peer"),))
+    captured: dict[str, object] = {}
+    launch_env(tmp_path, monkeypatch, captured)
+    monkeypatch.setenv(module.SETUP_FAILURES_ENV, "@pi: stale failure from a previous launch")
+    save_launcher_state(
+        tmp_path,
+        {
+            "agents_workspace_id": "w-agents",
+            "agents_cwd": str(tmp_path),
+            "participant_pane_ids": {"pi": "w-agents:p1"},
+            "participant_tab_ids": {"pi": "w-agents:t1"},
+        },
+    )
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        if arguments == ["workspace", "list"]:
+            return {
+                "result": {
+                    "workspaces": [{"workspace_id": "w-agents", "label": "agents · group-chat"}]
+                }
+            }
+        if arguments == ["agent", "list"]:
+            return {
+                "result": {
+                    "agents": [
+                        {
+                            "name": "pi-peer",
+                            "workspace_id": "w-agents",
+                            "cwd": str(tmp_path),
+                            "pane_id": "w-agents:p1",
+                            "tab_id": "w-agents:t1",
+                        }
+                    ]
+                }
+            }
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+
+    module.main()
+
+    assert module.SETUP_FAILURES_ENV not in captured["env"]

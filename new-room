@@ -35,6 +35,7 @@ ROOM_ENV = "HERDR_GROUP_CHAT_ROOM"
 AGENTS_WORKSPACE_ENV = "HERDR_GROUP_CHAT_AGENTS_WORKSPACE_ID"
 AGENT_CWD_ENV = "HERDR_GROUP_CHAT_AGENT_CWD"
 ROOM_OPERATION_ENV = "HERDR_GROUP_CHAT_OPERATION_ID"
+SETUP_FAILURES_ENV = "HERDR_GROUP_CHAT_SETUP_FAILURES"
 
 
 class BootstrapError(RuntimeError):
@@ -955,6 +956,15 @@ def main() -> int:
     else:
         print("\nAll participants ready. Opening the room...", flush=True)
 
+    # Hand the failures to the room process so they survive the setup pane's
+    # redraw; a launch without failures must never show a previous launch's.
+    if failures:
+        os.environ[SETUP_FAILURES_ENV] = "\n".join(
+            failure.replace("\n", " ") for failure in failures
+        )
+    else:
+        os.environ.pop(SETUP_FAILURES_ENV, None)
+
     executable = Path(__file__).resolve().parent / "herdr-group-chat"
     os.execv(
         str(executable),
@@ -992,6 +1002,8 @@ def room_entrypoint() -> int:
         )
         save_launcher_state(state_dir, state, state_path)
         agents_workspace_id = str(state.get("agents_workspace_id") or "")
+    # Reopening a retained room must not replay a previous launch's setup failures.
+    os.environ.pop(SETUP_FAILURES_ENV, None)
     executable = Path(__file__).resolve().parent / "herdr-group-chat"
     arguments = [str(executable), "--room", room]
     if agents_workspace_id:

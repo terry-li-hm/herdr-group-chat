@@ -38,6 +38,7 @@ DEFAULT_AGENTS = {
 DEFAULT_STATE_DIR = Path("~/.local/state/herdr-group-chat")
 ROOM_ENV = "HERDR_GROUP_CHAT_ROOM"
 AGENTS_WORKSPACE_ENV = "HERDR_GROUP_CHAT_AGENTS_WORKSPACE_ID"
+SETUP_FAILURES_ENV = "HERDR_GROUP_CHAT_SETUP_FAILURES"
 ROOM_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
 MENTION_RE = re.compile(r"^@([a-z0-9_,@-]+)\s+(.*)$", re.DOTALL | re.IGNORECASE)
 REPLY_TOKEN_RE = re.compile(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})")
@@ -1392,6 +1393,18 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
             buffer += key
 
 
+def record_setup_failures(transcript: Transcript) -> None:
+    """Record launch-time participant setup failures as system entries.
+
+    The setup pane hands them over via SETUP_FAILURES_ENV before exec'ing the
+    room, because its own prints are lost when the room redraws the pane.
+    """
+    reported = os.environ.get(SETUP_FAILURES_ENV, "")
+    for failure in reported.splitlines():
+        if failure.strip():
+            transcript.append("system", ("human",), f"setup: {failure.strip()}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--room", default=os.environ.get(ROOM_ENV, "cockpit"))
@@ -1437,6 +1450,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             synthesizer=args.synthesizer,
             agent_timeouts=agent_timeouts,
         )
+        record_setup_failures(transcript)
         if args.once is not None:
             before = len(transcript.read())
             if args.once.strip() == "/review" or args.once.strip().startswith("/review "):

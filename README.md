@@ -101,7 +101,9 @@ room pane but retains that room's transcript. **Open group chat** focuses the
 exact recorded plugin pane or reopens the last room without starting models.
 The transcript and input remain visible while you switch among participant
 tabs. Failed cleanup remains recorded for a later retry instead of silently
-losing ownership of the old pane.
+losing ownership of the old pane. Participant setup failures are recorded as
+system entries in the new room's transcript, so a missing peer is explained
+rather than silently offline.
 
 Compact mode keeps the room alone in the initiating workspace and places the
 four native agent tabs in a secondary `agents · group-chat` workspace, with

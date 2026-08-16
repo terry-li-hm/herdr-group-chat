@@ -30,6 +30,8 @@ All notable changes to this project are documented here.
 - Only send cancellation Ctrl-C to agents observed working; an idle Codex
   treats Ctrl-C as quit, which previously killed the participant on a timeout
   whose prompt never landed.
+- Record participant setup failures as system entries in the new room's
+  transcript instead of losing them when the room redraws the setup pane.
 
 ## [0.2.0] - 2026-08-15
 
