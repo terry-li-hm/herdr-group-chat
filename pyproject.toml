@@ -29,3 +29,5 @@ select = ["E", "F", "I", "W", "B", "UP", "RUF", "SIM", "S"]
 "assays/*" = ["S101"]
 # The bootstrap executes only argv-based Herdr commands and its adjacent checked-in effector.
 "new-room" = ["S603", "S606"]
+# The adapter executes only argv-based Orca commands and its adjacent checked-in effector.
+"orca-group-chat" = ["S101", "S603", "S606"]

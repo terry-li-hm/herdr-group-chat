@@ -30,15 +30,15 @@ def json_result(payload: str) -> str:
 
 
 def test_agent_mappings_require_explicit_unique_terminal_handles() -> None:
-    assert parse_agent_mappings(
-        ["pi=term_pi", "Claude=term_claude", "codex=term_codex"]
-    ) == {
+    assert parse_agent_mappings(["pi=term_pi", "Claude=term_claude", "codex=term_codex"]) == {
         "pi": "term_pi",
         "claude": "term_claude",
         "codex": "term_codex",
     }
     with pytest.raises(ChatError, match="at least one --agent"):
         parse_agent_mappings([])
+    with pytest.raises(ChatError, match="duplicate agent mapping"):
+        parse_agent_mappings(["pi=term_old", "PI=term_new"])
     with pytest.raises(ChatError, match="duplicate terminal handle"):
         parse_agent_mappings(["pi=term_shared", "claude=term_shared"])
     with pytest.raises(ChatError, match="invalid agent mapping"):
@@ -105,6 +105,8 @@ def test_turn_sends_waits_and_reads_token_bound_response_file(tmp_path: Path) ->
     )
 
     assert (status, reply) == ("done", "answer from Orca")
+    response_file = next((tmp_path / "responses").glob("*.txt"))
+    assert response_file.stat().st_mode & 0o777 == 0o600
     assert calls[0][:5] == ["orca-test", "terminal", "send", "--terminal", "term_pi"]
     assert calls[0][-2:] == ["--enter", "--json"]
     assert calls[1] == [
@@ -200,6 +202,75 @@ def test_immediate_review_cancel_interrupts_after_submission(tmp_path: Path) -> 
             cancel_event,
         )
 
+    assert [call[1:3] for call in calls] == [
+        ["terminal", "send"],
+        ["terminal", "send"],
+    ]
+    assert "--interrupt" in calls[-1]
+
+
+def test_cancel_interrupts_a_running_terminal_wait(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+    wait_calls: list[list[str]] = []
+    cancel_event = threading.Event()
+    token = "d" * 32
+
+    class WaitingProcess:
+        def __init__(self) -> None:
+            self.returncode = 0
+            self.terminated = False
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            if not self.terminated:
+                cancel_event.set()
+                raise subprocess.TimeoutExpired("orca-test", timeout)
+            return "", ""
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.terminated = True
+
+    process = WaitingProcess()
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=json_result("{}"), stderr="")
+
+    def popen_factory(argv: list[str], **_: object) -> WaitingProcess:
+        wait_calls.append(argv)
+        return process
+
+    client = OrcaClient(
+        orca_bin="orca-test",
+        state_dir=tmp_path,
+        runner=runner,
+        popen_factory=popen_factory,
+    )
+    with pytest.raises(ChatError, match="review cancelled"):
+        client.turn(
+            "term_claude",
+            f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+            12_000,
+            cancel_event,
+        )
+
+    assert process.terminated
+    assert wait_calls == [
+        [
+            "orca-test",
+            "terminal",
+            "wait",
+            "--terminal",
+            "term_claude",
+            "--for",
+            "tui-idle",
+            "--timeout-ms",
+            "12000",
+            "--json",
+        ]
+    ]
     assert [call[1:3] for call in calls] == [
         ["terminal", "send"],
         ["terminal", "send"],

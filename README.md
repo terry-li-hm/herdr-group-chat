@@ -167,9 +167,47 @@ Run the focused gate with:
 
 ```bash
 uv run --with pytest pytest -q
-uv run ruff check herdr-group-chat new-room assays
-uv run ruff format --check herdr-group-chat new-room assays
+uv run ruff check herdr-group-chat new-room orca-group-chat assays
+uv run ruff format --check herdr-group-chat new-room orca-group-chat assays
 ```
 
 See [SECURITY.md](SECURITY.md) for private vulnerability reporting and
 [CHANGELOG.md](CHANGELOG.md) for release history.
+
+## Experimental Orca adapter
+
+`orca-group-chat` is an experimental adapter that reuses this project's core
+(transcript, routing, review, synthesis, retry, cancellation, and curses TUI)
+while driving **already-live Orca agent terminals by exact terminal handle**.
+It is not a Herdr plugin and does not launch participants automatically — you
+start the agent terminals in Orca yourself.
+
+Discover exact terminal handles with:
+
+```bash
+orca terminal list --json
+```
+
+Then map one or more of `pi`, `claude`, `codex`, and `grok` explicitly;
+mappings and handles must be unique and nothing is guessed by title:
+
+```bash
+orca-group-chat --room myroom \
+  --agent pi=term_376a8453-88d7-4c3f-90b9-514d47cf87fb \
+  --agent codex=term_0d91c2f4-6b1e-4a30-9f57-c2ad80b1e644
+```
+
+A turn sends the prompt with `orca terminal send`, waits for `tui-idle`, and
+reads a token-bound reply from a private per-turn response file under
+`~/.local/state/orca-group-chat` (override with `--state-dir` or
+`ORCA_GROUP_CHAT_STATE_DIR`), falling back to a bounded
+`orca terminal read --limit 1000`. Cancellation targets only the exact
+terminal via `orca terminal send --interrupt`, and `focus`/`/show` uses
+`orca terminal switch`. Only connected, writable, non-orphaned terminals are
+considered live. `--once`, `--show`, and the interactive TUI work as in the
+Herdr executable.
+
+Accepted tradeoff: this first vertical slice uses Orca terminal control rather
+than creating an orchestration Task/Dispatch per conversational turn. It
+introduces no new message bus, MCP dependency, plugin framework, cross-host
+support, or automatic terminal lifecycle ownership.
