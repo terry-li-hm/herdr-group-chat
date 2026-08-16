@@ -11,6 +11,10 @@ All notable changes to this project are documented here.
 - Label review and synthesis entries while preserving the append-only ordered
   transcript, targeted mentions, and ordinary serial chat behavior.
 - Add Page Up and Page Down transcript scrolling.
+- Poll Herdr at half-second intervals, defer the first terminal read until the agent has
+  been seen working, and treat a refused or slow terminal read as not-ready instead of
+  failing the turn and interrupting the agent. Ctrl-Q now waits for an active review's
+  cancellation to reach the agents.
 
 ## [0.2.0] - 2026-08-15
 
