@@ -6,9 +6,10 @@ local relay provides `@pi`, `@claude`, `@codex`, `@grok`, and `@all` addressing.
 
 > Preview release for Herdr 0.8.0 or newer on macOS and Linux.
 
-Messages are delivered serially, capped at four agent turns by default, and
-recorded as append-only JSONL in the resolved state directory. Each agent
-receives only group messages added since its previous delivered turn.
+Ordinary messages are delivered serially and capped at four agent turns by
+default. Review rounds run their independent first-pass calls concurrently,
+then ask one configured agent to synthesize the collected answers. All messages
+are recorded as append-only JSONL in the resolved state directory.
 
 ## Install
 
@@ -35,6 +36,25 @@ Plain messages address everyone. Prefix a message to select participants:
 @pi Summarise the decision.
 ```
 
+Use `/review` when the agents should reach their views independently before any
+answer can influence another. Mentions select reviewers; without mentions, all
+participants review. Pi synthesizes by default.
+
+```text
+/review Review this email draft and recommend the final wording.
+/review @claude,@codex Challenge this architecture.
+/cancel
+/retry claude
+/retry synthesis
+```
+
+The room stays responsive while a review runs and shows each participant as
+queued, working, blocked, done, failed, timed out, cancelled, synthesizing, or
+skipped. `/cancel` interrupts only active participant tabs. A failed, blocked,
+timed-out, or cancelled first pass can be retried without rerunning the other
+reviewers; a successful retry triggers a fresh synthesis. Use Page Up and Page
+Down to scroll the transcript while work continues.
+
 A verified four-agent round looks like:
 
 ```text
@@ -50,8 +70,14 @@ The standalone CLI remains available:
 ```bash
 ./herdr-group-chat
 ./herdr-group-chat --once "@all Compare these options."
+./herdr-group-chat --once "/review @claude,@codex Compare these options."
+./herdr-group-chat --synthesizer codex --agent-timeout grok=900000
 ./herdr-group-chat --show
 ```
+
+Set `HERDR_GROUP_CHAT_SYNTHESIZER` or pass `--synthesizer` to select Pi,
+Claude, Codex, or Grok for phase two. `--agent-timeout NAME=MILLISECONDS`
+overrides the default timeout for one participant and may be repeated.
 
 Uninstall a GitHub-managed copy with:
 
@@ -102,12 +128,19 @@ can be completed in the native agent pane. Grok's alternate-screen TUI can hide
 a completed reply above the visible viewport; when that happens, the plugin
 recovers only the token-bound reply from the active local Grok session history.
 
+The review protocol and remaining v0.3 boundaries are specified in
+[docs/v0.3-review.md](docs/v0.3-review.md).
+
 ## Limitations
 
-- Turns are serial and capped at four by default.
+- Ordinary group turns remain serial; only `/review` first passes are parallel.
 - Every addressed agent must already be live in Herdr.
 - New-room setup starts all four default participants; participant selection is
   not yet configurable.
+- Retry state is kept in the running room process and does not survive a room
+  restart. The transcript itself remains durable.
+- Cancellation sends Ctrl-C to the exact active Herdr agent tab. It is
+  best-effort because the underlying CLI has no stronger cancellation primitive.
 - Rooms are local to one Herdr installation; this is not a network chat server.
 - Grok session recovery depends on the local `~/.grok/sessions` history layout.
 - The preview release supports macOS and Linux.

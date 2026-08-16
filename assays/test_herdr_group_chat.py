@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
+import threading
 import tomllib
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
@@ -21,21 +23,30 @@ namespace = module.__dict__
 
 ChatError = namespace["ChatError"]
 GroupChat = namespace["GroupChat"]
+HerdrClient = namespace["HerdrClient"]
+ReviewController = namespace["ReviewController"]
 Route = namespace["Route"]
 Transcript = namespace["Transcript"]
 extract_reply = namespace["extract_reply"]
 extract_grok_session_reply = namespace["extract_grok_session_reply"]
 build_prompt = namespace["build_prompt"]
+build_review_prompt = namespace["build_review_prompt"]
+build_synthesis_prompt = namespace["build_synthesis_prompt"]
+message_lines = namespace["message_lines"]
+parse_agent_timeouts = namespace["parse_agent_timeouts"]
 parse_route = namespace["parse_route"]
 resolve_state_dir = namespace["resolve_state_dir"]
 participant_status = namespace["participant_status"]
 handle_local_command = namespace["handle_local_command"]
+visible_message_lines = namespace["visible_message_lines"]
 
 
 class FakeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.timeouts: list[int | None] = []
         self.focused: list[str] = []
+        self.cancelled: list[str] = []
 
     def live_targets(self) -> set[str]:
         return {"pi-peer", "claude-peer", "codex-peer", "grok-peer"}
@@ -54,11 +65,23 @@ class FakeClient:
     def focus_workspace(self, workspace_id: str) -> None:
         self.focused.append(f"workspace:{workspace_id}")
 
-    def turn(self, target: str, prompt: str) -> tuple[str, str]:
+    def turn(
+        self,
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, str]:
         self.calls.append((target, prompt))
+        self.timeouts.append(timeout_ms)
+        if cancel_event is not None and cancel_event.is_set():
+            raise ChatError("review cancelled")
         match = re.search(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})", prompt)
         assert match
         return "done", f"reply from {target}"
+
+    def cancel(self, target: str) -> None:
+        self.cancelled.append(target)
 
 
 def make_chat(tmp_path: Path, max_turns: int = 4) -> tuple[object, FakeClient, object]:
@@ -281,12 +304,13 @@ def test_failed_turn_does_not_drop_context_and_later_agents_continue(tmp_path: P
     chat, client, transcript = make_chat(tmp_path)
     original_turn = client.turn
 
-    def fail_pi_once(target: str, prompt: str) -> tuple[str, str]:
+    def fail_pi_once(target: str, prompt: str, timeout_ms: int | None = None) -> tuple[str, str]:
         if target == "pi-peer":
             client.calls.append((target, prompt))
+            client.timeouts.append(timeout_ms)
             client.turn = original_turn
             raise ChatError("simulated delivery failure")
-        return original_turn(target, prompt)
+        return original_turn(target, prompt, timeout_ms)
 
     client.turn = fail_pi_once
     created = chat.dispatch("@all preserve this")
@@ -310,6 +334,600 @@ def test_failed_turn_does_not_drop_context_and_later_agents_continue(tmp_path: P
     assert "[human] preserve this" in retry_prompt
     assert "[human] retry" in retry_prompt
     assert transcript.cursors()["pi"] == transcript.read()[-1]["seq"]
+
+
+class ParallelReviewClient(FakeClient):
+    def __init__(self, reviewer_count: int) -> None:
+        super().__init__()
+        self.barrier = threading.Barrier(reviewer_count)
+        self.call_lock = threading.Lock()
+
+    def turn(
+        self,
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, str]:
+        with self.call_lock:
+            self.calls.append((target, prompt))
+            self.timeouts.append(timeout_ms)
+        if "Question for independent review" in prompt:
+            self.barrier.wait(timeout=2)
+            return "done", f"independent reply from {target}"
+        return "done", f"synthesis from {target}"
+
+
+def test_review_runs_independent_phase_in_parallel_then_synthesizes(tmp_path: Path) -> None:
+    transcript = Transcript(tmp_path, "review-room")
+    client = ParallelReviewClient(reviewer_count=3)
+    chat = GroupChat(
+        transcript,
+        {
+            "pi": "pi-peer",
+            "claude": "claude-peer",
+            "codex": "codex-peer",
+            "grok": "grok-peer",
+        },
+        client,
+        synthesizer="pi",
+        agent_timeouts={"claude": 11_000, "codex": 12_000, "grok": 13_000, "pi": 14_000},
+    )
+
+    review = chat.review("@claude,@codex,@grok Review this draft")
+
+    review_calls = [call for call in client.calls if "Question for independent review" in call[1]]
+    assert {target for target, _ in review_calls} == {
+        "claude-peer",
+        "codex-peer",
+        "grok-peer",
+    }
+    assert all("independent reply from" not in prompt for _, prompt in review_calls)
+    synthesis_target, synthesis_prompt = client.calls[-1]
+    assert synthesis_target == "pi-peer"
+    assert "Independent reviews:" in synthesis_prompt
+    assert all(
+        f"independent reply from {target}" in synthesis_prompt
+        for target in ("claude-peer", "codex-peer", "grok-peer")
+    )
+    assert set(client.timeouts[:-1]) == {11_000, 12_000, 13_000}
+    assert client.timeouts[-1] == 14_000
+    assert review.states == {"claude": "done", "codex": "done", "grok": "done", "pi": "done"}
+
+    messages = transcript.read()
+    assert messages[0]["kind"] == "review_question"
+    assert messages[0]["recipients"] == ["claude", "codex", "grok"]
+    assert [item["kind"] for item in messages[1:-1]] == [
+        "review_response",
+        "review_response",
+        "review_response",
+    ]
+    assert messages[-1]["kind"] == "review_synthesis"
+    assert len({item["round_id"] for item in messages}) == 1
+
+
+def test_review_timeout_is_visible_and_does_not_block_other_agents(tmp_path: Path) -> None:
+    class TimeoutClient(FakeClient):
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            if target == "claude-peer" and "Question for independent review" in prompt:
+                self.calls.append((target, prompt))
+                self.timeouts.append(timeout_ms)
+                raise ChatError("Herdr command timed out")
+            return super().turn(target, prompt, timeout_ms, cancel_event)
+
+    transcript = Transcript(tmp_path, "timeout-room")
+    client = TimeoutClient()
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        client,
+    )
+
+    review = chat.review("@claude,@codex Find the issue")
+
+    assert review.states["claude"] == "timed_out"
+    assert review.states["codex"] == "done"
+    assert review.states["pi"] == "done"
+    assert any("@claude review timed out" in item["body"] for item in transcript.read())
+    assert "[@claude] (no usable response)" in client.calls[-1][1]
+    assert "reply from codex-peer" in client.calls[-1][1]
+
+
+def test_review_controller_is_non_blocking_and_cancels_exact_active_target(
+    tmp_path: Path,
+) -> None:
+    class BlockingClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            self.calls.append((target, prompt))
+            self.timeouts.append(timeout_ms)
+            if "Question for independent review" in prompt:
+                self.started.set()
+                while not self.release.wait(timeout=0.01):
+                    if cancel_event is not None and cancel_event.is_set():
+                        self.cancel(target)
+                        raise ChatError("review cancelled")
+            return "done", f"reply from {target}"
+
+        def cancel(self, target: str) -> None:
+            super().cancel(target)
+            self.release.set()
+
+    transcript = Transcript(tmp_path, "cancel-room")
+    client = BlockingClient()
+    chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client)
+    controller = ReviewController(chat)
+
+    notice = controller.start("@claude Check this")
+    assert notice == "Review started with @claude; @pi synthesizes."
+    assert client.started.wait(timeout=1)
+    assert controller.is_active()
+    assert "@claude working" in controller.status()
+    assert controller.cancel() == "Cancellation requested."
+    assert controller.wait(timeout=2)
+
+    assert client.cancelled == ["claude-peer"]
+    assert controller.status() == "Review cancelled."
+    assert not any(item["kind"] == "review_synthesis" for item in transcript.read())
+
+
+def test_review_start_does_not_block_on_liveness_and_immediate_cancel_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    class SlowLivenessClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.check_started = threading.Event()
+            self.release_check = threading.Event()
+
+        def live_targets(self) -> set[str]:
+            self.check_started.set()
+            assert self.release_check.wait(timeout=2)
+            return super().live_targets()
+
+    transcript = Transcript(tmp_path, "pending-cancel-room")
+    client = SlowLivenessClient()
+    chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client)
+    controller = ReviewController(chat)
+
+    assert controller.start("@claude Check this").startswith("Review started")
+    assert client.check_started.wait(timeout=1)
+    assert controller.cancel() == "Cancellation requested."
+    assert "@claude cancelled" in controller.status()
+    client.release_check.set()
+    assert controller.wait(timeout=2)
+
+    assert client.calls == []
+    assert client.cancelled == []
+    assert transcript.read() == []
+
+
+def test_interrupted_synthesis_is_cancelled_without_failure_entry(tmp_path: Path) -> None:
+    class BlockingSynthesisClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.synthesis_started = threading.Event()
+
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            if "Independent reviews:" not in prompt:
+                return super().turn(target, prompt, timeout_ms, cancel_event)
+            self.calls.append((target, prompt))
+            self.timeouts.append(timeout_ms)
+            self.synthesis_started.set()
+            assert cancel_event is not None
+            assert cancel_event.wait(timeout=2)
+            self.cancel(target)
+            raise ChatError("review cancelled")
+
+    transcript = Transcript(tmp_path, "synthesis-cancel-room")
+    client = BlockingSynthesisClient()
+    chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client)
+    controller = ReviewController(chat)
+
+    controller.start("@claude Check this")
+    assert client.synthesis_started.wait(timeout=1)
+    assert controller.cancel() == "Cancellation requested."
+    assert controller.wait(timeout=2)
+
+    assert client.cancelled == ["pi-peer"]
+    assert controller.status() == "Review cancelled."
+    assert not any("synthesis failed" in item["body"] for item in transcript.read())
+    assert not any(item["kind"] == "review_synthesis" for item in transcript.read())
+
+
+def test_failed_review_can_retry_with_fresh_marker_and_resynthesize(tmp_path: Path) -> None:
+    class FlakyClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            if target == "claude-peer" and not self.failed:
+                self.failed = True
+                self.calls.append((target, prompt))
+                self.timeouts.append(timeout_ms)
+                raise ChatError("temporary failure")
+            return super().turn(target, prompt, timeout_ms, cancel_event)
+
+    transcript = Transcript(tmp_path, "retry-room")
+    client = FlakyClient()
+    chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client)
+    review = chat.review("@claude Review once")
+    first_prompt = client.calls[0][1]
+    assert review.states == {"claude": "failed", "pi": "skipped"}
+
+    chat.retry_review(review, "claude")
+
+    second_prompt = client.calls[1][1]
+    first_token = re.search(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})", first_prompt)
+    second_token = re.search(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})", second_prompt)
+    assert first_token and second_token and first_token.group(1) != second_token.group(1)
+    assert review.states == {"claude": "done", "pi": "done"}
+    assert [item["kind"] for item in transcript.read()][-2:] == [
+        "review_response",
+        "review_synthesis",
+    ]
+
+    with pytest.raises(ChatError, match="already has a usable review response"):
+        chat.retry_review(review, "claude")
+
+
+def test_completed_review_notice_can_be_cleared_for_later_chat_status(tmp_path: Path) -> None:
+    chat, _, _ = make_chat(tmp_path)
+    controller = ReviewController(chat)
+    controller.start("@claude Check this")
+    assert controller.wait(timeout=2)
+    assert controller.status() == "Review complete."
+    controller.clear_notice()
+    assert controller.status() == ""
+
+
+def test_cancel_during_retry_liveness_is_not_erased(tmp_path: Path) -> None:
+    class RetryLivenessClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.live_checks = 0
+            self.retry_check_started = threading.Event()
+            self.release_retry_check = threading.Event()
+
+        def live_targets(self) -> set[str]:
+            self.live_checks += 1
+            if self.live_checks == 2:
+                self.retry_check_started.set()
+                assert self.release_retry_check.wait(timeout=2)
+            return super().live_targets()
+
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            if target == "claude-peer":
+                self.calls.append((target, prompt))
+                self.timeouts.append(timeout_ms)
+                raise ChatError("temporary failure")
+            return super().turn(target, prompt, timeout_ms, cancel_event)
+
+    transcript = Transcript(tmp_path, "retry-cancel-room")
+    client = RetryLivenessClient()
+    chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client)
+    controller = ReviewController(chat)
+    controller.start("@claude Check this")
+    assert controller.wait(timeout=2)
+    assert len(client.calls) == 1
+
+    assert controller.retry("claude") == "Retrying @claude."
+    assert client.retry_check_started.wait(timeout=1)
+    assert controller.cancel() == "Cancellation requested."
+    client.release_retry_check.set()
+    assert controller.wait(timeout=2)
+
+    assert len(client.calls) == 1
+    assert controller.status() == "Review cancelled."
+
+
+def test_unstarted_review_cannot_append_retry_artifacts(tmp_path: Path) -> None:
+    transcript = Transcript(tmp_path, "unstarted-room")
+    chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, FakeClient())
+    review = chat.plan_review("@claude Check this")
+
+    with pytest.raises(ChatError, match="never started"):
+        chat.retry_review(review, "claude")
+    with pytest.raises(ChatError, match="never started"):
+        chat.retry_synthesis(review)
+    assert transcript.read() == []
+
+
+def test_review_commands_require_exact_names_and_support_retry(tmp_path: Path) -> None:
+    chat, _, _ = make_chat(tmp_path)
+    controller = ReviewController(chat)
+    assert handle_local_command("/reviewer hello", chat, controller) == (
+        "Unknown command. Use /help."
+    )
+    assert handle_local_command("/review", chat, controller) == (
+        "Usage: /review [@agent,@agent] QUESTION"
+    )
+    with pytest.raises(ChatError, match="no review to retry"):
+        handle_local_command("/retry claude", chat, controller)
+
+
+def test_review_prompt_and_synthesis_preserve_targeted_order() -> None:
+    review_prompt = build_review_prompt(
+        "claude", "Question", "a" * 32, ("pi", "claude", "codex", "grok")
+    )
+    assert "answers are deliberately withheld until synthesis" in review_prompt
+    synthesis_prompt = build_synthesis_prompt(
+        "grok",
+        "Question",
+        ("codex", "claude"),
+        {"claude": "second", "codex": "first"},
+        "b" * 32,
+    )
+    assert synthesis_prompt.index("[@codex] first") < synthesis_prompt.index("[@claude] second")
+
+
+def test_agent_timeout_parser_validates_and_overrides() -> None:
+    assert parse_agent_timeouts(["Claude=12000", "grok=900000"], ("pi", "claude", "grok")) == {
+        "claude": 12_000,
+        "grok": 900_000,
+    }
+    with pytest.raises(ChatError, match="unknown participant"):
+        parse_agent_timeouts(["gemini=12000"], ("pi", "claude"))
+    with pytest.raises(ChatError, match="between 1000 and 3600000"):
+        parse_agent_timeouts(["pi=999"], ("pi",))
+
+
+def test_parallel_review_rejects_duplicate_herdr_targets(tmp_path: Path) -> None:
+    with pytest.raises(ChatError, match="agent targets must be unique: shared-peer"):
+        GroupChat(
+            Transcript(tmp_path, "duplicate-room"),
+            {"pi": "shared-peer", "claude": "shared-peer"},
+            FakeClient(),
+        )
+
+
+def test_transcript_scrolling_and_review_labels() -> None:
+    messages = [
+        {"sender": "claude", "body": "review", "kind": "review_response"},
+        {"sender": "pi", "body": "synthesis", "kind": "review_synthesis"},
+        {"sender": "human", "body": "latest", "kind": "message"},
+    ]
+    assert message_lines(messages, 80)[0] == "claude [review]> review"
+    assert "pi [synthesis]> synthesis" in message_lines(messages, 80)
+    latest, max_offset = visible_message_lines(messages, 80, available=2, scroll_offset=0)
+    older, _ = visible_message_lines(messages, 80, available=2, scroll_offset=max_offset)
+    assert "human> latest" in latest
+    assert "claude [review]> review" in older
+
+
+def test_transcript_render_cache_is_reused_and_invalidated_on_append(tmp_path: Path) -> None:
+    transcript = Transcript(tmp_path, "render-room")
+    transcript.append("human", ("pi",), "first")
+    first = transcript.rendered_lines(80)
+    assert transcript.rendered_lines(80) is first
+    transcript.append("pi", ("human",), "second")
+    second = transcript.rendered_lines(80)
+    assert second is not first
+    assert "pi> second" in second
+
+
+def test_herdr_cancel_uses_exact_target_and_ctrl_c() -> None:
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    HerdrClient(herdr_bin="herdr-test", runner=runner).cancel("claude-peer")
+    assert calls == [["herdr-test", "agent", "send-keys", "claude-peer", "ctrl+c"]]
+
+
+def test_herdr_turn_submits_then_polls_for_token_bound_reply() -> None:
+    calls: list[list[str]] = []
+    token = "a" * 32
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1:3] == ["agent", "get"]:
+            stdout = '{"result":{"agent":{"agent_status":"done"}}}'
+        elif argv[1:3] == ["agent", "read"]:
+            stdout = f"HGCHAT_REPLY_BEGIN {token}\nanswer\nHGCHAT_REPLY_END {token}\n"
+        else:
+            stdout = "{}"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    status, reply = client.turn(
+        "claude-peer",
+        f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+        12_000,
+    )
+
+    assert (status, reply) == ("done", "answer")
+    assert calls[0][1:4] == ["agent", "prompt", "claude-peer"]
+    assert "--wait" not in calls[0]
+    assert [call[1:3] for call in calls[1:]] == [["agent", "get"], ["agent", "read"]]
+
+
+def test_herdr_turn_cancels_after_submission_if_request_arrived_during_submit() -> None:
+    calls: list[list[str]] = []
+    cancel_event = threading.Event()
+    token = "b" * 32
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1:3] == ["agent", "prompt"]:
+            cancel_event.set()
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    with pytest.raises(ChatError, match="review cancelled"):
+        client.turn(
+            "claude-peer",
+            f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+            12_000,
+            cancel_event,
+        )
+
+    assert [call[1:3] for call in calls] == [
+        ["agent", "prompt"],
+        ["agent", "send-keys"],
+    ]
+    assert calls[-1][-2:] == ["claude-peer", "ctrl+c"]
+
+
+def test_herdr_submission_process_is_terminated_on_immediate_cancel() -> None:
+    calls: list[list[str]] = []
+    cancel_event = threading.Event()
+    token = "c" * 32
+
+    class WaitingProcess:
+        def __init__(self) -> None:
+            self.returncode = 0
+            self.terminated = False
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            if not self.terminated:
+                raise subprocess.TimeoutExpired("herdr-test", timeout)
+            return "", ""
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.terminated = True
+
+    process = WaitingProcess()
+
+    def popen_factory(argv: list[str], **_: object) -> WaitingProcess:
+        calls.append(argv)
+        cancel_event.set()
+        return process
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    client = HerdrClient(
+        herdr_bin="herdr-test",
+        runner=runner,
+        popen_factory=popen_factory,
+    )
+    with pytest.raises(ChatError, match="review cancelled"):
+        client.turn(
+            "claude-peer",
+            f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+            12_000,
+            cancel_event,
+        )
+
+    assert process.terminated
+    assert [call[1:3] for call in calls] == [
+        ["agent", "prompt"],
+        ["agent", "send-keys"],
+    ]
+
+
+def test_herdr_turn_timeout_interrupts_active_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+    token = "d" * 32
+    ticks = iter((0.0, 2.0))
+    monkeypatch.setattr(namespace["time"], "monotonic", lambda: next(ticks))
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    with pytest.raises(ChatError, match="timed out after 1000 ms"):
+        client.turn(
+            "claude-peer",
+            f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+            1_000,
+        )
+
+    assert [call[1:3] for call in calls] == [
+        ["agent", "prompt"],
+        ["agent", "send-keys"],
+    ]
+
+
+def test_invalid_post_submission_status_interrupts_active_target() -> None:
+    calls: list[list[str]] = []
+    token = "e" * 32
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        stdout = "not-json" if argv[1:3] == ["agent", "get"] else "{}"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    with pytest.raises(ChatError, match="invalid result"):
+        client.turn(
+            "claude-peer",
+            f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+            12_000,
+        )
+
+    assert [call[1:3] for call in calls] == [
+        ["agent", "prompt"],
+        ["agent", "get"],
+        ["agent", "send-keys"],
+    ]
+
+
+def test_submission_command_failure_interrupts_possibly_active_target() -> None:
+    calls: list[list[str]] = []
+    token = "f" * 32
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1:3] == ["agent", "prompt"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="submit failed")
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    with pytest.raises(ChatError, match="submit failed"):
+        client.turn(
+            "claude-peer",
+            f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+            12_000,
+        )
+
+    assert [call[1:3] for call in calls] == [
+        ["agent", "prompt"],
+        ["agent", "send-keys"],
+    ]
 
 
 def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:

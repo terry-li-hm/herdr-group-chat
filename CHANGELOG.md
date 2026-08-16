@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Add a two-phase `/review` flow: independent reviewers run concurrently, then
+  a configurable participant synthesizes the available responses.
+- Keep the room responsive with per-participant review states, targeted
+  cancellation, retry for a reviewer or synthesis, and per-agent timeouts.
+- Label review and synthesis entries while preserving the append-only ordered
+  transcript, targeted mentions, and ordinary serial chat behavior.
+- Add Page Up and Page Down transcript scrolling.
+
 ## [0.2.0] - 2026-08-15
 
 - Add a visible New group chat setup flow that reuses live peers, starts missing

@@ -15,8 +15,12 @@ import re
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 import uuid
-from dataclasses import dataclass
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextlib import suppress
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -44,6 +48,10 @@ class ChatError(RuntimeError):
     """A user-visible relay failure."""
 
 
+class CommandLaunchError(ChatError):
+    """The Herdr command could not start, so no agent turn was submitted."""
+
+
 class AgentClient(Protocol):
     def live_targets(self) -> set[str]: ...
 
@@ -53,13 +61,33 @@ class AgentClient(Protocol):
 
     def focus_workspace(self, workspace_id: str) -> None: ...
 
-    def turn(self, target: str, prompt: str) -> tuple[str, str]: ...
+    def turn(
+        self,
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, str]: ...
 
 
 @dataclass(frozen=True)
 class Route:
     recipients: tuple[str, ...]
     body: str
+
+
+@dataclass
+class ReviewRound:
+    id: str
+    question: str
+    reviewers: tuple[str, ...]
+    synthesizer: str
+    prompts: dict[str, str]
+    question_seq: int | None
+    states: dict[str, str]
+    responses: dict[str, str] = field(default_factory=dict)
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
 
 def utc_now() -> str:
@@ -103,8 +131,21 @@ class Transcript:
         os.chmod(self.state_dir, 0o700)
         self.path = self.state_dir / f"{room}.jsonl"
         self.cursor_path = self.state_dir / f"{room}.state.json"
+        self._lock = threading.RLock()
+        self._render_cache: dict[int, tuple[tuple[int, int] | None, list[str]]] = {}
+
+    def _stamp_unlocked(self) -> tuple[int, int] | None:
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return None
+        return stat.st_mtime_ns, stat.st_size
 
     def read(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return self._read_unlocked()
+
+    def _read_unlocked(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
         messages: list[dict[str, Any]] = []
@@ -122,43 +163,68 @@ class Transcript:
             messages.append(item)
         return messages
 
-    def append(self, sender: str, recipients: Iterable[str], body: str) -> dict[str, Any]:
-        messages = self.read()
-        item = {
-            "seq": (messages[-1]["seq"] + 1) if messages else 1,
-            "at": utc_now(),
-            "sender": sender,
-            "recipients": list(recipients),
-            "body": body.strip(),
-        }
-        with self.path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(self.path, 0o600)
-        return item
+    def append(
+        self,
+        sender: str,
+        recipients: Iterable[str],
+        body: str,
+        *,
+        kind: str = "message",
+        round_id: str | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            messages = self._read_unlocked()
+            item = {
+                "seq": (messages[-1]["seq"] + 1) if messages else 1,
+                "at": utc_now(),
+                "sender": sender,
+                "recipients": list(recipients),
+                "body": body.strip(),
+                "kind": kind,
+            }
+            if round_id is not None:
+                item["round_id"] = round_id
+            with self.path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(self.path, 0o600)
+            self._render_cache.clear()
+            return item
+
+    def rendered_lines(self, width: int) -> list[str]:
+        with self._lock:
+            stamp = self._stamp_unlocked()
+            cached = self._render_cache.get(width)
+            if cached is not None and cached[0] == stamp:
+                return cached[1]
+            lines = message_lines(self._read_unlocked(), width)
+            self._render_cache[width] = (stamp, lines)
+            return lines
 
     def cursors(self) -> dict[str, int]:
-        if not self.cursor_path.exists():
-            return {}
-        try:
-            data = json.loads(self.cursor_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as error:
-            raise ChatError(f"invalid room state: {error}") from error
-        if not isinstance(data, dict) or not all(
-            isinstance(key, str) and isinstance(value, int) for key, value in data.items()
-        ):
-            raise ChatError("invalid room state")
-        return data
+        with self._lock:
+            if not self.cursor_path.exists():
+                return {}
+            try:
+                data = json.loads(self.cursor_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as error:
+                raise ChatError(f"invalid room state: {error}") from error
+            if not isinstance(data, dict) or not all(
+                isinstance(key, str) and isinstance(value, int) for key, value in data.items()
+            ):
+                raise ChatError("invalid room state")
+            return data
 
     def save_cursors(self, cursors: dict[str, int]) -> None:
-        temporary = self.cursor_path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(cursors, sort_keys=True, separators=(",", ":")) + "\n",
-            encoding="utf-8",
-        )
-        os.chmod(temporary, 0o600)
-        temporary.replace(self.cursor_path)
+        with self._lock:
+            temporary = self.cursor_path.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps(cursors, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(temporary, 0o600)
+            temporary.replace(self.cursor_path)
 
 
 class HerdrClient:
@@ -167,10 +233,16 @@ class HerdrClient:
         herdr_bin: str = "herdr",
         timeout_ms: int = 600_000,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
     ) -> None:
         self.herdr_bin = herdr_bin
         self.timeout_ms = timeout_ms
         self.runner = runner
+        self.popen_factory = (
+            subprocess.Popen
+            if popen_factory is None and runner is subprocess.run
+            else popen_factory
+        )
 
     def _run(self, arguments: list[str], timeout: float = 30) -> subprocess.CompletedProcess[str]:
         try:
@@ -182,12 +254,62 @@ class HerdrClient:
                 timeout=timeout,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as error:
+        except OSError as error:
+            raise CommandLaunchError(f"Herdr command failed: {error}") from error
+        except subprocess.TimeoutExpired as error:
             raise ChatError(f"Herdr command failed: {error}") from error
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
             raise ChatError(f"Herdr command failed: {detail}")
         return result
+
+    @staticmethod
+    def _stop_process(process: subprocess.Popen[str]) -> None:
+        process.terminate()
+        try:
+            process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+
+    def _run_interruptible(
+        self,
+        arguments: list[str],
+        cancel_event: threading.Event | None,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        if self.popen_factory is None:
+            return self._run(arguments, timeout=timeout)
+        try:
+            process = self.popen_factory(
+                [self.herdr_bin, *arguments],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+            )
+        except OSError as error:
+            raise CommandLaunchError(f"Herdr command failed: {error}") from error
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                self._stop_process(process)
+                raise ChatError("review cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._stop_process(process)
+                raise ChatError(f"Herdr command timed out after {int(timeout * 1000)} ms")
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+            result = subprocess.CompletedProcess(
+                [self.herdr_bin, *arguments], process.returncode, stdout, stderr
+            )
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+                raise ChatError(f"Herdr command failed: {detail}")
+            return result
 
     def _agents(self) -> list[dict[str, Any]]:
         result = self._run(["agent", "list"])
@@ -222,48 +344,93 @@ class HerdrClient:
     def focus_workspace(self, workspace_id: str) -> None:
         self._run(["workspace", "focus", workspace_id])
 
-    def turn(self, target: str, prompt: str) -> tuple[str, str]:
-        result = self._run(
-            [
-                "agent",
-                "prompt",
-                target,
-                prompt,
-                "--wait",
-                "--until",
-                "idle",
-                "--until",
-                "done",
-                "--until",
-                "blocked",
-                "--timeout",
-                str(self.timeout_ms),
-            ],
-            timeout=(self.timeout_ms / 1000) + 20,
-        )
-        try:
-            status = json.loads(result.stdout)["result"]["agent"]["agent_status"]
-        except (json.JSONDecodeError, KeyError, TypeError) as error:
-            raise ChatError(f"Herdr returned an invalid result for {target}") from error
-        if status == "blocked":
-            return "blocked", ""
-
-        terminal = self._run(
-            ["agent", "read", target, "--source", "recent-unwrapped", "--lines", "240"]
-        ).stdout
-        if "Press t to trust all; enter to review hooks; esc to close" in terminal:
-            return "blocked", ""
+    def turn(
+        self,
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, str]:
+        effective_timeout_ms = timeout_ms if timeout_ms is not None else self.timeout_ms
         token_match = REPLY_TOKEN_RE.search(prompt)
         if token_match is None:
             raise ChatError("relay prompt has no reply token")
         reply_marker_id = token_match.group(1)
+        if cancel_event is not None and cancel_event.is_set():
+            raise ChatError("review cancelled")
+
+        deadline = time.monotonic() + (effective_timeout_ms / 1000)
         try:
-            reply = extract_reply(terminal, reply_marker_id)
-        except ChatError as terminal_error:
-            reply = self._local_grok_reply(target, reply_marker_id)
-            if reply is None:
-                raise terminal_error
-        return status, reply
+            self._run_interruptible(
+                ["agent", "prompt", target, prompt],
+                cancel_event,
+                timeout=max(1, min(30, effective_timeout_ms / 1000)),
+            )
+        except ChatError as error:
+            if not isinstance(error, CommandLaunchError):
+                with suppress(ChatError):
+                    self.cancel(target)
+            raise
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                with suppress(ChatError):
+                    self.cancel(target)
+                raise ChatError("review cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                with suppress(ChatError):
+                    self.cancel(target)
+                raise ChatError(f"Herdr command timed out after {effective_timeout_ms} ms")
+            try:
+                result = self._run(
+                    ["agent", "get", target],
+                    timeout=max(0.1, min(5, remaining)),
+                )
+            except ChatError:
+                with suppress(ChatError):
+                    self.cancel(target)
+                raise
+            try:
+                status = json.loads(result.stdout)["result"]["agent"]["agent_status"]
+            except (json.JSONDecodeError, KeyError, TypeError) as error:
+                with suppress(ChatError):
+                    self.cancel(target)
+                raise ChatError(f"Herdr returned an invalid result for {target}") from error
+            if status == "blocked":
+                return "blocked", ""
+            if status in {"idle", "done"}:
+                try:
+                    terminal = self._run(
+                        [
+                            "agent",
+                            "read",
+                            target,
+                            "--source",
+                            "recent-unwrapped",
+                            "--lines",
+                            "240",
+                        ],
+                        timeout=max(0.1, min(5, remaining)),
+                    ).stdout
+                except ChatError:
+                    with suppress(ChatError):
+                        self.cancel(target)
+                    raise
+                if "Press t to trust all; enter to review hooks; esc to close" in terminal:
+                    return "blocked", ""
+                try:
+                    return status, extract_reply(terminal, reply_marker_id)
+                except ChatError:
+                    reply = self._local_grok_reply(target, reply_marker_id)
+                    if reply is not None:
+                        return status, reply
+            if cancel_event is not None:
+                cancel_event.wait(min(0.1, max(0, remaining)))
+            else:
+                time.sleep(min(0.1, max(0, remaining)))
+
+    def cancel(self, target: str) -> None:
+        self._run(["agent", "send-keys", target, "ctrl+c"], timeout=5)
 
     def _local_grok_reply(self, target: str, token: str) -> str | None:
         """Recover a Grok reply hidden above its alternate-screen viewport."""
@@ -358,6 +525,60 @@ def build_prompt(
     )
 
 
+def build_review_prompt(
+    agent: str,
+    question: str,
+    token: str,
+    participants: Sequence[str],
+) -> str:
+    roster = ", ".join(f"@{name}" for name in participants)
+    return (
+        f"You are @{agent}, one of the independent reviewers in a local Herdr group chat "
+        f"with {roster}. Keep your normal capabilities, instructions, and data-handling "
+        "rules. Review the human's question independently. Do not assume or imitate another "
+        "reviewer's answer; their answers are deliberately withheld until synthesis. Use your "
+        "ordinary tools when needed, but do not use Herdr to relay this reply because the "
+        "group-chat relay handles delivery.\n\n"
+        "Question for independent review:\n\n"
+        f"{question}\n\n"
+        "Return one direct review message. Wrap only that message between these marker lines:\n"
+        f"HGCHAT_REPLY_BEGIN {token}\n"
+        f"HGCHAT_REPLY_END {token}\n"
+    )
+
+
+def build_synthesis_prompt(
+    synthesizer: str,
+    question: str,
+    reviewers: Sequence[str],
+    responses: dict[str, str],
+    token: str,
+) -> str:
+    review_text = "\n\n".join(
+        f"[@{name}] {responses.get(name, '(no usable response)')}" for name in reviewers
+    )
+    return (
+        f"You are @{synthesizer}, the designated synthesizer in a local Herdr group chat. "
+        "Keep your normal capabilities, instructions, and data-handling rules. The reviewers "
+        "answered independently. Identify agreements, material disagreements, and the best "
+        "supported final recommendation. Do not claim consensus when the reviews differ. Use "
+        "your ordinary tools only if synthesis genuinely requires them, and do not use Herdr "
+        "to relay this reply because the group-chat relay handles delivery.\n\n"
+        "Human question:\n\n"
+        f"{question}\n\n"
+        "Independent reviews:\n\n"
+        f"{review_text}\n\n"
+        "Return one direct synthesis message. Wrap only that message between these marker lines:\n"
+        f"HGCHAT_REPLY_BEGIN {token}\n"
+        f"HGCHAT_REPLY_END {token}\n"
+    )
+
+
+def failure_state(error: ChatError) -> str:
+    detail = str(error).lower()
+    return "timed_out" if "timeout" in detail or "timed out" in detail else "failed"
+
+
 class GroupChat:
     def __init__(
         self,
@@ -366,6 +587,8 @@ class GroupChat:
         client: AgentClient,
         max_turns: int = 4,
         agents_workspace_id: str | None = None,
+        synthesizer: str = "pi",
+        agent_timeouts: dict[str, int] | None = None,
     ) -> None:
         if max_turns < 1:
             raise ChatError("max turns must be positive")
@@ -374,15 +597,62 @@ class GroupChat:
         self.client = client
         self.max_turns = max_turns
         self.agents_workspace_id = agents_workspace_id
+        if synthesizer not in agents:
+            raise ChatError(f"unknown synthesizer: @{synthesizer}")
+        duplicates = sorted(
+            target for target in set(agents.values()) if list(agents.values()).count(target) > 1
+        )
+        if duplicates:
+            raise ChatError(f"agent targets must be unique: {', '.join(duplicates)}")
+        self.synthesizer = synthesizer
+        self.agent_timeouts = dict(agent_timeouts or {})
+
+    def _ensure_live(self, names: Sequence[str]) -> None:
+        targets = self.client.live_targets()
+        missing = [name for name in names if self.agents[name] not in targets]
+        if missing:
+            labels = ", ".join(f"@{name}" for name in missing)
+            raise ChatError(f"participant not live in Herdr: {labels}")
+
+    def _timeout_for(self, agent: str) -> int | None:
+        return self.agent_timeouts.get(agent)
+
+    @staticmethod
+    def _set_review_state(
+        review: ReviewRound,
+        agent: str,
+        state: str,
+        on_state: Callable[[str, str], None] | None,
+    ) -> None:
+        with review.lock:
+            review.states[agent] = state
+        if on_state is not None:
+            on_state(agent, state)
+
+    @staticmethod
+    def _begin_review_call(
+        review: ReviewRound,
+        agent: str,
+        state: str,
+        on_state: Callable[[str, str], None] | None,
+    ) -> bool:
+        with review.lock:
+            if review.cancel_event.is_set():
+                review.states[agent] = "cancelled"
+                effective_state = "cancelled"
+                should_start = False
+            else:
+                review.states[agent] = state
+                effective_state = state
+                should_start = True
+        if on_state is not None:
+            on_state(agent, effective_state)
+        return should_start
 
     def dispatch(self, text: str) -> list[dict[str, Any]]:
         route = parse_route(text, tuple(self.agents))
         selected = route.recipients[: self.max_turns]
-        targets = self.client.live_targets()
-        missing = [name for name in selected if self.agents[name] not in targets]
-        if missing:
-            labels = ", ".join(f"@{name}" for name in missing)
-            raise ChatError(f"participant not live in Herdr: {labels}")
+        self._ensure_live(selected)
 
         created = [self.transcript.append("human", selected, route.body)]
         cursors = self.transcript.cursors()
@@ -395,7 +665,9 @@ class GroupChat:
             token = uuid.uuid4().hex
             prompt = build_prompt(agent, messages, token, tuple(self.agents))
             try:
-                status, reply = self.client.turn(self.agents[agent], prompt)
+                status, reply = self.client.turn(
+                    self.agents[agent], prompt, self._timeout_for(agent)
+                )
                 if status == "blocked":
                     item = self.transcript.append(
                         "system",
@@ -412,6 +684,286 @@ class GroupChat:
             self.transcript.save_cursors(cursors)
         return created
 
+    def plan_review(self, text: str) -> ReviewRound:
+        route = parse_route(text, tuple(self.agents))
+        reviewers = route.recipients[: self.max_turns]
+        required = tuple(dict.fromkeys((*reviewers, self.synthesizer)))
+        round_id = uuid.uuid4().hex
+        prompts = {
+            agent: build_review_prompt(
+                agent,
+                route.body,
+                uuid.uuid4().hex,
+                tuple(self.agents),
+            )
+            for agent in reviewers
+        }
+        return ReviewRound(
+            id=round_id,
+            question=route.body,
+            reviewers=reviewers,
+            synthesizer=self.synthesizer,
+            prompts=prompts,
+            question_seq=None,
+            states={agent: "queued" for agent in required},
+        )
+
+    def _activate_review(self, review: ReviewRound) -> bool:
+        required = tuple(dict.fromkeys((*review.reviewers, review.synthesizer)))
+        self._ensure_live(required)
+        with review.lock:
+            if review.cancel_event.is_set():
+                return False
+            question_item = self.transcript.append(
+                "human",
+                review.reviewers,
+                review.question,
+                kind="review_question",
+                round_id=review.id,
+            )
+            review.question_seq = question_item["seq"]
+        return True
+
+    def prepare_review(self, text: str) -> ReviewRound:
+        review = self.plan_review(text)
+        self._activate_review(review)
+        return review
+
+    def _run_reviewer(
+        self,
+        review: ReviewRound,
+        agent: str,
+        on_state: Callable[[str, str], None] | None,
+    ) -> tuple[str, str]:
+        if not self._begin_review_call(review, agent, "working", on_state):
+            raise ChatError("review cancelled")
+        return self.client.turn(
+            self.agents[agent],
+            review.prompts[agent],
+            self._timeout_for(agent),
+            review.cancel_event,
+        )
+
+    def _record_reviewer_result(
+        self,
+        review: ReviewRound,
+        agent: str,
+        future: Future[tuple[str, str]],
+        on_state: Callable[[str, str], None] | None,
+    ) -> None:
+        if review.cancel_event.is_set():
+            self._set_review_state(review, agent, "cancelled", on_state)
+            return
+        try:
+            status, reply = future.result()
+        except ChatError as error:
+            state = failure_state(error)
+            self._set_review_state(review, agent, state, on_state)
+            self.transcript.append(
+                "system",
+                ("human",),
+                f"@{agent} review {state.replace('_', ' ')}: {error}",
+                kind="review_status",
+                round_id=review.id,
+            )
+            return
+        if status == "blocked":
+            self._set_review_state(review, agent, "blocked", on_state)
+            self.transcript.append(
+                "system",
+                ("human",),
+                f"@{agent} is blocked and needs attention in Herdr.",
+                kind="review_status",
+                round_id=review.id,
+            )
+            return
+        self.transcript.append(
+            agent,
+            ("human", "all"),
+            reply,
+            kind="review_response",
+            round_id=review.id,
+        )
+        with review.lock:
+            review.responses[agent] = reply
+        cursors = self.transcript.cursors()
+        if review.question_seq is None:
+            raise ChatError("review question is not active")
+        cursors[agent] = review.question_seq
+        self.transcript.save_cursors(cursors)
+        self._set_review_state(review, agent, "done", on_state)
+
+    def _synthesize_review(
+        self,
+        review: ReviewRound,
+        on_state: Callable[[str, str], None] | None,
+    ) -> None:
+        if not self._begin_review_call(review, review.synthesizer, "synthesizing", on_state):
+            return
+        with review.lock:
+            responses = dict(review.responses)
+        if not responses:
+            self._set_review_state(review, review.synthesizer, "skipped", on_state)
+            self.transcript.append(
+                "system",
+                ("human",),
+                "Review ended without a usable response; synthesis was skipped.",
+                kind="review_status",
+                round_id=review.id,
+            )
+            return
+        token = uuid.uuid4().hex
+        prompt = build_synthesis_prompt(
+            review.synthesizer,
+            review.question,
+            review.reviewers,
+            responses,
+            token,
+        )
+        try:
+            status, reply = self.client.turn(
+                self.agents[review.synthesizer],
+                prompt,
+                self._timeout_for(review.synthesizer),
+                review.cancel_event,
+            )
+        except ChatError as error:
+            if review.cancel_event.is_set():
+                self._set_review_state(review, review.synthesizer, "cancelled", on_state)
+                return
+            state = failure_state(error)
+            self._set_review_state(review, review.synthesizer, state, on_state)
+            self.transcript.append(
+                "system",
+                ("human",),
+                f"@{review.synthesizer} synthesis {state.replace('_', ' ')}: {error}",
+                kind="review_status",
+                round_id=review.id,
+            )
+            return
+        if review.cancel_event.is_set():
+            self._set_review_state(review, review.synthesizer, "cancelled", on_state)
+            return
+        if status == "blocked":
+            self._set_review_state(review, review.synthesizer, "blocked", on_state)
+            self.transcript.append(
+                "system",
+                ("human",),
+                f"@{review.synthesizer} synthesis is blocked and needs attention in Herdr.",
+                kind="review_status",
+                round_id=review.id,
+            )
+            return
+        item = self.transcript.append(
+            review.synthesizer,
+            ("human", "all"),
+            reply,
+            kind="review_synthesis",
+            round_id=review.id,
+        )
+        cursors = self.transcript.cursors()
+        cursors[review.synthesizer] = item["seq"]
+        self.transcript.save_cursors(cursors)
+        self._set_review_state(review, review.synthesizer, "done", on_state)
+
+    def execute_review(
+        self,
+        review: ReviewRound,
+        on_state: Callable[[str, str], None] | None = None,
+    ) -> ReviewRound:
+        if review.question_seq is None and not self._activate_review(review):
+            return review
+        with ThreadPoolExecutor(
+            max_workers=len(review.reviewers), thread_name_prefix="hgchat-review"
+        ) as pool:
+            futures = {
+                pool.submit(self._run_reviewer, review, agent, on_state): agent
+                for agent in review.reviewers
+            }
+            for future in as_completed(futures):
+                self._record_reviewer_result(review, futures[future], future, on_state)
+        if review.cancel_event.is_set():
+            self.transcript.append(
+                "system",
+                ("human",),
+                "Review cancelled; synthesis was not started.",
+                kind="review_status",
+                round_id=review.id,
+            )
+            return review
+        self._synthesize_review(review, on_state)
+        return review
+
+    def review(
+        self,
+        text: str,
+        on_state: Callable[[str, str], None] | None = None,
+    ) -> ReviewRound:
+        return self.execute_review(self.plan_review(text), on_state)
+
+    def retry_review(
+        self,
+        review: ReviewRound,
+        agent: str,
+        on_state: Callable[[str, str], None] | None = None,
+        *,
+        reset_cancel: bool = True,
+    ) -> ReviewRound:
+        if agent not in review.reviewers:
+            raise ChatError(f"@{agent} was not a reviewer in the last round")
+        with review.lock:
+            if review.question_seq is None:
+                raise ChatError("the last review never started and cannot be retried")
+            if agent in review.responses:
+                raise ChatError(f"@{agent} already has a usable review response")
+            review.responses.pop(agent, None)
+            if reset_cancel:
+                review.cancel_event = threading.Event()
+        self._ensure_live((agent, review.synthesizer))
+        if review.cancel_event.is_set():
+            return review
+        review.prompts[agent] = build_review_prompt(
+            agent,
+            review.question,
+            uuid.uuid4().hex,
+            tuple(self.agents),
+        )
+        self._set_review_state(review, agent, "queued", on_state)
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="hgchat-retry") as pool:
+            future = pool.submit(self._run_reviewer, review, agent, on_state)
+            self._record_reviewer_result(review, agent, future, on_state)
+        with review.lock:
+            retry_succeeded = review.states[agent] == "done"
+        if not review.cancel_event.is_set() and retry_succeeded:
+            self._synthesize_review(review, on_state)
+        return review
+
+    def retry_synthesis(
+        self,
+        review: ReviewRound,
+        on_state: Callable[[str, str], None] | None = None,
+        *,
+        reset_cancel: bool = True,
+    ) -> ReviewRound:
+        with review.lock:
+            if review.question_seq is None:
+                raise ChatError("the last review never started and cannot be retried")
+            if reset_cancel:
+                review.cancel_event = threading.Event()
+        self._ensure_live((review.synthesizer,))
+        if review.cancel_event.is_set():
+            return review
+        self._synthesize_review(review, on_state)
+        return review
+
+    def cancel_review(self, review: ReviewRound) -> list[str]:
+        with review.lock:
+            review.cancel_event.set()
+            for name, state in review.states.items():
+                if state == "queued":
+                    review.states[name] = "cancelled"
+        return []
+
 
 def parse_agent_overrides(values: Sequence[str]) -> dict[str, str]:
     agents = dict(DEFAULT_AGENTS)
@@ -423,6 +975,25 @@ def parse_agent_overrides(values: Sequence[str]) -> dict[str, str]:
             raise ChatError(f"invalid agent mapping: {value}")
         agents[name] = target
     return agents
+
+
+def parse_agent_timeouts(values: Sequence[str], agents: Sequence[str]) -> dict[str, int]:
+    timeouts: dict[str, int] = {}
+    for value in values:
+        if "=" not in value:
+            raise ChatError("--agent-timeout must be NAME=MILLISECONDS")
+        name, raw_timeout = value.split("=", 1)
+        name = name.strip().lower()
+        if name not in agents:
+            raise ChatError(f"unknown participant in --agent-timeout: @{name}")
+        try:
+            timeout_ms = int(raw_timeout)
+        except ValueError as error:
+            raise ChatError(f"invalid timeout for @{name}: {raw_timeout}") from error
+        if not 1_000 <= timeout_ms <= 3_600_000:
+            raise ChatError(f"timeout for @{name} must be between 1000 and 3600000 ms")
+        timeouts[name] = timeout_ms
+    return timeouts
 
 
 def resolve_state_dir(
@@ -440,7 +1011,12 @@ def resolve_state_dir(
 def message_lines(messages: Sequence[dict[str, Any]], width: int) -> list[str]:
     lines: list[str] = []
     for item in messages:
-        prefix = f"{item['sender']}> "
+        label = str(item["sender"])
+        if item.get("kind") == "review_response":
+            label += " [review]"
+        elif item.get("kind") == "review_synthesis":
+            label += " [synthesis]"
+        prefix = f"{label}> "
         paragraphs = str(item["body"]).splitlines() or [""]
         first = True
         for paragraph in paragraphs:
@@ -455,6 +1031,145 @@ def message_lines(messages: Sequence[dict[str, Any]], width: int) -> list[str]:
                 first = False
         lines.append("")
     return lines
+
+
+def visible_message_lines(
+    messages: Sequence[dict[str, Any]],
+    width: int,
+    available: int,
+    scroll_offset: int,
+) -> tuple[list[str], int]:
+    return visible_wrapped_lines(message_lines(messages, width), available, scroll_offset)
+
+
+def visible_wrapped_lines(
+    lines: Sequence[str], available: int, scroll_offset: int
+) -> tuple[list[str], int]:
+    max_offset = max(0, len(lines) - available)
+    offset = min(max(0, scroll_offset), max_offset)
+    end = len(lines) - offset
+    start = max(0, end - available)
+    return lines[start:end], max_offset
+
+
+class ReviewController:
+    def __init__(self, chat: GroupChat) -> None:
+        self.chat = chat
+        self._lock = threading.RLock()
+        self._active: ReviewRound | None = None
+        self._last: ReviewRound | None = None
+        self._thread: threading.Thread | None = None
+        self._states: dict[str, str] = {}
+        self._notice = ""
+
+    def _on_state(self, agent: str, state: str) -> None:
+        with self._lock:
+            self._states[agent] = state
+
+    def _run(self, action: Callable[[], ReviewRound], review: ReviewRound) -> None:
+        try:
+            action()
+        except ChatError as error:
+            notice = f"Review failed: {error}"
+        except Exception as error:
+            notice = f"Review failed unexpectedly: {error}"
+        else:
+            notice = "Review cancelled." if review.cancel_event.is_set() else "Review complete."
+        with self._lock:
+            self._last = review
+            self._active = None
+            self._notice = notice
+
+    def _launch(self, action: Callable[[], ReviewRound], review: ReviewRound) -> None:
+        self._active = review
+        with review.lock:
+            self._states = dict(review.states)
+        self._notice = ""
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(action, review),
+            name="hgchat-review-controller",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def start(self, text: str) -> str:
+        with self._lock:
+            if self._active is not None:
+                raise ChatError("a review is already running")
+            review = self.chat.plan_review(text)
+            self._launch(lambda: self.chat.execute_review(review, self._on_state), review)
+        reviewers = ", @".join(review.reviewers)
+        return f"Review started with @{reviewers}; @{review.synthesizer} synthesizes."
+
+    def retry(self, target: str) -> str:
+        name = target.removeprefix("@").strip().lower()
+        with self._lock:
+            if self._active is not None:
+                raise ChatError("wait for the active review or cancel it before retrying")
+            if self._last is None:
+                raise ChatError("there is no review to retry")
+            review = self._last
+            with review.lock:
+                if review.question_seq is None:
+                    raise ChatError("the last review never started and cannot be retried")
+                if name != "synthesis" and name not in review.reviewers:
+                    raise ChatError(f"@{name} was not a reviewer in the last round")
+                if name in review.responses:
+                    raise ChatError(f"@{name} already has a usable review response")
+                review.cancel_event = threading.Event()
+            if name == "synthesis":
+
+                def action() -> ReviewRound:
+                    return self.chat.retry_synthesis(review, self._on_state, reset_cancel=False)
+
+                label = "synthesis"
+            else:
+
+                def action() -> ReviewRound:
+                    return self.chat.retry_review(review, name, self._on_state, reset_cancel=False)
+
+                label = f"@{name}"
+            self._launch(action, review)
+        return f"Retrying {label}."
+
+    def cancel(self) -> str:
+        with self._lock:
+            if self._active is None:
+                raise ChatError("there is no active review to cancel")
+            review = self._active
+        failures = self.chat.cancel_review(review)
+        with review.lock, self._lock:
+            self._states = dict(review.states)
+        if failures:
+            return "Cancellation requested; interrupt failed for " + "; ".join(failures)
+        return "Cancellation requested."
+
+    def is_active(self) -> bool:
+        with self._lock:
+            return self._active is not None
+
+    def status(self) -> str:
+        with self._lock:
+            if self._active is None:
+                return self._notice
+            review = self._active
+            order = tuple(dict.fromkeys((*review.reviewers, review.synthesizer)))
+            labels = [f"@{name} {self._states.get(name, 'queued')}" for name in order]
+        return "Review: " + " · ".join(labels)
+
+    def clear_notice(self) -> None:
+        with self._lock:
+            if self._active is None:
+                self._notice = ""
+
+    def wait(self, timeout: float = 5) -> bool:
+        with self._lock:
+            thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
 
 
 def participant_status(chat: GroupChat, prefix: str = "") -> str:
@@ -472,7 +1187,9 @@ def participant_status(chat: GroupChat, prefix: str = "") -> str:
     return f"{prefix} {summary}".strip()
 
 
-def handle_local_command(text: str, chat: GroupChat) -> str | None:
+def handle_local_command(
+    text: str, chat: GroupChat, reviews: ReviewController | None = None
+) -> str | None:
     stripped = text.strip()
     if not stripped.startswith("/"):
         return None
@@ -482,7 +1199,28 @@ def handle_local_command(text: str, chat: GroupChat) -> str | None:
         chat.client.focus_workspace(chat.agents_workspace_id)
         return "Focused the agents workspace."
     if stripped == "/help":
-        return "Commands: /agents · /show pi|claude|codex|grok"
+        return (
+            "Commands: /review [@agents] QUESTION · /retry <agent|synthesis> · "
+            "/cancel · /agents · /show <agent> · PgUp/PgDn"
+        )
+    if stripped == "/review" or stripped.startswith("/review "):
+        if reviews is None:
+            return "Review control is unavailable."
+        question = stripped.removeprefix("/review").strip()
+        if not question:
+            return "Usage: /review [@agent,@agent] QUESTION"
+        return reviews.start(question)
+    if stripped == "/cancel":
+        if reviews is None:
+            return "Review control is unavailable."
+        return reviews.cancel()
+    if stripped.startswith("/retry "):
+        if reviews is None:
+            return "Review control is unavailable."
+        target = stripped.removeprefix("/retry ").strip()
+        if not target:
+            return "Usage: /retry <agent|synthesis>"
+        return reviews.retry(target)
     if stripped.startswith("/show "):
         name = stripped.removeprefix("/show ").strip().lower()
         if name not in chat.agents:
@@ -499,46 +1237,84 @@ def draw_tui(
     buffer: str,
     status: str,
     participants: Sequence[str],
-) -> None:
+    scroll_offset: int = 0,
+) -> int:
     screen.erase()
     height, width = screen.getmaxyx()
     mentions = " ".join(f"@{name}" for name in participants)
     header = f" Herdr group chat: {room} | {mentions} @all | Ctrl-Q exits "
     try:
         screen.addnstr(0, 0, header, width - 1, curses.A_REVERSE)
-        lines = message_lines(transcript.read(), width - 2)
         available = max(1, height - 4)
-        for row, line in enumerate(lines[-available:], start=1):
+        lines, max_scroll = visible_wrapped_lines(
+            transcript.rendered_lines(width - 2), available, scroll_offset
+        )
+        for row, line in enumerate(lines, start=1):
             screen.addnstr(row, 1, line, width - 2)
         screen.addnstr(height - 3, 0, status, width - 1, curses.A_DIM)
         prompt = f"> {buffer}"
         screen.addnstr(height - 2, 0, prompt, width - 1)
         screen.move(height - 2, min(width - 1, len(prompt)))
     except curses.error:
-        pass
+        max_scroll = 0
     screen.refresh()
+    return max_scroll
 
 
 def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
     curses.curs_set(1)
     screen.keypad(True)
+    screen.timeout(100)
     buffer = ""
+    scroll_offset = 0
     participants = tuple(chat.agents)
+    reviews = ReviewController(chat)
     status = participant_status(chat, "Ready.")
+    status_override = False
     while True:
-        draw_tui(screen, chat.transcript, room, buffer, status, participants)
-        key = screen.get_wch()
+        review_status = reviews.status()
+        max_scroll = draw_tui(
+            screen,
+            chat.transcript,
+            room,
+            buffer,
+            status if status_override else (review_status or status),
+            participants,
+            scroll_offset,
+        )
+        try:
+            key = screen.get_wch()
+        except curses.error:
+            continue
         if key in ("\x03", "\x11"):
+            if reviews.is_active():
+                with suppress(ChatError):
+                    reviews.cancel()
             return
+        if key == curses.KEY_PPAGE:
+            scroll_offset = min(max_scroll, scroll_offset + max(1, screen.getmaxyx()[0] - 5))
+            continue
+        if key == curses.KEY_NPAGE:
+            scroll_offset = max(0, scroll_offset - max(1, screen.getmaxyx()[0] - 5))
+            continue
         if key in ("\n", "\r"):
             if not buffer.strip():
                 continue
+            reviews.clear_notice()
+            status_override = False
             try:
-                command_status = handle_local_command(buffer, chat)
+                command_status = handle_local_command(buffer, chat, reviews)
             except ChatError as error:
                 command_status = str(error)
+                status_override = True
             if command_status is not None:
                 status = command_status
+                status_override = status_override or not reviews.is_active()
+                buffer = ""
+                continue
+            if reviews.is_active():
+                status = "A review is running; use /cancel or wait before sending another message."
+                status_override = True
                 buffer = ""
                 continue
             status = "Waiting for the addressed agents..."
@@ -548,7 +1324,9 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
                 status = participant_status(chat, "Delivered.")
             except ChatError as error:
                 status = str(error)
+            status_override = True
             buffer = ""
+            scroll_offset = 0
             continue
         if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
             buffer = buffer[:-1]
@@ -564,6 +1342,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-turns", type=int, default=4)
     parser.add_argument("--timeout-ms", type=int, default=600_000)
     parser.add_argument("--agent", action="append", default=[], metavar="NAME=TARGET")
+    parser.add_argument(
+        "--agent-timeout",
+        action="append",
+        default=[],
+        metavar="NAME=MILLISECONDS",
+    )
+    parser.add_argument(
+        "--synthesizer",
+        default=os.environ.get("HERDR_GROUP_CHAT_SYNTHESIZER", "pi"),
+    )
     parser.add_argument("--agents-workspace", default=os.environ.get(AGENTS_WORKSPACE_ENV))
     parser.add_argument("--once", metavar="MESSAGE")
     parser.add_argument("--show", action="store_true")
@@ -579,6 +1367,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(line)
             return 0
         agents = parse_agent_overrides(args.agent)
+        agent_timeouts = parse_agent_timeouts(args.agent_timeout, tuple(agents))
         chat = GroupChat(
             transcript,
             agents,
@@ -588,9 +1377,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             max_turns=args.max_turns,
             agents_workspace_id=args.agents_workspace,
+            synthesizer=args.synthesizer,
+            agent_timeouts=agent_timeouts,
         )
         if args.once is not None:
-            for item in chat.dispatch(args.once):
+            before = len(transcript.read())
+            if args.once.strip() == "/review" or args.once.strip().startswith("/review "):
+                question = args.once.strip().removeprefix("/review").strip()
+                if not question:
+                    raise ChatError("usage: --once '/review [@agents] QUESTION'")
+                chat.review(question)
+                created = transcript.read()[before:]
+            else:
+                created = chat.dispatch(args.once)
+            for item in created:
                 print(f"{item['sender']}> {item['body']}")
             return 0
         if not sys.stdin.isatty() or not sys.stdout.isatty():
