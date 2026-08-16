@@ -1026,3 +1026,87 @@ def test_launch_without_failures_clears_stale_setup_failures(
     module.main()
 
     assert module.SETUP_FAILURES_ENV not in captured["env"]
+
+
+PANE_BUSY_ERROR = BootstrapError(
+    '{"error":{"code":"agent_pane_busy","message":"agent target pane is not an available shell"}}',
+    code="agent_pane_busy",
+)
+
+
+def participant_start_fake(
+    calls: list[list[str]], start_outcomes: list[Exception | None]
+) -> Callable[..., dict]:
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {"result": {"agents": []}}
+        if arguments[:2] == ["tab", "create"]:
+            return {
+                "result": {
+                    "tab": {"tab_id": "w-agents:t-grok"},
+                    "root_pane": {"pane_id": "w-agents:p-grok"},
+                }
+            }
+        if arguments[:2] == ["pane", "process-info"]:
+            return {"result": {"process_info": {"foreground_processes": [{"name": "zsh"}]}}}
+        if arguments[:2] == ["agent", "start"]:
+            outcome = start_outcomes.pop(0) if start_outcomes else None
+            if outcome is not None:
+                raise outcome
+        return {"result": {"type": "ok"}}
+
+    return fake_run_json
+
+
+def run_grok_participant_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start_outcomes: list[Exception | None],
+) -> tuple[list[str], list[list[str]]]:
+    monkeypatch.setattr(module, "PARTICIPANTS", (("grok", "grok-peer"),))
+    monkeypatch.setattr(module, "AGENT_START_BUSY_INTERVAL_S", 0)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(module, "run_json", participant_start_fake(calls, start_outcomes))
+    state: dict = {"schema_version": 1}
+    failures = module.start_participants(
+        "herdr", str(tmp_path), "w-agents", tmp_path, launcher_state_path(tmp_path), state
+    )
+    return failures, calls
+
+
+def test_agent_start_retries_transient_pane_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failures, calls = run_grok_participant_start(
+        tmp_path, monkeypatch, [PANE_BUSY_ERROR, PANE_BUSY_ERROR]
+    )
+
+    assert failures == []
+    starts = [call for call in calls if call[:2] == ["agent", "start"]]
+    assert len(starts) == 3
+
+
+def test_agent_start_persistent_pane_busy_records_failure_after_bounded_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failures, calls = run_grok_participant_start(
+        tmp_path, monkeypatch, [PANE_BUSY_ERROR] * module.AGENT_START_BUSY_ATTEMPTS
+    )
+
+    assert len(failures) == 1 and "agent_pane_busy" in failures[0]
+    starts = [call for call in calls if call[:2] == ["agent", "start"]]
+    assert len(starts) == module.AGENT_START_BUSY_ATTEMPTS
+
+
+def test_agent_start_does_not_retry_other_error_codes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failures, calls = run_grok_participant_start(
+        tmp_path, monkeypatch, [BootstrapError("pane is gone", code="pane_not_found")]
+    )
+
+    assert len(failures) == 1 and "pane is gone" in failures[0]
+    starts = [call for call in calls if call[:2] == ["agent", "start"]]
+    assert len(starts) == 1

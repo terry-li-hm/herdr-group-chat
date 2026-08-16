@@ -32,6 +32,8 @@ All notable changes to this project are documented here.
   whose prompt never landed.
 - Record participant setup failures as system entries in the new room's
   transcript instead of losing them when the room redraws the setup pane.
+- Retry a participant's `agent start` a few times when Herdr transiently
+  refuses it with `agent_pane_busy` after a fresh tab's shell comes up.
 
 ## [0.2.0] - 2026-08-15
 

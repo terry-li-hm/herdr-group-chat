@@ -329,6 +329,42 @@ def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> Non
         return
 
 
+AGENT_START_BUSY_ATTEMPTS = 5
+AGENT_START_BUSY_INTERVAL_S = 2.0
+
+
+def start_agent(herdr_bin: str, name: str, kind: str, pane_id: str) -> None:
+    """Start an agent, retrying herdr's transient agent_pane_busy refusal.
+
+    Herdr can keep reporting a freshly created pane as busy for a short window
+    after its shell is up, especially right after previous tabs were closed;
+    agent_pane_busy means the start was refused, so retrying it is safe. Any
+    other error code is raised immediately.
+    """
+    for attempt in range(AGENT_START_BUSY_ATTEMPTS):
+        try:
+            run_json(
+                herdr_bin,
+                [
+                    "agent",
+                    "start",
+                    name,
+                    "--kind",
+                    kind,
+                    "--pane",
+                    pane_id,
+                    "--timeout",
+                    "120000",
+                ],
+                timeout=None,
+            )
+            return
+        except BootstrapError as error:
+            if error.code != "agent_pane_busy" or attempt + 1 == AGENT_START_BUSY_ATTEMPTS:
+                raise
+            time.sleep(AGENT_START_BUSY_INTERVAL_S)
+
+
 def ensure_owned_workspace(
     herdr_bin: str,
     cwd: str,
@@ -824,21 +860,7 @@ def start_participants(
             save_launcher_state(state_dir, state, state_path)
             wait_for_shell(herdr_bin, pane_id)
             assert_server_identity(state_dir, state_path)
-            run_json(
-                herdr_bin,
-                [
-                    "agent",
-                    "start",
-                    name,
-                    "--kind",
-                    kind,
-                    "--pane",
-                    pane_id,
-                    "--timeout",
-                    "120000",
-                ],
-                timeout=None,
-            )
+            start_agent(herdr_bin, name, kind, pane_id)
             participant_panes[kind] = pane_id
             participant_tabs[kind] = participant_tab_id
             pending_tabs.pop(kind, None)
