@@ -56,6 +56,12 @@ STATE_DIR_ENV = "ORCA_GROUP_CHAT_STATE_DIR"
 ROOM_ENV = "ORCA_GROUP_CHAT_ROOM"
 HOST_LABEL = "Orca"
 TERMINAL_READ_LIMIT = 1000
+STALE_HANDLE_CODE = "terminal_handle_stale"
+
+
+def _is_stale_handle_error(error: ChatError) -> bool:
+    """Whether an Orca error carries the structured terminal_handle_stale code."""
+    return str(error).startswith(f"Orca command failed: {STALE_HANDLE_CODE}:")
 
 
 def parse_agent_mappings(values: Sequence[str]) -> dict[str, str]:
@@ -276,6 +282,7 @@ class OrcaClient:
         )
         if cancel_event is not None and cancel_event.is_set():
             raise ChatError("review cancelled")
+        turn_deadline = time.monotonic() + effective_timeout_ms / 1000
         self._run(
             ["terminal", "send", "--terminal", target, "--text", full_prompt, "--enter", "--json"]
         )
@@ -302,11 +309,61 @@ class OrcaClient:
                 and str(error) == ("review cancelled")
             ):
                 self.cancel(target)
+                raise
+            if _is_stale_handle_error(error):
+                return "done", self._await_response_file(
+                    target, reply_marker_id, response_file, cancel_event, turn_deadline
+                )
+            reply = self._safe_file_reply(reply_marker_id, response_file)
+            if reply is not None:
+                return "done", reply
             raise
         if cancel_event is not None and cancel_event.is_set():
             self.cancel(target)
             raise ChatError("review cancelled")
         return "done", self._collect_reply(target, reply_marker_id, response_file)
+
+    def _await_response_file(
+        self,
+        target: str,
+        reply_marker_id: str,
+        response_file: Path,
+        cancel_event: threading.Event | None,
+        deadline: float,
+        poll_interval: float = 0.1,
+    ) -> str:
+        """Watch the exact response file after a stale-handle wait failure.
+
+        The prompt was already delivered to the exact terminal, so the waiter
+        can lose lifecycle authority while the agent keeps working. Keep watching
+        the token-bound response file rather than resending the prompt or guessing
+        another handle.
+        """
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                self.cancel(target)
+                raise ChatError("review cancelled")
+            reply = self._safe_file_reply(reply_marker_id, response_file)
+            if reply is not None:
+                return reply
+            if time.monotonic() >= deadline:
+                raise ChatError(
+                    "Orca terminal wait failed: terminal_handle_stale and no complete "
+                    "response file arrived before the turn deadline"
+                )
+            time.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.0)))
+
+    @staticmethod
+    def _safe_file_reply(reply_marker_id: str, response_file: Path) -> str | None:
+        """Return the complete token-bound reply if the file is safely available."""
+        if not response_file.is_file():
+            return None
+        try:
+            reply = extract_reply(response_file.read_text(encoding="utf-8"), reply_marker_id)
+        except ChatError:
+            return None
+        os.chmod(response_file, 0o600)
+        return reply
 
     def _collect_reply(self, target: str, reply_marker_id: str, response_file: Path) -> str:
         if response_file.is_file():
