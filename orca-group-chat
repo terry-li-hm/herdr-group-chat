@@ -311,7 +311,7 @@ class OrcaClient:
                 self.cancel(target)
                 raise
             if _is_stale_handle_error(error):
-                return "done", self._await_response_file(
+                return "done", self._rendezvous_reply(
                     target, reply_marker_id, response_file, cancel_event, turn_deadline
                 )
             reply = self._safe_file_reply(reply_marker_id, response_file)
@@ -321,24 +321,30 @@ class OrcaClient:
         if cancel_event is not None and cancel_event.is_set():
             self.cancel(target)
             raise ChatError("review cancelled")
-        return "done", self._collect_reply(target, reply_marker_id, response_file)
+        return "done", self._rendezvous_reply(
+            target, reply_marker_id, response_file, cancel_event, turn_deadline
+        )
 
-    def _await_response_file(
+    def _rendezvous_reply(
         self,
         target: str,
         reply_marker_id: str,
         response_file: Path,
         cancel_event: threading.Event | None,
         deadline: float,
-        poll_interval: float = 0.1,
+        file_poll_interval: float = 0.1,
+        tail_poll_interval: float = 1.5,
     ) -> str:
-        """Watch the exact response file after a stale-handle wait failure.
+        """Rendezvous with the delayed token-bound reply until the turn deadline.
 
-        The prompt was already delivered to the exact terminal, so the waiter
-        can lose lifecycle authority while the agent keeps working. Keep watching
-        the token-bound response file rather than resending the prompt or guessing
-        another handle.
+        ``tui-idle`` is only an observation: the agent may still be writing its
+        response file or terminal output after the wait resolves, and a
+        stale-handle wait failure does not mean the agent stopped working. Watch
+        the exact response file primarily, and the bounded terminal tail at a low
+        frequency for agents that cannot write files, without resending the
+        prompt or switching handles.
         """
+        next_tail_poll = time.monotonic()
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 self.cancel(target)
@@ -346,15 +352,47 @@ class OrcaClient:
             reply = self._safe_file_reply(reply_marker_id, response_file)
             if reply is not None:
                 return reply
+            if time.monotonic() >= next_tail_poll:
+                reply = self._tail_reply(target, reply_marker_id)
+                next_tail_poll = time.monotonic() + tail_poll_interval
+                if reply is not None:
+                    return reply
             if time.monotonic() >= deadline:
                 raise ChatError(
-                    "Orca terminal wait failed: terminal_handle_stale and no complete "
-                    "response file arrived before the turn deadline"
+                    "no complete token-bound reply arrived before the turn deadline "
+                    f"(response file {response_file} and bounded terminal tail)"
                 )
-            time.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.0)))
+            time.sleep(min(file_poll_interval, max(deadline - time.monotonic(), 0.0)))
 
-    @staticmethod
-    def _safe_file_reply(reply_marker_id: str, response_file: Path) -> str | None:
+    def _tail_reply(self, target: str, reply_marker_id: str) -> str | None:
+        """Return a complete reply from the bounded terminal tail, if any.
+
+        A transient Orca read failure during the rendezvous is not response
+        completion; keep waiting until the deadline for a definitive answer.
+        """
+        try:
+            result = self._run(
+                [
+                    "terminal",
+                    "read",
+                    "--terminal",
+                    target,
+                    "--limit",
+                    str(TERMINAL_READ_LIMIT),
+                    "--json",
+                ]
+            )
+        except ChatError:
+            return None
+        tail = result.get("terminal", {}).get("tail") if isinstance(result, dict) else None
+        if not isinstance(tail, list):
+            return None
+        try:
+            return extract_reply("\n".join(str(line) for line in tail), reply_marker_id)
+        except ChatError:
+            return None
+
+    def _safe_file_reply(self, reply_marker_id: str, response_file: Path) -> str | None:
         """Return the complete token-bound reply if the file is safely available."""
         if not response_file.is_file():
             return None
@@ -364,26 +402,6 @@ class OrcaClient:
             return None
         os.chmod(response_file, 0o600)
         return reply
-
-    def _collect_reply(self, target: str, reply_marker_id: str, response_file: Path) -> str:
-        if response_file.is_file():
-            os.chmod(response_file, 0o600)
-            return extract_reply(response_file.read_text(encoding="utf-8"), reply_marker_id)
-        result = self._run(
-            [
-                "terminal",
-                "read",
-                "--terminal",
-                target,
-                "--limit",
-                str(TERMINAL_READ_LIMIT),
-                "--json",
-            ]
-        )
-        tail = result.get("terminal", {}).get("tail") if isinstance(result, dict) else None
-        if not isinstance(tail, list):
-            raise ChatError("Orca returned an invalid terminal read")
-        return extract_reply("\n".join(str(line) for line in tail), reply_marker_id)
 
 
 def build_parser() -> argparse.ArgumentParser:

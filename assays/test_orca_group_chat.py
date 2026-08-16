@@ -161,7 +161,10 @@ def test_turn_falls_back_to_bounded_terminal_read(tmp_path: Path) -> None:
     ]
 
 
-def test_stale_wait_still_collects_a_delayed_token_bound_response_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize("stale_wait", [False, True])
+def test_wait_rendezvous_collects_a_delayed_token_bound_response_file(
+    tmp_path: Path, stale_wait: bool
+) -> None:
     token = "e" * 32
     response_file = tmp_path / "responses" / f"{token}.txt"
     writer: threading.Thread | None = None
@@ -178,13 +181,14 @@ def test_stale_wait_still_collects_a_delayed_token_bound_response_file(tmp_path:
         if argv[1:3] == ["terminal", "wait"]:
             writer = threading.Timer(0.02, write_response)
             writer.start()
-            return subprocess.CompletedProcess(
-                argv,
-                1,
-                stdout='{"ok":false,"error":{"code":"terminal_handle_stale",'
-                '"message":"terminal_handle_stale"}}',
-                stderr="",
-            )
+            if stale_wait:
+                return subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    stdout='{"ok":false,"error":{"code":"terminal_handle_stale",'
+                    '"message":"terminal_handle_stale"}}',
+                    stderr="",
+                )
         return subprocess.CompletedProcess(argv, 0, stdout=json_result("{}"), stderr="")
 
     client = OrcaClient(orca_bin="orca-test", state_dir=tmp_path, runner=runner)
