@@ -91,7 +91,7 @@ supplies `HERDR_PLUGIN_STATE_DIR`, so transcripts and the plugin's exact
 workspace and pane identifiers stay in a server-instance-scoped, locked state file. This
 keeps multiple Herdr sessions separate and serializes overlapping launcher and
 setup processes. The launcher never claims a workspace merely because its label
-is `agents` or `group-chat`. Standalone CLI use retains
+is `agents · group-chat` or `group-chat`. Standalone CLI use retains
 `~/.local/state/herdr-group-chat/`; an explicit `--state-dir` always wins.
 
 Invoking **New group chat** opens a visible setup tab, reuses any live named
@@ -104,13 +104,19 @@ tabs. Failed cleanup remains recorded for a later retry instead of silently
 losing ownership of the old pane.
 
 Compact mode keeps the room alone in the initiating workspace and places the
-four native agent tabs in a secondary `agents` workspace. Enter `/agents` to
+four native agent tabs in a secondary `agents · group-chat` workspace, with
+each participant tab labeled `<kind> · group-chat` (for example `pi ·
+group-chat`). These labels are display-only; routing and reuse still key on the
+exact recorded workspace and pane identifiers. Enter `/agents` to
 reveal that workspace or `/show pi`, `/show claude`, `/show codex`, or `/show
 grok` to focus one native agent directly. Use Herdr's workspace switcher or
 **Open group chat** to return.
 
-If Codex reports unreviewed lifecycle hooks during startup, setup dismisses the
-notice and leaves those hooks inactive; it never selects **trust all** for you.
+If Codex reports unreviewed lifecycle hooks during startup, setup detects the
+dialog even when the pane read clips its text, retries briefly while it renders,
+and leaves those hooks inactive: it closes the summary notice or chooses
+**Continue without trusting** in the menu variant. It never selects **trust
+all** for you.
 
 Like every Herdr plugin, this is ordinary local code running as your user and it
 can call the full Herdr CLI. Review the manifest and executable scripts before
@@ -139,9 +145,17 @@ The review protocol and remaining v0.3 boundaries are specified in
   not yet configurable.
 - Retry state is kept in the running room process and does not survive a room
   restart. The transcript itself remains durable.
-- Cancellation sends Ctrl-C to the exact active Herdr agent tab. It is
-  best-effort because the underlying CLI has no stronger cancellation primitive.
+- Cancellation sends Ctrl-C to the exact active Herdr agent tab, and only when
+  the agent was observed working: an idle Codex interprets Ctrl-C as quit,
+  which previously killed the participant process on a timeout whose prompt
+  never landed. It remains best-effort because the underlying CLI has no
+  stronger cancellation primitive.
 - Rooms are local to one Herdr installation; this is not a network chat server.
+- An agent that finishes without emitting the `HGCHAT_REPLY_*` markers fails the
+  turn fast with a clear error once its terminal output is observed stable,
+  instead of stalling until the full agent timeout. A generic unmarked-reply
+  extractor is deliberately not attempted: terminal output has no reliable
+  reply boundaries.
 - Grok session recovery depends on the local `~/.grok/sessions` history layout.
 - The preview release supports macOS and Linux.
 

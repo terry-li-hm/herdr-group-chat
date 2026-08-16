@@ -15,6 +15,19 @@ All notable changes to this project are documented here.
   been seen working, and treat a refused or slow terminal read as not-ready instead of
   failing the turn and interrupting the agent. Ctrl-Q now waits for an active review's
   cancellation to reach the agents.
+- Detect Codex's unreviewed-hooks dialog with clipping-safe needles, retry briefly
+  while it renders, and answer the menu variant with "Continue without trusting";
+  hooks are never trusted. The room also recognizes the clipped dialog as a
+  blocked turn.
+- Fail a turn fast with a clear error when an agent completes without emitting the
+  `HGCHAT_REPLY_*` markers and its terminal output stays stable, instead of
+  polling until the full agent timeout.
+- Label participant tabs `<kind> · group-chat` and the secondary workspace
+  `agents · group-chat`; routing and reuse still key on exact recorded workspace
+  and pane identifiers.
+- Only send cancellation Ctrl-C to agents observed working; an idle Codex
+  treats Ctrl-C as quit, which previously killed the participant on a timeout
+  whose prompt never landed.
 
 ## [0.2.0] - 2026-08-15
 

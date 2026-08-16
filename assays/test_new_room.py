@@ -5,6 +5,7 @@ import os
 import re
 import stat
 import sys
+from collections.abc import Callable
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
@@ -178,7 +179,9 @@ def test_workspace_creation_never_claims_generic_user_labels(
         if arguments[:2] == ["workspace", "rename"]:
             return {"result": {"type": "workspace_info"}}
         label = arguments[arguments.index("--label") + 1]
-        workspace_id = "w-owned-group-chat" if "group-chat" in label else "w-owned-agents"
+        workspace_id = (
+            "w-owned-agents" if label.startswith("hgchat-agents") else "w-owned-group-chat"
+        )
         return {
             "result": {
                 "workspace": {"workspace_id": workspace_id},
@@ -208,7 +211,7 @@ def test_recorded_workspace_is_reused_by_id_not_label(
         del timeout
         if arguments == ["workspace", "list"]:
             return {"result": {"workspaces": [{"workspace_id": "w-exact", "label": "renamed"}]}}
-        assert arguments == ["workspace", "rename", "w-exact", "agents"]
+        assert arguments == ["workspace", "rename", "w-exact", "agents · group-chat"]
         return {"result": {"type": "workspace_info"}}
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
@@ -754,3 +757,162 @@ def test_fresh_room_ids_are_unique_and_valid() -> None:
     assert first != second
     assert re.fullmatch(r"chat-\d{8}-\d{6}-[a-f0-9]{6}", first)
     assert len(first) <= 32
+
+
+def hook_notice_fake(reads: list[str], calls: list[list[str]]) -> Callable[..., dict]:
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments[:2] == ["pane", "read"]:
+            text = reads.pop(0) if reads else ""
+            return {"result": {"read": {"text": text}}}
+        return {"result": {"type": "ok"}}
+
+    return fake_run_json
+
+
+def test_hook_notice_summary_is_dismissed_with_esc(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        hook_notice_fake(
+            [
+                "Codex detected unreviewed lifecycle hooks.\n"
+                "Press t to trust all; enter to review hooks; esc to close"
+            ],
+            calls,
+        ),
+    )
+
+    module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
+
+    assert calls == [
+        ["pane", "read", "w-agents:p-codex", "--source", "visible", "--lines", "80"],
+        ["agent", "send-keys", "codex-peer", "esc"],
+    ]
+    assert "unreviewed hooks left inactive" in capsys.readouterr().out
+
+
+def test_hook_notice_detection_survives_viewport_clipping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        hook_notice_fake(["Press T to TRUST ALL; enter to review hooks; es"], calls),
+    )
+
+    module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
+
+    assert calls[-1] == ["agent", "send-keys", "codex-peer", "esc"]
+
+
+def test_hook_menu_variant_continues_without_trusting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        hook_notice_fake(
+            [
+                "\u203a 1. Review hooks\n"
+                "  2. Trust all and continue\n"
+                "  3. Continue without trusting (hooks won't run)\n"
+                "Press enter to confirm or esc to go back"
+            ],
+            calls,
+        ),
+    )
+
+    module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
+
+    assert calls[1:] == [
+        ["agent", "send-keys", "codex-peer", "down"],
+        ["agent", "send-keys", "codex-peer", "down"],
+        ["agent", "send-keys", "codex-peer", "enter"],
+    ]
+
+
+def test_hook_notice_retry_catches_a_late_rendering_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(module, "HOOK_DISMISS_INTERVAL_S", 0)
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        hook_notice_fake(
+            ["", "", "Press t to trust all; enter to review hooks; es"],
+            calls,
+        ),
+    )
+
+    module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
+
+    reads = [call for call in calls if call[:2] == ["pane", "read"]]
+    assert len(reads) == 3
+    assert calls[-1] == ["agent", "send-keys", "codex-peer", "esc"]
+
+
+def test_hook_notice_absent_dialog_is_silent_and_bounded(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(module, "HOOK_DISMISS_INTERVAL_S", 0)
+    monkeypatch.setattr(module, "run_json", hook_notice_fake([], calls))
+
+    module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
+
+    assert len(calls) == module.HOOK_DISMISS_ATTEMPTS
+    assert all(call[:2] == ["pane", "read"] for call in calls)
+    assert capsys.readouterr().out == ""
+
+
+def test_started_participant_tabs_are_labeled_for_group_chat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "PARTICIPANTS", (("pi", "pi-peer"), ("codex", "codex-peer")))
+    monkeypatch.setattr(module, "HOOK_DISMISS_INTERVAL_S", 0)
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {"result": {"agents": []}}
+        if arguments[:2] == ["tab", "create"]:
+            label = arguments[arguments.index("--label") + 1]
+            kind = label.split("-")[1]
+            return {
+                "result": {
+                    "tab": {"tab_id": f"w-agents:t-{kind}"},
+                    "root_pane": {"pane_id": f"w-agents:p-{kind}"},
+                }
+            }
+        if arguments[:2] == ["pane", "process-info"]:
+            return {"result": {"process_info": {"foreground_processes": [{"name": "zsh"}]}}}
+        if arguments[:2] == ["pane", "read"]:
+            return {"result": {"read": {"text": ""}}}
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {"schema_version": 1}
+
+    failures = module.start_participants(
+        "herdr", str(tmp_path), "w-agents", tmp_path, launcher_state_path(tmp_path), state
+    )
+
+    assert failures == []
+    renames = [call for call in calls if call[:2] == ["tab", "rename"]]
+    assert renames == [
+        ["tab", "rename", "w-agents:t-pi", "pi · group-chat"],
+        ["tab", "rename", "w-agents:t-codex", "codex · group-chat"],
+    ]
+    reads = [call for call in calls if call[:2] == ["pane", "read"]]
+    assert reads and all(call[2] == "w-agents:p-codex" for call in reads)
+    assert not any(call[:2] == ["agent", "send-keys"] for call in calls)

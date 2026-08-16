@@ -293,17 +293,39 @@ def wait_for_shell(herdr_bin: str, pane_id: str, timeout: float = 10) -> None:
     raise BootstrapError("new tab did not reach an interactive shell")
 
 
+HOOK_DIALOG_NEEDLE = "trust all"
+HOOK_MENU_NEEDLE = "continue without trusting"
+HOOK_DISMISS_ATTEMPTS = 10
+HOOK_DISMISS_INTERVAL_S = 1.0
+
+
 def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> None:
-    """Dismiss Codex's notice without trusting hooks the user has not reviewed."""
-    payload = run_json(
-        herdr_bin,
-        ["pane", "read", pane_id, "--source", "visible", "--lines", "80"],
-    )
-    text = payload.get("result", {}).get("read", {}).get("text", "")
-    if "Press t to trust all; enter to review hooks; esc to close" not in text:
+    """Dismiss Codex's hooks dialog without trusting hooks the user has not reviewed.
+
+    The dialog can render after `agent start` reports ready, and the visible-pane
+    read clips lines at viewport width, so detection retries briefly and matches
+    short case-insensitive needles that survive clipping. Hooks stay inactive:
+    the summary notice is closed with esc, and the menu variant is answered with
+    "Continue without trusting".
+    """
+    for attempt in range(HOOK_DISMISS_ATTEMPTS):
+        payload = run_json(
+            herdr_bin,
+            ["pane", "read", pane_id, "--source", "visible", "--lines", "80"],
+        )
+        text = payload.get("result", {}).get("read", {}).get("text", "")
+        lowered = text.lower()
+        if HOOK_DIALOG_NEEDLE not in lowered:
+            if attempt + 1 < HOOK_DISMISS_ATTEMPTS:
+                time.sleep(HOOK_DISMISS_INTERVAL_S)
+            continue
+        if HOOK_MENU_NEEDLE in lowered:
+            for key in ("down", "down", "enter"):
+                run_json(herdr_bin, ["agent", "send-keys", name, key])
+        else:
+            run_json(herdr_bin, ["agent", "send-keys", name, "esc"])
+        print("notice @codex unreviewed hooks left inactive", flush=True)
         return
-    run_json(herdr_bin, ["agent", "send-keys", name, "esc"])
-    print("notice @codex unreviewed hooks left inactive", flush=True)
 
 
 def ensure_owned_workspace(
@@ -383,7 +405,7 @@ def ensure_agents_workspace(
         workspace_field="agents_workspace_id",
         placeholder_field="agents_placeholder_tab_id",
         pending_label_field="pending_agents_workspace_label",
-        display_label="agents",
+        display_label="agents · group-chat",
     )
 
 
@@ -822,10 +844,14 @@ def start_participants(
             save_launcher_state(state_dir, state, state_path)
             with suppress(BootstrapError):
                 assert_server_identity(state_dir, state_path)
-                run_json(herdr_bin, ["tab", "rename", participant_tab_id, kind])
-            with suppress(BootstrapError):
-                assert_server_identity(state_dir, state_path)
-                dismiss_inactive_hook_notice(herdr_bin, name, pane_id)
+                run_json(
+                    herdr_bin,
+                    ["tab", "rename", participant_tab_id, f"{kind} · group-chat"],
+                )
+            if kind == "codex":
+                with suppress(BootstrapError):
+                    assert_server_identity(state_dir, state_path)
+                    dismiss_inactive_hook_notice(herdr_bin, name, pane_id)
             print(f"ready  @{kind}", flush=True)
         except (BootstrapError, KeyError, TypeError) as error:
             if not isinstance(error, BootstrapError) or error.code not in INDETERMINATE_OPEN_CODES:

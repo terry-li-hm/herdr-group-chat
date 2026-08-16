@@ -49,6 +49,10 @@ REPLY_TOKEN_RE = re.compile(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})")
 POLL_INTERVAL_S = 0.5
 SUBMIT_GRACE_S = 2.0
 TERMINAL_READ_TIMEOUT_S = 30.0
+# An agent that went back to idle/done but keeps showing the same terminal text without
+# the reply markers has finished without honoring the marker protocol; after this many
+# consecutive stable unmarked reads the turn fails fast instead of stalling to timeout.
+STABLE_UNMARKED_POLLS = 20
 TUI_TIMESTAMP_RE = re.compile(r"[ \t]{2,}\d{1,2}:\d{2}\s+[AP]M[ \t█]*(?:\n[ \t]*)?")
 
 
@@ -377,19 +381,21 @@ class HerdrClient:
             )
         except ChatError as error:
             if not isinstance(error, CommandLaunchError):
-                with suppress(ChatError):
-                    self.cancel(target)
+                # The prompt may still have landed, but no status is known here,
+                # so this cancel stays best-effort.
+                self._cancel_if_working(target, None)
             raise
         saw_working = False
+        stable_unmarked = 0
+        last_unmarked_read: str | None = None
+        last_status: str | None = None
         while True:
             if cancel_event is not None and cancel_event.is_set():
-                with suppress(ChatError):
-                    self.cancel(target)
+                self._cancel_if_working(target, last_status)
                 raise ChatError("review cancelled")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                with suppress(ChatError):
-                    self.cancel(target)
+                self._cancel_if_working(target, self._agent_status(target))
                 raise ChatError(f"Herdr command timed out after {effective_timeout_ms} ms")
             try:
                 result = self._run(
@@ -397,25 +403,31 @@ class HerdrClient:
                     timeout=max(0.1, min(5, remaining)),
                 )
             except ChatError:
-                with suppress(ChatError):
-                    self.cancel(target)
+                # The status is unknown exactly because this read failed, so the
+                # cancel stays best-effort.
+                self._cancel_if_working(target, None)
                 raise
             try:
                 status = json.loads(result.stdout)["result"]["agent"]["agent_status"]
             except (json.JSONDecodeError, KeyError, TypeError) as error:
-                with suppress(ChatError):
-                    self.cancel(target)
+                self._cancel_if_working(target, None)
                 raise ChatError(f"Herdr returned an invalid result for {target}") from error
+            last_status = status
             if status == "blocked":
                 return "blocked", ""
             if status == "working":
                 saw_working = True
+                stable_unmarked = 0
+                last_unmarked_read = None
             elif status in {"idle", "done"} and (
                 saw_working or time.monotonic() - submitted_at >= SUBMIT_GRACE_S
             ):
                 terminal = self._read_terminal(target, timeout=remaining)
-                if terminal is not None:
-                    if "Press t to trust all; enter to review hooks; esc to close" in terminal:
+                if terminal is None:
+                    stable_unmarked = 0
+                    last_unmarked_read = None
+                else:
+                    if "trust all" in terminal.lower():
                         return "blocked", ""
                     try:
                         return status, extract_reply(terminal, reply_marker_id)
@@ -423,6 +435,16 @@ class HerdrClient:
                         reply = self._local_grok_reply(target, reply_marker_id)
                         if reply is not None:
                             return status, reply
+                    if saw_working and terminal == last_unmarked_read:
+                        stable_unmarked += 1
+                    else:
+                        stable_unmarked = 0
+                    last_unmarked_read = terminal
+                    if saw_working and stable_unmarked >= STABLE_UNMARKED_POLLS:
+                        raise ChatError(
+                            "reply markers HGCHAT_REPLY_* not found in "
+                            f"@{target}'s completed response"
+                        )
             pause = min(POLL_INTERVAL_S, max(0, remaining))
             if cancel_event is not None:
                 cancel_event.wait(pause)
@@ -446,6 +468,27 @@ class HerdrClient:
 
     def cancel(self, target: str) -> None:
         self._run(["agent", "send-keys", target, "ctrl+c"], timeout=5)
+
+    def _agent_status(self, target: str) -> str | None:
+        """Best-effort current agent status, or None when it cannot be determined."""
+        try:
+            result = self._run(["agent", "get", target], timeout=5)
+            return str(json.loads(result.stdout)["result"]["agent"]["agent_status"])
+        except (ChatError, json.JSONDecodeError, KeyError, TypeError):
+            return None
+
+    def _cancel_if_working(self, target: str, last_known_status: str | None) -> None:
+        """Send Ctrl-C only to an agent believed to be working.
+
+        An idle Codex TUI treats Ctrl-C as quit, which kills the participant
+        process, so an agent last seen idle or done is left alone. When the
+        status is genuinely unknown (the status read itself failed), the cancel
+        stays best-effort as before.
+        """
+        if last_known_status is not None and last_known_status != "working":
+            return
+        with suppress(ChatError):
+            self.cancel(target)
 
     def _local_grok_reply(self, target: str, token: str) -> str | None:
         """Recover a Grok reply hidden above its alternate-screen viewport."""

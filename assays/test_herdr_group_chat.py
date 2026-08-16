@@ -957,7 +957,11 @@ def test_herdr_turn_timeout_interrupts_active_target(monkeypatch: pytest.MonkeyP
 
     def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+        if argv[1:3] == ["agent", "get"]:
+            stdout = '{"result":{"agent":{"agent_status":"working"}}}'
+        else:
+            stdout = "{}"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
     client = HerdrClient(herdr_bin="herdr-test", runner=runner)
     with pytest.raises(ChatError, match="timed out after 1000 ms"):
@@ -969,8 +973,92 @@ def test_herdr_turn_timeout_interrupts_active_target(monkeypatch: pytest.MonkeyP
 
     assert [call[1:3] for call in calls] == [
         ["agent", "prompt"],
+        ["agent", "get"],
         ["agent", "send-keys"],
     ]
+
+
+def test_herdr_turn_timeout_does_not_ctrl_c_an_idle_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle Codex treats Ctrl-C as quit; a timeout with no landed prompt must not kill it."""
+    calls: list[list[str]] = []
+    token = "6" * 32
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1:3] == ["agent", "get"]:
+            stdout = '{"result":{"agent":{"agent_status":"idle"}}}'
+        else:
+            stdout = "{}"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    with pytest.raises(ChatError, match="timed out after 50 ms"):
+        client.turn(
+            "codex-peer",
+            f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+            50,
+        )
+
+    assert ["agent", "send-keys"] not in [call[1:3] for call in calls]
+
+
+def test_herdr_turn_timeout_ctrl_c_reaches_a_working_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    token = "7" * 32
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1:3] == ["agent", "get"]:
+            stdout = '{"result":{"agent":{"agent_status":"working"}}}'
+        else:
+            stdout = "{}"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    with pytest.raises(ChatError, match="timed out after 50 ms"):
+        client.turn(
+            "claude-peer",
+            f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+            50,
+        )
+
+    assert [call[1:3] for call in calls][-2:] == [["agent", "get"], ["agent", "send-keys"]]
+    assert calls[-1][-2:] == ["claude-peer", "ctrl+c"]
+
+
+def test_herdr_turn_review_cancel_skips_ctrl_c_for_an_idle_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    cancel_event = threading.Event()
+    token = "8" * 32
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1:3] == ["agent", "get"]:
+            cancel_event.set()
+            stdout = '{"result":{"agent":{"agent_status":"idle"}}}'
+        else:
+            stdout = "{}"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    with pytest.raises(ChatError, match="review cancelled"):
+        client.turn(
+            "codex-peer",
+            f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+            12_000,
+            cancel_event,
+        )
+
+    assert ["agent", "send-keys"] not in [call[1:3] for call in calls]
 
 
 def test_invalid_post_submission_status_interrupts_active_target() -> None:
@@ -1019,6 +1107,105 @@ def test_submission_command_failure_interrupts_possibly_active_target() -> None:
         ["agent", "prompt"],
         ["agent", "send-keys"],
     ]
+
+
+def test_herdr_turn_detects_clipped_hooks_dialog_as_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "3" * 32
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    statuses = iter(("working", "done"))
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        if argv[1:3] == ["agent", "get"]:
+            stdout = f'{{"result":{{"agent":{{"agent_status":"{next(statuses)}"}}}}}}'
+        elif argv[1:3] == ["agent", "read"]:
+            stdout = "Press t to trust all; enter to review hooks; es"
+        else:
+            stdout = "{}"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    assert client.turn(
+        "codex-peer",
+        f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+        12_000,
+    ) == ("blocked", "")
+
+
+def test_herdr_turn_fails_fast_when_a_completed_reply_stays_unmarked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    token = "4" * 32
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    polls = 0
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        nonlocal polls
+        calls.append(argv)
+        if argv[1:3] == ["agent", "get"]:
+            polls += 1
+            status = "working" if polls == 1 else "done"
+            stdout = f'{{"result":{{"agent":{{"agent_status":"{status}"}}}}}}'
+        elif argv[1:3] == ["agent", "read"]:
+            stdout = "a complete answer that ignored the marker protocol"
+        else:
+            stdout = "{}"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    with pytest.raises(
+        ChatError,
+        match=r"reply markers HGCHAT_REPLY_\* not found in @claude-peer's completed response",
+    ):
+        client.turn(
+            "claude-peer",
+            f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+            600_000,
+        )
+
+    reads = [call for call in calls if call[1:3] == ["agent", "read"]]
+    assert len(reads) == namespace["STABLE_UNMARKED_POLLS"] + 1
+    assert ["agent", "send-keys"] not in [call[1:3] for call in calls]
+
+
+def test_herdr_turn_unmarked_streak_resets_when_terminal_content_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    token = "5" * 32
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    polls = 0
+    streak_limit = namespace["STABLE_UNMARKED_POLLS"]
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        nonlocal polls
+        calls.append(argv)
+        if argv[1:3] == ["agent", "get"]:
+            polls += 1
+            status = "working" if polls == 1 else "done"
+            stdout = f'{{"result":{{"agent":{{"agent_status":"{status}"}}}}}}'
+        elif argv[1:3] == ["agent", "read"]:
+            reads = len([call for call in calls if call[1:3] == ["agent", "read"]])
+            if reads > streak_limit * 2:
+                stdout = f"HGCHAT_REPLY_BEGIN {token}\nanswer\nHGCHAT_REPLY_END {token}\n"
+            else:
+                stdout = f"still drafting chunk {reads}"
+        else:
+            stdout = "{}"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    status, reply = client.turn(
+        "claude-peer",
+        f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+        600_000,
+    )
+
+    assert (status, reply) == ("done", "answer")
+    reads = [call for call in calls if call[1:3] == ["agent", "read"]]
+    assert len(reads) > streak_limit
 
 
 def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:
