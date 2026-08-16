@@ -1,0 +1,406 @@
+#!/usr/bin/env -S uv run --script --python 3.13
+# /// script
+# requires-python = ">=3.13"
+# dependencies = []
+# ///
+"""An experimental Orca adapter: group-chat TUI over live Orca agent terminals.
+
+This reuses the herdr-group-chat core (transcript, routing, review, synthesis,
+retry, cancellation, and curses TUI) while driving already-live Orca agent
+terminals by exact terminal handle. Participants must be mapped explicitly
+with --agent NAME=TERMINAL_HANDLE; no handle is ever guessed.
+
+Accepted tradeoff of this first vertical slice: it uses Orca terminal control
+(``terminal send/wait/read``) rather than creating an orchestration
+Task/Dispatch per conversational turn. It introduces no new message bus, MCP
+dependency, plugin framework, cross-host support, or terminal lifecycle
+ownership.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+CORE_PATH = Path(__file__).resolve().parent / "herdr-group-chat"
+_loader = SourceFileLoader("herdr_group_chat_core", str(CORE_PATH))
+_spec = spec_from_loader(_loader.name, _loader)
+assert _spec is not None
+core = module_from_spec(_spec)
+sys.modules[_spec.name] = core
+_loader.exec_module(core)
+
+ChatError = core.ChatError
+Transcript = core.Transcript
+GroupChat = core.GroupChat
+parse_agent_timeouts = core.parse_agent_timeouts
+message_lines = core.message_lines
+run_tui = core.run_tui
+REPLY_TOKEN_RE = core.REPLY_TOKEN_RE
+extract_reply = core.extract_reply
+
+DEFAULT_ORCA_STATE_DIR = Path("~/.local/state/orca-group-chat")
+STATE_DIR_ENV = "ORCA_GROUP_CHAT_STATE_DIR"
+ROOM_ENV = "ORCA_GROUP_CHAT_ROOM"
+HOST_LABEL = "Orca"
+TERMINAL_READ_LIMIT = 1000
+
+
+def parse_agent_mappings(values: Sequence[str]) -> dict[str, str]:
+    """Map --agent NAME=TERMINAL_HANDLE values to unique explicit handles."""
+    if not values:
+        raise ChatError("at least one --agent NAME=TERMINAL_HANDLE mapping is required")
+    agents: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            raise ChatError(f"invalid agent mapping: {value}")
+        name, handle = value.split("=", 1)
+        name = name.strip().lower()
+        handle = handle.strip()
+        if name not in core.DEFAULT_AGENTS or not handle:
+            raise ChatError(f"invalid agent mapping: {value}")
+        if name in agents:
+            raise ChatError(f"duplicate agent mapping: {value}")
+        agents[name] = handle
+    duplicates = sorted(
+        handle for handle in set(agents.values()) if list(agents.values()).count(handle) > 1
+    )
+    if duplicates:
+        raise ChatError(f"duplicate terminal handle: {', '.join(duplicates)}")
+    return agents
+
+
+def resolve_state_dir(
+    explicit: Path | None,
+    environ: dict[str, str] | os._Environ[str] = os.environ,
+) -> Path:
+    if explicit is not None:
+        return explicit
+    configured = environ.get(STATE_DIR_ENV, "").strip()
+    if configured:
+        return Path(configured)
+    return DEFAULT_ORCA_STATE_DIR
+
+
+class OrcaClient:
+    """AgentClient implementation over argv-based ``orca ... --json`` calls."""
+
+    def __init__(
+        self,
+        orca_bin: str = "orca",
+        timeout_ms: int = 600_000,
+        state_dir: Path | None = None,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
+    ) -> None:
+        self.orca_bin = orca_bin
+        self.timeout_ms = timeout_ms
+        self.state_dir = (
+            resolve_state_dir(state_dir).expanduser()
+            if state_dir is not None
+            else resolve_state_dir(None).expanduser()
+        )
+        self.runner = runner
+        self.popen_factory = (
+            subprocess.Popen
+            if popen_factory is None and runner is subprocess.run
+            else popen_factory
+        )
+
+    def _run(self, arguments: list[str], timeout: float = 30) -> Any:
+        try:
+            result = self.runner(
+                [self.orca_bin, *arguments],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=timeout,
+                check=False,
+            )
+        except OSError as error:
+            raise ChatError(f"Orca command failed: {error}") from error
+        except subprocess.TimeoutExpired as error:
+            raise ChatError(f"Orca command failed: {error}") from error
+        if result.returncode != 0:
+            raise self._command_error(result)
+        return self._parse_payload(result)
+
+    @staticmethod
+    def _parse_payload(
+        result: subprocess.CompletedProcess[str],
+    ) -> Any:
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise ChatError("Orca returned invalid JSON") from error
+        if not isinstance(payload, dict):
+            raise ChatError("Orca returned invalid JSON")
+        if payload.get("ok") is not True:
+            raise OrcaClient._payload_error(payload)
+        return payload.get("result")
+
+    @staticmethod
+    def _stop_process(process: subprocess.Popen[str]) -> None:
+        process.terminate()
+        try:
+            process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+
+    def _run_interruptible(
+        self,
+        arguments: list[str],
+        cancel_event: threading.Event | None,
+        timeout: float,
+    ) -> Any:
+        if self.popen_factory is None:
+            return self._run(arguments, timeout=timeout)
+        try:
+            process = self.popen_factory(
+                [self.orca_bin, *arguments],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+            )
+        except OSError as error:
+            raise ChatError(f"Orca command failed: {error}") from error
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                self._stop_process(process)
+                raise ChatError("review cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._stop_process(process)
+                raise ChatError(f"Orca command timed out after {int(timeout * 1000)} ms")
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+            result = subprocess.CompletedProcess(
+                [self.orca_bin, *arguments], process.returncode, stdout, stderr
+            )
+            if result.returncode != 0:
+                raise self._command_error(result)
+            return self._parse_payload(result)
+
+    @staticmethod
+    def _payload_error(payload: dict[str, Any]) -> ChatError:
+        error = payload.get("error")
+        if isinstance(error, dict) and error.get("code") and error.get("message"):
+            return ChatError(f"Orca command failed: {error['code']}: {error['message']}")
+        return ChatError("Orca returned an error result")
+
+    def _command_error(self, result: subprocess.CompletedProcess[str]) -> ChatError:
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            return self._payload_error(payload)
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        return ChatError(f"Orca command failed: {detail}")
+
+    def _terminals(self) -> list[dict[str, Any]]:
+        result = self._run(["terminal", "list", "--json"])
+        terminals = result.get("terminals") if isinstance(result, dict) else None
+        if not isinstance(terminals, list):
+            raise ChatError("Orca returned an invalid terminal list")
+        return [item for item in terminals if isinstance(item, dict) and item.get("handle")]
+
+    @staticmethod
+    def _is_live(terminal: dict[str, Any]) -> bool:
+        return (
+            terminal.get("connected") is True
+            and terminal.get("writable") is True
+            and terminal.get("orphaned") is not True
+        )
+
+    def live_targets(self) -> set[str]:
+        return {item["handle"] for item in self._terminals() if self._is_live(item)}
+
+    def states(self) -> dict[str, str]:
+        return {
+            item["handle"]: "ready" if self._is_live(item) else "offline"
+            for item in self._terminals()
+        }
+
+    def focus(self, target: str) -> None:
+        self._run(["terminal", "switch", "--terminal", target, "--json"])
+
+    def focus_workspace(self, workspace_id: str) -> None:
+        raise ChatError("the Orca adapter does not manage workspace focus")
+
+    def cancel(self, target: str) -> None:
+        self._run(["terminal", "send", "--terminal", target, "--interrupt", "--json"])
+
+    def _response_file(self, reply_marker_id: str) -> Path:
+        directory = self.state_dir / "responses"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(directory, 0o700)
+        return directory / f"{reply_marker_id}.txt"
+
+    def turn(
+        self,
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, str]:
+        effective_timeout_ms = timeout_ms if timeout_ms is not None else self.timeout_ms
+        marker_match = REPLY_TOKEN_RE.search(prompt)
+        if marker_match is None:
+            raise ChatError("relay prompt has no reply token")
+        reply_marker_id = marker_match.group(1)
+        response_file = self._response_file(reply_marker_id)
+        full_prompt = (
+            f"{prompt}\n"
+            "Additionally, write your final marker-wrapped reply to the file below "
+            "(exact path), keeping the HGCHAT_REPLY_BEGIN/END marker lines inside the "
+            "file:\n"
+            f"ORCA_GROUP_CHAT_RESPONSE_FILE: {response_file}\n"
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise ChatError("review cancelled")
+        self._run(
+            ["terminal", "send", "--terminal", target, "--text", full_prompt, "--enter", "--json"]
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            self.cancel(target)
+            raise ChatError("review cancelled")
+        wait_arguments = [
+            "terminal",
+            "wait",
+            "--terminal",
+            target,
+            "--for",
+            "tui-idle",
+            "--timeout-ms",
+            str(effective_timeout_ms),
+            "--json",
+        ]
+        try:
+            self._run_interruptible(wait_arguments, cancel_event, effective_timeout_ms / 1000 + 30)
+        except ChatError as error:
+            if (
+                cancel_event is not None
+                and cancel_event.is_set()
+                and str(error) == ("review cancelled")
+            ):
+                self.cancel(target)
+            raise
+        if cancel_event is not None and cancel_event.is_set():
+            self.cancel(target)
+            raise ChatError("review cancelled")
+        return "done", self._collect_reply(target, reply_marker_id, response_file)
+
+    def _collect_reply(self, target: str, reply_marker_id: str, response_file: Path) -> str:
+        if response_file.is_file():
+            os.chmod(response_file, 0o600)
+            return extract_reply(response_file.read_text(encoding="utf-8"), reply_marker_id)
+        result = self._run(
+            [
+                "terminal",
+                "read",
+                "--terminal",
+                target,
+                "--limit",
+                str(TERMINAL_READ_LIMIT),
+                "--json",
+            ]
+        )
+        tail = result.get("terminal", {}).get("tail") if isinstance(result, dict) else None
+        if not isinstance(tail, list):
+            raise ChatError("Orca returned an invalid terminal read")
+        return extract_reply("\n".join(str(line) for line in tail), reply_marker_id)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--room", default=os.environ.get(ROOM_ENV, "cockpit"))
+    parser.add_argument("--state-dir", type=Path)
+    parser.add_argument("--max-turns", type=int, default=4)
+    parser.add_argument("--timeout-ms", type=int, default=600_000)
+    parser.add_argument("--agent", action="append", default=[], metavar="NAME=TERMINAL_HANDLE")
+    parser.add_argument(
+        "--agent-timeout",
+        action="append",
+        default=[],
+        metavar="NAME=MILLISECONDS",
+    )
+    parser.add_argument(
+        "--synthesizer",
+        default=os.environ.get("ORCA_GROUP_CHAT_SYNTHESIZER", "pi"),
+    )
+    parser.add_argument("--once", metavar="MESSAGE")
+    parser.add_argument("--show", action="store_true")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        transcript = Transcript(resolve_state_dir(args.state_dir), args.room)
+        if args.show:
+            for line in message_lines(transcript.read(), 100):
+                print(line)
+            return 0
+        agents = parse_agent_mappings(args.agent)
+        agent_timeouts = parse_agent_timeouts(args.agent_timeout, tuple(agents))
+        chat = GroupChat(
+            transcript,
+            agents,
+            OrcaClient(
+                orca_bin=os.environ.get("ORCA_BIN_PATH", "orca"),
+                timeout_ms=args.timeout_ms,
+                state_dir=resolve_state_dir(args.state_dir),
+            ),
+            max_turns=args.max_turns,
+            synthesizer=args.synthesizer,
+            agent_timeouts=agent_timeouts,
+            host_label=HOST_LABEL,
+        )
+        if args.once is not None:
+            before = len(transcript.read())
+            if args.once.strip() == "/review" or args.once.strip().startswith("/review "):
+                question = args.once.strip().removeprefix("/review").strip()
+                if not question:
+                    raise ChatError("usage: --once '/review [@agents] QUESTION'")
+                chat.review(question)
+                created = transcript.read()[before:]
+            else:
+                created = chat.dispatch(args.once)
+            for item in created:
+                print(f"{item['sender']}> {item['body']}")
+            return 0
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            raise ChatError("interactive mode requires a TTY; use --once or --show")
+        curses_run(chat, args.room)
+        return 0
+    except ChatError as error:
+        print(f"orca-group-chat: {error}", file=sys.stderr)
+        return 2
+
+
+def curses_run(chat: GroupChat, room: str) -> None:
+    import curses
+
+    curses.wrapper(run_tui, chat, room)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

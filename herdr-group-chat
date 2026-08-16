@@ -561,13 +561,14 @@ def build_prompt(
     messages: Sequence[dict[str, Any]],
     token: str,
     participants: Sequence[str],
+    host: str = "Herdr",
 ) -> str:
     roster = ", ".join(["a human", *(f"@{name}" for name in participants)])
     return (
         f"You are @{agent}, a full participant in a local group chat with {roster}. "
         "Keep your normal capabilities and instructions. "
         "Respond to the room as yourself. Use your ordinary tools when the task requires "
-        "them, but do not use Herdr to relay this reply because the group-chat relay handles "
+        f"them, but do not use {host} to relay this reply because the group-chat relay handles "
         "delivery. Apply your own data-handling rules independently; another participant's "
         "eligibility never transfers to you. If the user invokes a bounded disclosure, "
         "verify your active provider, model, account-surface eligibility, exact payload, and "
@@ -589,14 +590,15 @@ def build_review_prompt(
     question: str,
     token: str,
     participants: Sequence[str],
+    host: str = "Herdr",
 ) -> str:
     roster = ", ".join(f"@{name}" for name in participants)
     return (
-        f"You are @{agent}, one of the independent reviewers in a local Herdr group chat "
+        f"You are @{agent}, one of the independent reviewers in a local {host} group chat "
         f"with {roster}. Keep your normal capabilities, instructions, and data-handling "
         "rules. Review the human's question independently. Do not assume or imitate another "
         "reviewer's answer; their answers are deliberately withheld until synthesis. Use your "
-        "ordinary tools when needed, but do not use Herdr to relay this reply because the "
+        f"ordinary tools when needed, but do not use {host} to relay this reply because the "
         "group-chat relay handles delivery.\n\n"
         "Question for independent review:\n\n"
         f"{question}\n\n"
@@ -612,16 +614,17 @@ def build_synthesis_prompt(
     reviewers: Sequence[str],
     responses: dict[str, str],
     token: str,
+    host: str = "Herdr",
 ) -> str:
     review_text = "\n\n".join(
         f"[@{name}] {responses.get(name, '(no usable response)')}" for name in reviewers
     )
     return (
-        f"You are @{synthesizer}, the designated synthesizer in a local Herdr group chat. "
+        f"You are @{synthesizer}, the designated synthesizer in a local {host} group chat. "
         "Keep your normal capabilities, instructions, and data-handling rules. The reviewers "
         "answered independently. Identify agreements, material disagreements, and the best "
         "supported final recommendation. Do not claim consensus when the reviews differ. Use "
-        "your ordinary tools only if synthesis genuinely requires them, and do not use Herdr "
+        f"your ordinary tools only if synthesis genuinely requires them, and do not use {host} "
         "to relay this reply because the group-chat relay handles delivery.\n\n"
         "Human question:\n\n"
         f"{question}\n\n"
@@ -648,6 +651,7 @@ class GroupChat:
         agents_workspace_id: str | None = None,
         synthesizer: str = "pi",
         agent_timeouts: dict[str, int] | None = None,
+        host_label: str = "Herdr",
     ) -> None:
         if max_turns < 1:
             raise ChatError("max turns must be positive")
@@ -665,13 +669,14 @@ class GroupChat:
             raise ChatError(f"agent targets must be unique: {', '.join(duplicates)}")
         self.synthesizer = synthesizer
         self.agent_timeouts = dict(agent_timeouts or {})
+        self.host_label = host_label
 
     def _ensure_live(self, names: Sequence[str]) -> None:
         targets = self.client.live_targets()
         missing = [name for name in names if self.agents[name] not in targets]
         if missing:
             labels = ", ".join(f"@{name}" for name in missing)
-            raise ChatError(f"participant not live in Herdr: {labels}")
+            raise ChatError(f"participant not live in {self.host_label}: {labels}")
 
     def _timeout_for(self, agent: str) -> int | None:
         return self.agent_timeouts.get(agent)
@@ -722,7 +727,7 @@ class GroupChat:
                 if item["seq"] > cursors.get(agent, 0) and item["sender"] != agent
             ]
             token = uuid.uuid4().hex
-            prompt = build_prompt(agent, messages, token, tuple(self.agents))
+            prompt = build_prompt(agent, messages, token, tuple(self.agents), self.host_label)
             try:
                 status, reply = self.client.turn(
                     self.agents[agent], prompt, self._timeout_for(agent)
@@ -731,7 +736,7 @@ class GroupChat:
                     item = self.transcript.append(
                         "system",
                         ("human",),
-                        f"@{agent} is blocked and needs attention in Herdr.",
+                        f"@{agent} is blocked and needs attention in {self.host_label}.",
                     )
                 else:
                     item = self.transcript.append(agent, ("human", "all"), reply)
@@ -754,6 +759,7 @@ class GroupChat:
                 route.body,
                 uuid.uuid4().hex,
                 tuple(self.agents),
+                self.host_label,
             )
             for agent in reviewers
         }
@@ -831,7 +837,7 @@ class GroupChat:
             self.transcript.append(
                 "system",
                 ("human",),
-                f"@{agent} is blocked and needs attention in Herdr.",
+                f"@{agent} is blocked and needs attention in {self.host_label}.",
                 kind="review_status",
                 round_id=review.id,
             )
@@ -878,6 +884,7 @@ class GroupChat:
             review.reviewers,
             responses,
             token,
+            self.host_label,
         )
         try:
             status, reply = self.client.turn(
@@ -908,7 +915,8 @@ class GroupChat:
             self.transcript.append(
                 "system",
                 ("human",),
-                f"@{review.synthesizer} synthesis is blocked and needs attention in Herdr.",
+                f"@{review.synthesizer} synthesis is blocked and needs attention in "
+                f"{self.host_label}.",
                 kind="review_status",
                 round_id=review.id,
             )
@@ -985,6 +993,7 @@ class GroupChat:
             review.question,
             uuid.uuid4().hex,
             tuple(self.agents),
+            self.host_label,
         )
         self._set_review_state(review, agent, "queued", on_state)
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="hgchat-retry") as pool:
@@ -1293,11 +1302,12 @@ def draw_tui(
     status: str,
     participants: Sequence[str],
     scroll_offset: int = 0,
+    title: str = "Herdr group chat",
 ) -> int:
     screen.erase()
     height, width = screen.getmaxyx()
     mentions = " ".join(f"@{name}" for name in participants)
-    header = f" Herdr group chat: {room} | {mentions} @all | Ctrl-Q exits "
+    header = f" {title}: {room} | {mentions} @all | Ctrl-Q exits "
     try:
         screen.addnstr(0, 0, header, width - 1, curses.A_REVERSE)
         available = max(1, height - 4)
@@ -1336,6 +1346,7 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
             status if status_override else (review_status or status),
             participants,
             scroll_offset,
+            title=f"{chat.host_label} group chat",
         )
         try:
             key = screen.get_wch()
@@ -1376,7 +1387,15 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
                 buffer = ""
                 continue
             status = "Waiting for the addressed agents..."
-            draw_tui(screen, chat.transcript, room, "", status, participants)
+            draw_tui(
+                screen,
+                chat.transcript,
+                room,
+                "",
+                status,
+                participants,
+                title=f"{chat.host_label} group chat",
+            )
             try:
                 chat.dispatch(buffer)
                 status = participant_status(chat, "Delivered.")
