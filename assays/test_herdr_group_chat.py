@@ -752,14 +752,18 @@ def test_herdr_cancel_uses_exact_target_and_ctrl_c() -> None:
     assert calls == [["herdr-test", "agent", "send-keys", "claude-peer", "ctrl+c"]]
 
 
-def test_herdr_turn_submits_then_polls_for_token_bound_reply() -> None:
+def test_herdr_turn_submits_then_polls_for_token_bound_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[list[str]] = []
     token = "a" * 32
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    statuses = iter(("working", "done"))
 
     def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
         if argv[1:3] == ["agent", "get"]:
-            stdout = '{"result":{"agent":{"agent_status":"done"}}}'
+            stdout = f'{{"result":{{"agent":{{"agent_status":"{next(statuses)}"}}}}}}'
         elif argv[1:3] == ["agent", "read"]:
             stdout = f"HGCHAT_REPLY_BEGIN {token}\nanswer\nHGCHAT_REPLY_END {token}\n"
         else:
@@ -776,7 +780,94 @@ def test_herdr_turn_submits_then_polls_for_token_bound_reply() -> None:
     assert (status, reply) == ("done", "answer")
     assert calls[0][1:4] == ["agent", "prompt", "claude-peer"]
     assert "--wait" not in calls[0]
-    assert [call[1:3] for call in calls[1:]] == [["agent", "get"], ["agent", "read"]]
+    assert [call[1:3] for call in calls[1:]] == [
+        ["agent", "get"],
+        ["agent", "get"],
+        ["agent", "read"],
+    ]
+
+
+def test_herdr_turn_defers_terminal_read_until_agent_seen_working_or_grace_elapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale idle right after submission must not trigger the slow scrolling read."""
+    calls: list[list[str]] = []
+    token = "1" * 32
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    monkeypatch.setitem(namespace, "SUBMIT_GRACE_S", 2.0)
+    clock = iter((0.0, 0.5, 0.5, 1.0, 1.0, 2.5, 2.5, 3.0, 3.0))
+    monkeypatch.setattr(namespace["time"], "monotonic", lambda: next(clock, 3.0))
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1:3] == ["agent", "get"]:
+            stdout = '{"result":{"agent":{"agent_status":"idle"}}}'
+        elif argv[1:3] == ["agent", "read"]:
+            stdout = f"HGCHAT_REPLY_BEGIN {token}\nanswer\nHGCHAT_REPLY_END {token}\n"
+        else:
+            stdout = "{}"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    status, reply = client.turn(
+        "claude-peer",
+        f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+        12_000,
+    )
+
+    assert (status, reply) == ("idle", "answer")
+    kinds = [call[1:3] for call in calls]
+    first_read = kinds.index(["agent", "read"])
+    assert kinds[first_read - 1] == ["agent", "get"]
+    assert kinds[1:first_read] == [["agent", "get"]] * (first_read - 1)
+    assert first_read - 1 >= 2, "idle polls inside the grace period must not read"
+
+
+def test_herdr_turn_tolerates_refused_or_slow_terminal_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """agent_not_idle at the idle->working flip and a slow capture are 'not ready', not failure."""
+    calls: list[list[str]] = []
+    token = "2" * 32
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    reads = iter(("refused", "slow", "ok"))
+
+    def runner(
+        argv: list[str], timeout: float = 30, **_: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1:3] == ["agent", "get"]:
+            status = "working" if len(calls) == 2 else "done"
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=f'{{"result":{{"agent":{{"agent_status":"{status}"}}}}}}', stderr=""
+            )
+        if argv[1:3] == ["agent", "read"]:
+            assert timeout > 5, "terminal reads are no longer capped at five seconds"
+            outcome = next(reads)
+            if outcome == "refused":
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout='{"error":{"code":"agent_not_idle"}}', stderr=""
+                )
+            if outcome == "slow":
+                raise subprocess.TimeoutExpired(argv, timeout)
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=f"HGCHAT_REPLY_BEGIN {token}\nanswer\nHGCHAT_REPLY_END {token}\n",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    status, reply = client.turn(
+        "claude-peer",
+        f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+        12_000,
+    )
+
+    assert (status, reply) == ("done", "answer")
+    assert ["agent", "send-keys"] not in [call[1:3] for call in calls]
+    assert [call[1:3] for call in calls].count(["agent", "read"]) == 3
 
 
 def test_herdr_turn_cancels_after_submission_if_request_arrived_during_submit() -> None:

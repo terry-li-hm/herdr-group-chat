@@ -41,6 +41,14 @@ AGENTS_WORKSPACE_ENV = "HERDR_GROUP_CHAT_AGENTS_WORKSPACE_ID"
 ROOM_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
 MENTION_RE = re.compile(r"^@([a-z0-9_,@-]+)\s+(.*)$", re.DOTALL | re.IGNORECASE)
 REPLY_TOKEN_RE = re.compile(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})")
+# Herdr reports agent status heuristically and flips idle->working with a lag, and a
+# 240-line alternate-screen read is a scrolling capture that took ~6 s on a busy host.
+# So the relay polls at a modest interval, defers the first read until the agent has been
+# seen working (or a short grace period has passed), and treats a refused or slow read as
+# "not ready yet" rather than as a failed turn.
+POLL_INTERVAL_S = 0.5
+SUBMIT_GRACE_S = 2.0
+TERMINAL_READ_TIMEOUT_S = 30.0
 TUI_TIMESTAMP_RE = re.compile(r"[ \t]{2,}\d{1,2}:\d{2}\s+[AP]M[ \t█]*(?:\n[ \t]*)?")
 
 
@@ -359,7 +367,8 @@ class HerdrClient:
         if cancel_event is not None and cancel_event.is_set():
             raise ChatError("review cancelled")
 
-        deadline = time.monotonic() + (effective_timeout_ms / 1000)
+        submitted_at = time.monotonic()
+        deadline = submitted_at + (effective_timeout_ms / 1000)
         try:
             self._run_interruptible(
                 ["agent", "prompt", target, prompt],
@@ -371,6 +380,7 @@ class HerdrClient:
                 with suppress(ChatError):
                     self.cancel(target)
             raise
+        saw_working = False
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 with suppress(ChatError):
@@ -398,36 +408,41 @@ class HerdrClient:
                 raise ChatError(f"Herdr returned an invalid result for {target}") from error
             if status == "blocked":
                 return "blocked", ""
-            if status in {"idle", "done"}:
-                try:
-                    terminal = self._run(
-                        [
-                            "agent",
-                            "read",
-                            target,
-                            "--source",
-                            "recent-unwrapped",
-                            "--lines",
-                            "240",
-                        ],
-                        timeout=max(0.1, min(5, remaining)),
-                    ).stdout
-                except ChatError:
-                    with suppress(ChatError):
-                        self.cancel(target)
-                    raise
-                if "Press t to trust all; enter to review hooks; esc to close" in terminal:
-                    return "blocked", ""
-                try:
-                    return status, extract_reply(terminal, reply_marker_id)
-                except ChatError:
-                    reply = self._local_grok_reply(target, reply_marker_id)
-                    if reply is not None:
-                        return status, reply
+            if status == "working":
+                saw_working = True
+            elif status in {"idle", "done"} and (
+                saw_working or time.monotonic() - submitted_at >= SUBMIT_GRACE_S
+            ):
+                terminal = self._read_terminal(target, timeout=remaining)
+                if terminal is not None:
+                    if "Press t to trust all; enter to review hooks; esc to close" in terminal:
+                        return "blocked", ""
+                    try:
+                        return status, extract_reply(terminal, reply_marker_id)
+                    except ChatError:
+                        reply = self._local_grok_reply(target, reply_marker_id)
+                        if reply is not None:
+                            return status, reply
+            pause = min(POLL_INTERVAL_S, max(0, remaining))
             if cancel_event is not None:
-                cancel_event.wait(min(0.1, max(0, remaining)))
+                cancel_event.wait(pause)
             else:
-                time.sleep(min(0.1, max(0, remaining)))
+                time.sleep(pause)
+
+    def _read_terminal(self, target: str, timeout: float) -> str | None:
+        """Read recent terminal output, or None when Herdr refuses or the capture is slow.
+
+        A refused read (Herdr's `agent_not_idle` at the idle->working flip) or a slow
+        alternate-screen capture means the reply is not observable yet; the caller keeps
+        polling until the token-bound reply appears or the turn deadline passes.
+        """
+        try:
+            return self._run(
+                ["agent", "read", target, "--source", "recent-unwrapped", "--lines", "240"],
+                timeout=max(0.1, min(TERMINAL_READ_TIMEOUT_S, timeout)),
+            ).stdout
+        except ChatError:
+            return None
 
     def cancel(self, target: str) -> None:
         self._run(["agent", "send-keys", target, "ctrl+c"], timeout=5)
@@ -751,7 +766,7 @@ class GroupChat:
         future: Future[tuple[str, str]],
         on_state: Callable[[str, str], None] | None,
     ) -> None:
-        if review.cancel_event.is_set():
+        if review.cancel_event.is_set() and future.exception() is not None:
             self._set_review_state(review, agent, "cancelled", on_state)
             return
         try:
@@ -916,7 +931,6 @@ class GroupChat:
                 raise ChatError("the last review never started and cannot be retried")
             if agent in review.responses:
                 raise ChatError(f"@{agent} already has a usable review response")
-            review.responses.pop(agent, None)
             if reset_cancel:
                 review.cancel_event = threading.Event()
         self._ensure_live((agent, review.synthesizer))
@@ -956,13 +970,12 @@ class GroupChat:
         self._synthesize_review(review, on_state)
         return review
 
-    def cancel_review(self, review: ReviewRound) -> list[str]:
+    def cancel_review(self, review: ReviewRound) -> None:
         with review.lock:
             review.cancel_event.set()
             for name, state in review.states.items():
                 if state == "queued":
                     review.states[name] = "cancelled"
-        return []
 
 
 def parse_agent_overrides(values: Sequence[str]) -> dict[str, str]:
@@ -1138,11 +1151,9 @@ class ReviewController:
             if self._active is None:
                 raise ChatError("there is no active review to cancel")
             review = self._active
-        failures = self.chat.cancel_review(review)
+        self.chat.cancel_review(review)
         with review.lock, self._lock:
             self._states = dict(review.states)
-        if failures:
-            return "Cancellation requested; interrupt failed for " + "; ".join(failures)
         return "Cancellation requested."
 
     def is_active(self) -> bool:
@@ -1290,6 +1301,9 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
             if reviews.is_active():
                 with suppress(ChatError):
                     reviews.cancel()
+                # The workers send Ctrl-C to their agents on their next poll tick; exiting
+                # before that kills the daemon threads and leaves the agents working.
+                reviews.wait(5)
             return
         if key == curses.KEY_PPAGE:
             scroll_offset = min(max_scroll, scroll_offset + max(1, screen.getmaxyx()[0] - 5))
