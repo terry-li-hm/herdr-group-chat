@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-16
+
 - Add a two-phase `/review` flow: independent reviewers run concurrently, then
   a configurable participant synthesizes the available responses.
 - Keep the room responsive with per-participant review states, targeted
