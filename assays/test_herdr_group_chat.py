@@ -40,6 +40,7 @@ participant_status = namespace["participant_status"]
 handle_local_command = namespace["handle_local_command"]
 handle_view_command = namespace["handle_view_command"]
 inbox_messages = namespace["inbox_messages"]
+inbox_rendered_lines = namespace["inbox_rendered_lines"]
 visible_message_lines = namespace["visible_message_lines"]
 
 
@@ -152,6 +153,14 @@ def test_inbox_keeps_final_deliverables_and_attention_without_review_drafts() ->
     ]
 
     assert [item["seq"] for item in inbox_messages(messages)] == [2, 4, 5, 7]
+
+
+def test_inbox_empty_state_is_explicit_and_nonempty_inbox_uses_message_rendering() -> None:
+    assert inbox_rendered_lines([], 80) == [
+        "Inbox is clear. Final replies and items needing attention appear here."
+    ]
+    messages = [{"seq": 1, "sender": "pi", "kind": "message", "body": "answer"}]
+    assert inbox_rendered_lines(messages, 80) == message_lines(messages, 80)
 
 
 def test_view_commands_are_exact_and_do_not_enter_the_transcript(tmp_path: Path) -> None:
