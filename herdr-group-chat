@@ -1124,6 +1124,12 @@ def inbox_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     return kept
 
 
+def inbox_rendered_lines(messages: Sequence[dict[str, Any]], width: int) -> list[str]:
+    if not messages:
+        return ["Inbox is clear. Final replies and items needing attention appear here."]
+    return message_lines(messages, width)
+
+
 def handle_view_command(text: str) -> tuple[str, str] | None:
     """Handle the exact /inbox and /room view switches; anything else is None."""
     stripped = text.strip()
@@ -1346,13 +1352,13 @@ def draw_tui(
     screen.erase()
     height, width = screen.getmaxyx()
     mentions = " ".join(f"@{name}" for name in participants)
-    title = title if view == "room" else f"{title} — inbox (/room returns)"
+    title = title if view == "room" else f"{title} | inbox (/room returns)"
     header = f" {title}: {room} | {mentions} @all | Ctrl-Q exits "
     try:
         screen.addnstr(0, 0, header, width - 1, curses.A_REVERSE)
         available = max(1, height - 4)
         if view == "inbox":
-            all_lines = message_lines(inbox_messages(transcript.read()), width - 2)
+            all_lines = inbox_rendered_lines(inbox_messages(transcript.read()), width - 2)
         else:
             all_lines = transcript.rendered_lines(width - 2)
         lines, max_scroll = visible_wrapped_lines(all_lines, available, scroll_offset)
