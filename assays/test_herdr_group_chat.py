@@ -38,6 +38,8 @@ parse_route = namespace["parse_route"]
 resolve_state_dir = namespace["resolve_state_dir"]
 participant_status = namespace["participant_status"]
 handle_local_command = namespace["handle_local_command"]
+handle_view_command = namespace["handle_view_command"]
+inbox_messages = namespace["inbox_messages"]
 visible_message_lines = namespace["visible_message_lines"]
 
 
@@ -124,6 +126,44 @@ def test_local_navigation_commands_focus_agents_without_entering_transcript(tmp_
     assert handle_local_command("/show nobody", chat) == "Unknown participant: nobody"
     assert handle_local_command("ordinary message", chat) is None
     assert client.focused == ["codex-peer", "workspace:w-agents"]
+    assert transcript.read() == []
+
+
+def test_inbox_keeps_final_deliverables_and_attention_without_review_drafts() -> None:
+    messages = [
+        {"seq": 1, "sender": "human", "kind": "message", "body": "question"},
+        {"seq": 2, "sender": "pi", "kind": "message", "body": "ordinary reply"},
+        {"seq": 3, "sender": "claude", "kind": "review_response", "body": "draft"},
+        {"seq": 4, "sender": "pi", "kind": "review_synthesis", "body": "decision"},
+        {
+            "seq": 5,
+            "sender": "system",
+            "kind": "review_status",
+            "body": "@grok review blocked: login required",
+        },
+        {
+            "seq": 6,
+            "sender": "system",
+            "kind": "review_status",
+            "body": "@codex review done",
+        },
+        {"seq": 7, "sender": "system", "kind": "message", "body": "setup: pi failed"},
+        {"seq": 8, "sender": "human", "kind": "review_question", "body": "review this"},
+    ]
+
+    assert [item["seq"] for item in inbox_messages(messages)] == [2, 4, 5, 7]
+
+
+def test_view_commands_are_exact_and_do_not_enter_the_transcript(tmp_path: Path) -> None:
+    _, _, transcript = make_chat(tmp_path)
+
+    assert handle_view_command("/inbox") == (
+        "inbox",
+        "Inbox shows final replies, syntheses, and attention items. Use /room to return.",
+    )
+    assert handle_view_command("/room") == ("room", "Showing the full room transcript.")
+    assert handle_view_command("/inbox later") is None
+    assert handle_view_command("ordinary message") is None
     assert transcript.read() == []
 
 
