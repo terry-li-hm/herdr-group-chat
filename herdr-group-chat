@@ -1099,6 +1099,44 @@ def message_lines(messages: Sequence[dict[str, Any]], width: int) -> list[str]:
     return lines
 
 
+def inbox_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project the transcript onto a presentation-only inbox.
+
+    Keeps final agent replies, review syntheses, system notices, and only those
+    review statuses that demand attention. Drops human turns, review questions,
+    independent review drafts, and quiet review statuses.
+    """
+    attention_markers = ("blocked", "failed", "timed out", "cancelled")
+    kept: list[dict[str, Any]] = []
+    for item in messages:
+        sender = item.get("sender")
+        kind = item.get("kind")
+        if sender == "human":
+            continue
+        if kind == "review_synthesis":
+            kept.append(item)
+        elif kind == "review_status":
+            body = str(item.get("body", "")).lower()
+            if any(marker in body for marker in attention_markers):
+                kept.append(item)
+        elif kind == "message":
+            kept.append(item)
+    return kept
+
+
+def handle_view_command(text: str) -> tuple[str, str] | None:
+    """Handle the exact /inbox and /room view switches; anything else is None."""
+    stripped = text.strip()
+    if stripped == "/inbox":
+        return (
+            "inbox",
+            "Inbox shows final replies, syntheses, and attention items. Use /room to return.",
+        )
+    if stripped == "/room":
+        return "room", "Showing the full room transcript."
+    return None
+
+
 def visible_message_lines(
     messages: Sequence[dict[str, Any]],
     width: int,
@@ -1265,7 +1303,7 @@ def handle_local_command(
     if stripped == "/help":
         return (
             "Commands: /review [@agents] QUESTION · /retry <agent|synthesis> · "
-            "/cancel · /agents · /show <agent> · PgUp/PgDn"
+            "/cancel · /agents · /show <agent> · /inbox · /room · PgUp/PgDn"
         )
     if stripped == "/review" or stripped.startswith("/review "):
         if reviews is None:
@@ -1303,17 +1341,21 @@ def draw_tui(
     participants: Sequence[str],
     scroll_offset: int = 0,
     title: str = "Herdr group chat",
+    view: str = "room",
 ) -> int:
     screen.erase()
     height, width = screen.getmaxyx()
     mentions = " ".join(f"@{name}" for name in participants)
+    title = title if view == "room" else f"{title} — inbox (/room returns)"
     header = f" {title}: {room} | {mentions} @all | Ctrl-Q exits "
     try:
         screen.addnstr(0, 0, header, width - 1, curses.A_REVERSE)
         available = max(1, height - 4)
-        lines, max_scroll = visible_wrapped_lines(
-            transcript.rendered_lines(width - 2), available, scroll_offset
-        )
+        if view == "inbox":
+            all_lines = message_lines(inbox_messages(transcript.read()), width - 2)
+        else:
+            all_lines = transcript.rendered_lines(width - 2)
+        lines, max_scroll = visible_wrapped_lines(all_lines, available, scroll_offset)
         for row, line in enumerate(lines, start=1):
             screen.addnstr(row, 1, line, width - 2)
         screen.addnstr(height - 3, 0, status, width - 1, curses.A_DIM)
@@ -1334,6 +1376,7 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
     scroll_offset = 0
     participants = tuple(chat.agents)
     reviews = ReviewController(chat)
+    view = "room"
     status = participant_status(chat, "Ready.")
     status_override = False
     while True:
@@ -1347,6 +1390,7 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
             participants,
             scroll_offset,
             title=f"{chat.host_label} group chat",
+            view=view,
         )
         try:
             key = screen.get_wch()
@@ -1371,6 +1415,13 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
                 continue
             reviews.clear_notice()
             status_override = False
+            view_result = handle_view_command(buffer)
+            if view_result is not None:
+                view, status = view_result
+                status_override = not reviews.is_active()
+                scroll_offset = 0
+                buffer = ""
+                continue
             try:
                 command_status = handle_local_command(buffer, chat, reviews)
             except ChatError as error:
@@ -1395,6 +1446,7 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
                 status,
                 participants,
                 title=f"{chat.host_label} group chat",
+                view=view,
             )
             try:
                 chat.dispatch(buffer)

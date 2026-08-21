@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Add `/inbox` and `/room` view switches: a presentation-only inbox projection
+  of final replies, syntheses, system notices, and attention-bearing review
+  statuses over the unchanged full-room transcript.
+
 ## [0.3.0] - 2026-08-16
 
 - Add a two-phase `/review` flow: independent reviewers run concurrently, then

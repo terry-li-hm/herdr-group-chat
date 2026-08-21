@@ -55,6 +55,13 @@ timed-out, or cancelled first pass can be retried without rerunning the other
 reviewers; a successful retry triggers a fresh synthesis. Use Page Up and Page
 Down to scroll the transcript while work continues.
 
+`/inbox` switches the transcript to a presentation-only inbox of final agent
+replies, review syntheses, system notices, and review statuses that need
+attention (blocked, failed, timed out, cancelled); `/room` returns to the full
+transcript. Both are pure view switches: nothing is dispatched, recorded, or
+kept as unread state, and the room remains the single live discussion and
+independent-review surface.
+
 A verified four-agent round looks like:
 
 ```text
