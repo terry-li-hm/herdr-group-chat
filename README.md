@@ -164,12 +164,36 @@ recovers only the token-bound reply from the active local Grok session history.
 The review protocol and remaining v0.3 boundaries are specified in
 [docs/v0.3-review.md](docs/v0.3-review.md).
 
+## Sol + Fable profile
+
+`New Sol + Fable chat` (or `./new-room --launch --profile sol-fable`) opens a
+bounded two-role room: `@sol` runs Pi as `sol-peer` with the native arguments
+`--provider openai-codex --model gpt-5.6-sol --thinking high`, and `@fable`
+runs Claude Code as `fable-peer` with `--model fable --effort high` and no
+fallback. Before either participant becomes routable, the launcher verifies
+native host evidence: Sol requires an exact `openai-codex  gpt-5.6-sol` row
+from `pi --list-models gpt-5.6-sol` plus the model and high-thinking tokens in
+the native pane; Fable requires `Fable 5` and `high effort` in its native
+pane. Reads retry briefly because startup UIs render asynchronously, and both the
+catalog row and the pane evidence are matched as exact tokens and bounded
+sequences, so lookalikes such as `gpt-5.6-sol-01` or `Fable 5-deluxe` never
+verify. A `sol-fable` room is atomic: if any required role fails, the launch
+or reopen fails closed and no room opens. A mismatching existing session is
+left open and excluded; a newly created tab that fails verification is closed
+and never routed. The room records one non-secret `native-ui verified` system
+receipt per profile in the transcript, generated only after complete
+verification and deduplicated across reopens by its exact structured payload;
+this describes what the launcher saw in the native UIs, not a cryptographic or
+model-service attestation. Sol synthesizes reviews by default, and the default
+four-agent room is unchanged.
+
 ## Limitations
 
 - Ordinary group turns remain serial; only `/review` first passes are parallel.
 - Every addressed agent must already be live in Herdr.
-- New-room setup starts all four default participants; participant selection is
-  not yet configurable.
+- New-room setup starts all four default participants, or the two bounded
+  `sol-fable` profile participants; no other participant selection is
+  configurable.
 - Retry state is kept in the running room process and does not survive a room
   restart. The transcript itself remains durable.
 - Cancellation sends Ctrl-C to the exact active Herdr agent tab, and only when

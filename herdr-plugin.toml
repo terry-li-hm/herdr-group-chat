@@ -12,6 +12,12 @@ contexts = ["workspace", "tab", "pane"]
 command = ["./new-room", "--launch"]
 
 [[actions]]
+id = "new-sol-fable"
+title = "New Sol + Fable chat"
+contexts = ["workspace", "tab", "pane"]
+command = ["./new-room", "--launch", "--profile", "sol-fable"]
+
+[[actions]]
 id = "open"
 title = "Open group chat"
 contexts = ["workspace", "tab", "pane"]

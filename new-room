@@ -14,6 +14,7 @@ import sys
 import time
 import uuid
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from fcntl import LOCK_EX, LOCK_UN, flock
 from hashlib import sha256
@@ -21,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Iterator, Mapping, Sequence
 
 PARTICIPANTS = (
     ("pi", "pi-peer"),
@@ -32,10 +33,79 @@ PARTICIPANTS = (
 LAUNCHER_STATE_PREFIX = "launcher-state-"
 LAUNCHER_STATE_VERSION = 1
 ROOM_ENV = "HERDR_GROUP_CHAT_ROOM"
+PROFILE_ENV = "HERDR_GROUP_CHAT_PROFILE"
 AGENTS_WORKSPACE_ENV = "HERDR_GROUP_CHAT_AGENTS_WORKSPACE_ID"
 AGENT_CWD_ENV = "HERDR_GROUP_CHAT_AGENT_CWD"
 ROOM_OPERATION_ENV = "HERDR_GROUP_CHAT_OPERATION_ID"
 SETUP_FAILURES_ENV = "HERDR_GROUP_CHAT_SETUP_FAILURES"
+PROFILE_RECEIPT_ENV = "HERDR_GROUP_CHAT_PROFILE_RECEIPT"
+
+# A pane proof is a sequence of token alternatives: every element must match
+# consecutive whitespace-separated tokens exactly (case-insensitive, edge
+# punctuation stripped), so suffixed or prefixed lookalikes never match.
+PANE_BULLETS = ("•", "·")
+SOL_PANE_PROOF = (("gpt-5.6-sol",), PANE_BULLETS, ("high",))
+FABLE_PANE_PROOFS = (("fable",), ("5",)), (("high",), ("effort",))
+
+
+@dataclass(frozen=True)
+class Participant:
+    """One bounded room participant: role, Herdr agent name, and native launch argv."""
+
+    role: str
+    kind: str
+    name: str
+    start_args: tuple[str, ...] = ()
+    pane_proofs: tuple[tuple[tuple[str, ...], ...], ...] = ()
+    catalog_command: tuple[str, ...] = ()
+    provider: str | None = None
+    model: str = ""
+    effort: str = ""
+
+
+# The single profile definition: participants, native launch argv, and the
+# canonical matched evidence the receipt carries. No other source exists.
+PROFILE_PARTICIPANTS: dict[str, tuple[Participant, ...]] = {
+    "sol-fable": (
+        Participant(
+            role="sol",
+            kind="pi",
+            name="sol-peer",
+            start_args=(
+                "--provider",
+                "openai-codex",
+                "--model",
+                "gpt-5.6-sol",
+                "--thinking",
+                "high",
+            ),
+            pane_proofs=(SOL_PANE_PROOF,),
+            catalog_command=("pi", "--list-models", "gpt-5.6-sol"),
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+            effort="high",
+        ),
+        Participant(
+            role="fable",
+            kind="claude",
+            name="fable-peer",
+            start_args=("--model", "fable", "--effort", "high"),
+            pane_proofs=FABLE_PANE_PROOFS,
+            model="fable",
+            effort="high",
+        ),
+    )
+}
+
+
+def resolve_profile(profile: str | None) -> tuple[Participant, ...]:
+    """Resolve a profile name to its exact participants; unknown names fail closed."""
+    if profile is None or profile == "":
+        return tuple(Participant(role=kind, kind=kind, name=name) for kind, name in PARTICIPANTS)
+    participants = PROFILE_PARTICIPANTS.get(profile)
+    if participants is None:
+        raise BootstrapError(f"unknown profile: {profile}", code="unknown_profile")
+    return participants
 
 
 class BootstrapError(RuntimeError):
@@ -135,6 +205,8 @@ def load_state_file(path: Path) -> dict[str, Any]:
         "pending_agents_workspace_label",
         "pending_room_id",
         "pending_room_operation_id",
+        "pending_room_profile",
+        "selected_profile",
         "agents_cwd",
     )
     if any(field in state and not isinstance(state[field], str) for field in string_fields):
@@ -358,15 +430,123 @@ def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> Non
 AGENT_START_BUSY_ATTEMPTS = 5
 AGENT_START_BUSY_INTERVAL_S = 2.0
 
+VERIFY_PANE_ATTEMPTS = 15
+VERIFY_PANE_INTERVAL_S = 1.0
+_TOKEN_EDGE = "".join((":;,.!()", "[]<>", "\"'"))
 
-def start_agent(herdr_bin: str, name: str, kind: str, pane_id: str) -> None:
+
+def pane_tokens(text: str) -> list[str]:
+    """Case-folded whitespace tokens with edge punctuation stripped; internal
+    punctuation stays, so `gpt-5.6-sol-01` remains a different token."""
+    return [token.strip(_TOKEN_EDGE).lower() for token in text.split()]
+
+
+def sequence_present(tokens: Sequence[str], sequence: tuple[tuple[str, ...], ...]) -> bool:
+    """Bounded sequence match: every element matches consecutive tokens exactly."""
+    for start in range(len(tokens) - len(sequence) + 1):
+        if all(
+            tokens[start + offset] in alternatives for offset, alternatives in enumerate(sequence)
+        ):
+            return True
+    return False
+
+
+def native_catalog_row_present(command: Sequence[str], provider: str, model: str) -> bool:
+    """A row matches only when tokens[0] is the provider and tokens[1] the model."""
+    try:
+        result = subprocess.run(
+            list(command), capture_output=True, text=True, errors="replace", timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.splitlines():
+        tokens = line.split()
+        if len(tokens) >= 2 and tokens[0] == provider and tokens[1] == model:
+            return True
+    return False
+
+
+def native_pane_proves(
+    herdr_bin: str, pane_id: str, proofs: Sequence[tuple[tuple[str, ...], ...]]
+) -> bool:
+    """Bounded retries for native-pane token evidence; startup UIs render asynchronously."""
+    for attempt in range(VERIFY_PANE_ATTEMPTS):
+        text = run_text(
+            herdr_bin, ["pane", "read", pane_id, "--source", "visible", "--lines", "80"]
+        )
+        tokens = pane_tokens(text)
+        if all(sequence_present(tokens, proof) for proof in proofs):
+            return True
+        if attempt + 1 < VERIFY_PANE_ATTEMPTS:
+            time.sleep(VERIFY_PANE_INTERVAL_S)
+    return False
+
+
+def catalog_proof(participant: Participant) -> bool:
+    """Catalog preflight; must pass before any participant tab is created or started."""
+    return not participant.catalog_command or (
+        participant.provider is not None
+        and native_catalog_row_present(
+            participant.catalog_command, participant.provider, participant.model
+        )
+    )
+
+
+def pane_proof(herdr_bin: str, participant: Participant, pane_id: str) -> bool:
+    return not participant.pane_proofs or native_pane_proves(
+        herdr_bin, pane_id, participant.pane_proofs
+    )
+
+
+def needs_native_proof(participant: Participant) -> bool:
+    return bool(participant.catalog_command or participant.pane_proofs)
+
+
+def profile_receipt_payload(profile: str, participants: Sequence[Participant]) -> dict[str, Any]:
+    """Deterministic receipt payload carrying the profile's canonical evidence."""
+
+    def entry(participant: Participant) -> dict[str, str]:
+        verified = {
+            "role": participant.role,
+            "target": participant.name,
+            "harness": participant.kind,
+            "model": participant.model,
+            "effort": participant.effort,
+            "verification": "native-ui verified",
+        }
+        if participant.provider:
+            verified["provider"] = participant.provider
+        return verified
+
+    return {
+        "profile": profile,
+        "verified": sorted((entry(p) for p in participants), key=lambda e: e["role"]),
+    }
+
+
+def profile_room_exec(profile: str, participants: Sequence[Participant]) -> tuple[list[str], str]:
+    """Room argv and receipt payload shared by fresh launch and reopen."""
+    arguments = ["--profile", profile]
+    for participant in participants:
+        arguments.extend(["--agent", f"{participant.role}={participant.name}"])
+    arguments.extend(["--synthesizer", participants[0].role])
+    receipt = json.dumps(
+        profile_receipt_payload(profile, participants), sort_keys=True, separators=(",", ":")
+    )
+    return arguments, receipt
+
+
+def start_agent(
+    herdr_bin: str, name: str, kind: str, pane_id: str, start_args: Sequence[str] = ()
+) -> None:
     """Start an agent, retrying herdr's transient agent_pane_busy refusal.
 
-    Herdr can keep reporting a freshly created pane as busy for a short window
-    after its shell is up, especially right after previous tabs were closed;
-    agent_pane_busy means the start was refused, so retrying it is safe. Any
-    other error code is raised immediately.
+    Native agent arguments are accepted only after a literal `--` pass-through
+    separator, added exactly once and only when native arguments exist.
     """
+    native_arguments = ["--", *start_args] if start_args else []
     for attempt in range(AGENT_START_BUSY_ATTEMPTS):
         try:
             run_json(
@@ -381,6 +561,7 @@ def start_agent(herdr_bin: str, name: str, kind: str, pane_id: str) -> None:
                     pane_id,
                     "--timeout",
                     "120000",
+                    *native_arguments,
                 ],
                 timeout=None,
             )
@@ -553,6 +734,7 @@ def reconcile_pending_room(state: dict[str, Any]) -> None:
         )
     state.pop("pending_room_id", None)
     state.pop("pending_room_operation_id", None)
+    state.pop("pending_room_profile", None)
     state.pop("pending_room_started_unix_ms", None)
 
 
@@ -585,10 +767,15 @@ def register_room_pane(
     )
     state.pop("pending_room_id", None)
     state.pop("pending_room_operation_id", None)
+    state.pop("pending_room_profile", None)
     state.pop("pending_room_started_unix_ms", None)
 
 
-def launch_room(open_existing: bool) -> int:
+def launch_room(open_existing: bool, profile: str | None = None) -> int:
+    if profile and open_existing:
+        # Opening the retained room never selects a profile; the stored binding wins.
+        raise BootstrapError("--profile only applies to a new room launch")
+    resolve_profile(profile)  # unknown profiles fail before opening tabs
     herdr_bin = os.environ.get("HERDR_BIN_PATH", "herdr")
     context = plugin_context()
     cwd = str(context.get("focused_pane_cwd") or context.get("workspace_cwd") or Path.cwd())
@@ -660,12 +847,16 @@ def launch_room(open_existing: bool) -> int:
             "--env",
             f"{ROOM_OPERATION_ENV}={operation_id}",
         ]
+        if profile:
+            pane_arguments.extend(["--env", f"{PROFILE_ENV}={profile}"])
         agents_workspace_id = state.get("agents_workspace_id")
         if agents_workspace_id and agents_workspace_id in workspace_ids(herdr_bin):
             pane_arguments.extend(["--env", f"{AGENTS_WORKSPACE_ENV}={agents_workspace_id}"])
         pane_arguments.append("--focus")
         state["pending_room_id"] = room
         state["pending_room_operation_id"] = operation_id
+        if profile:
+            state["pending_room_profile"] = profile
         state["pending_room_started_unix_ms"] = int(time.time() * 1000)
         save_launcher_state(state_dir, state, state_path)
         try:
@@ -675,6 +866,7 @@ def launch_room(open_existing: bool) -> int:
             if error.code not in INDETERMINATE_OPEN_CODES:
                 state.pop("pending_room_id", None)
                 state.pop("pending_room_operation_id", None)
+                state.pop("pending_room_profile", None)
                 state.pop("pending_room_started_unix_ms", None)
                 save_launcher_state(state_dir, state, state_path)
             raise
@@ -712,7 +904,11 @@ def same_cwd(left: str, right: str) -> bool:
 
 def infer_owned_agents_cwd(herdr_bin: str, agents_workspace_id: str, requested_cwd: str) -> str:
     listed = run_json(herdr_bin, ["agent", "list"])
-    expected_names = {name for _, name in PARTICIPANTS}
+    expected_names = {name for _, name in PARTICIPANTS} | {
+        participant.name
+        for participants in PROFILE_PARTICIPANTS.values()
+        for participant in participants
+    }
     owned_cwds = {
         str(item.get("cwd") or item.get("foreground_cwd"))
         for item in listed.get("result", {}).get("agents", [])
@@ -773,7 +969,15 @@ def start_participants(
     state_dir: Path,
     state_path: Path,
     state: dict[str, Any],
-) -> list[str]:
+    participants: Sequence[Participant] | None = None,
+) -> tuple[list[str], list[Participant]]:
+    """Start (or re-verify) the requested participants, returning setup failures.
+
+    Only participants whose native host evidence verified become routable; an
+    existing mismatched session is excluded without being closed.
+    """
+    if participants is None:
+        participants = resolve_profile(None)
     listed = run_json(herdr_bin, ["agent", "list"])
     agents = listed.get("result", {}).get("agents", [])
     live_agents = {
@@ -784,11 +988,13 @@ def start_participants(
     participant_panes = state.setdefault("participant_pane_ids", {})
     participant_tabs = state.setdefault("participant_tab_ids", {})
     pending_tabs = state.setdefault("pending_participant_tabs", {})
-    for kind, name in PARTICIPANTS:
+    for participant in participants:
+        role = participant.role
+        name = participant.name
         live_agent = live_agents.get(name)
         if live_agent is not None:
             live_cwd = str(live_agent.get("cwd") or live_agent.get("foreground_cwd") or "")
-            recorded_pane_id = participant_panes.get(kind)
+            recorded_pane_id = participant_panes.get(role)
             if (
                 str(live_agent.get("workspace_id")) != agents_workspace_id
                 or not live_cwd
@@ -796,65 +1002,80 @@ def start_participants(
                 or recorded_pane_id != str(live_agent.get("pane_id"))
             ):
                 failures.append(
-                    f"@{kind}: {name} is already in use outside this plugin-owned project"
+                    f"@{role}: {name} is already in use outside this plugin-owned project"
                 )
-                print(f"failed @{kind}", flush=True)
+                print(f"failed @{role}", flush=True)
                 continue
-            participant_panes[kind] = str(live_agent["pane_id"])
-            participant_tabs[kind] = str(live_agent["tab_id"])
-            pending = pending_tabs.get(kind)
+            if needs_native_proof(participant) and not (
+                catalog_proof(participant)
+                and pane_proof(herdr_bin, participant, str(live_agent["pane_id"]))
+            ):
+                failures.append(
+                    f"@{role}: {name} failed native-ui verification; the session was left open"
+                )
+                print(f"unverified @{role}", flush=True)
+                continue
+            participant_panes[role] = str(live_agent["pane_id"])
+            participant_tabs[role] = str(live_agent["tab_id"])
+            pending = pending_tabs.get(role)
             if pending and pending.get("tab_id") != live_agent.get("tab_id"):
                 try:
                     close_pending_participant_tab(
                         herdr_bin, agents_workspace_id, pending, state_dir, state_path
                     )
                 except BootstrapError as error:
-                    failures.append(f"@{kind}: pending-tab cleanup failed: {error}")
-                    print(f"cleanup @{kind} pending", flush=True)
+                    failures.append(f"@{role}: pending-tab cleanup failed: {error}")
+                    print(f"cleanup @{role} pending", flush=True)
                     save_launcher_state(state_dir, state, state_path)
                     continue
-            pending_tabs.pop(kind, None)
+            pending_tabs.pop(role, None)
             save_launcher_state(state_dir, state, state_path)
-            print(f"ready  @{kind} (existing {name})", flush=True)
+            print(f"ready  @{role} (existing {name})", flush=True)
             continue
-        print(f"start  @{kind}", flush=True)
-        recorded_pane_id = participant_panes.get(kind)
+        print(f"start  @{role}", flush=True)
+        recorded_pane_id = participant_panes.get(role)
         if recorded_pane_id:
             try:
                 close_recorded_participant(
                     herdr_bin,
                     recorded_pane_id,
-                    participant_tabs.get(kind),
+                    participant_tabs.get(role),
                     state_dir,
                     state_path,
                 )
             except BootstrapError as error:
-                failures.append(f"@{kind}: previous-tab cleanup failed: {error}")
-                print(f"cleanup @{kind} previous", flush=True)
+                failures.append(f"@{role}: previous-tab cleanup failed: {error}")
+                print(f"cleanup @{role} previous", flush=True)
                 continue
-            participant_panes.pop(kind, None)
-            participant_tabs.pop(kind, None)
+            participant_panes.pop(role, None)
+            participant_tabs.pop(role, None)
             save_launcher_state(state_dir, state, state_path)
-        pending = pending_tabs.get(kind)
+        pending = pending_tabs.get(role)
         if pending:
             age_ms = int(time.time() * 1000) - int(pending.get("started_unix_ms", 0))
             if age_ms < PENDING_ROOM_GRACE_MS:
-                failures.append(f"@{kind}: previous agent start is still pending")
-                print(f"pending @{kind}", flush=True)
+                failures.append(f"@{role}: previous agent start is still pending")
+                print(f"pending @{role}", flush=True)
                 continue
             try:
                 close_pending_participant_tab(
                     herdr_bin, agents_workspace_id, pending, state_dir, state_path
                 )
             except BootstrapError as error:
-                failures.append(f"@{kind}: pending-tab cleanup failed: {error}")
-                print(f"cleanup @{kind} pending", flush=True)
+                failures.append(f"@{role}: pending-tab cleanup failed: {error}")
+                print(f"cleanup @{role} pending", flush=True)
                 continue
-            pending_tabs.pop(kind, None)
+            pending_tabs.pop(role, None)
             save_launcher_state(state_dir, state, state_path)
         try:
-            pending_label = f"hgchat-{kind}-{uuid.uuid4().hex[:10]}"
-            pending_tabs[kind] = {
+            if not catalog_proof(participant):
+                failures.append(
+                    f"@{role}: {name} failed the native catalog preflight; no tab was created"
+                )
+                print(f"unverified @{role} (catalog)", flush=True)
+                continue
+            pending_label = f"hgchat-{role}-{uuid.uuid4().hex[:10]}"
+            pending_tabs[role] = {
                 "label": pending_label,
                 "started_unix_ms": int(time.time() * 1000),
             }
@@ -877,7 +1098,7 @@ def start_participants(
             )
             pane_id = str(created["result"]["root_pane"]["pane_id"])
             participant_tab_id = str(created["result"]["tab"]["tab_id"])
-            pending_tabs[kind] = {
+            pending_tabs[role] = {
                 "label": pending_label,
                 "pane_id": pane_id,
                 "tab_id": participant_tab_id,
@@ -886,25 +1107,42 @@ def start_participants(
             save_launcher_state(state_dir, state, state_path)
             wait_for_shell(herdr_bin, pane_id)
             assert_server_identity(state_dir, state_path)
-            start_agent(herdr_bin, name, kind, pane_id)
-            participant_panes[kind] = pane_id
-            participant_tabs[kind] = participant_tab_id
-            pending_tabs.pop(kind, None)
+            start_agent(herdr_bin, name, participant.kind, pane_id, participant.start_args)
+            if needs_native_proof(participant) and not pane_proof(herdr_bin, participant, pane_id):
+                try:
+                    close_pending_participant_tab(
+                        herdr_bin, agents_workspace_id, pending_tabs[role], state_dir, state_path
+                    )
+                except BootstrapError as cleanup_error:
+                    failures.append(f"@{role}: pending-tab cleanup failed: {cleanup_error}")
+                else:
+                    pending_tabs.pop(role, None)
+                participant_panes.pop(role, None)
+                participant_tabs.pop(role, None)
+                save_launcher_state(state_dir, state, state_path)
+                failures.append(
+                    f"@{role}: {name} failed native-ui verification; the new tab was closed"
+                )
+                print(f"unverified @{role}", flush=True)
+                continue
+            participant_panes[role] = pane_id
+            participant_tabs[role] = participant_tab_id
+            pending_tabs.pop(role, None)
             save_launcher_state(state_dir, state, state_path)
             with suppress(BootstrapError):
                 assert_server_identity(state_dir, state_path)
                 run_json(
                     herdr_bin,
-                    ["tab", "rename", participant_tab_id, f"{kind} · group-chat"],
+                    ["tab", "rename", participant_tab_id, f"{role} · group-chat"],
                 )
-            if kind == "codex":
+            if participant.kind == "codex":
                 with suppress(BootstrapError):
                     assert_server_identity(state_dir, state_path)
                     dismiss_inactive_hook_notice(herdr_bin, name, pane_id)
-            print(f"ready  @{kind}", flush=True)
+            print(f"ready  @{role}", flush=True)
         except (BootstrapError, KeyError, TypeError) as error:
             if not isinstance(error, BootstrapError) or error.code not in INDETERMINATE_OPEN_CODES:
-                pending = pending_tabs.get(kind)
+                pending = pending_tabs.get(role)
                 if pending:
                     try:
                         close_pending_participant_tab(
@@ -915,12 +1153,12 @@ def start_participants(
                             state_path,
                         )
                     except BootstrapError as cleanup_error:
-                        failures.append(f"@{kind}: pending-tab cleanup failed: {cleanup_error}")
+                        failures.append(f"@{role}: pending-tab cleanup failed: {cleanup_error}")
                     else:
-                        pending_tabs.pop(kind, None)
+                        pending_tabs.pop(role, None)
                 save_launcher_state(state_dir, state, state_path)
-            failures.append(f"@{kind}: {error}")
-            print(f"failed @{kind}", flush=True)
+            failures.append(f"@{role}: {error}")
+            print(f"failed @{role}", flush=True)
     if not participant_panes:
         state.pop("participant_pane_ids", None)
     if not participant_tabs:
@@ -933,6 +1171,8 @@ def start_participants(
 
 def main() -> int:
     herdr_bin = os.environ.get("HERDR_BIN_PATH", "herdr")
+    profile = os.environ.get(PROFILE_ENV, "").strip() or None
+    participants = resolve_profile(profile)  # unknown profiles fail before any tab opens
     workspace_id = os.environ.get("HERDR_WORKSPACE_ID", "").strip()
     tab_id = os.environ.get("HERDR_TAB_ID", "").strip()
     if not workspace_id:
@@ -950,6 +1190,14 @@ def main() -> int:
         raise BootstrapError("New group chat is missing its Herdr pane context")
     with launcher_state_lock(state_dir) as state_path:
         state = load_launcher_state(state_dir, state_path)
+        if profile is not None and (
+            state.get("pending_room_operation_id") != operation_id
+            or state.get("pending_room_profile") != profile
+        ):
+            raise BootstrapError(
+                "room profile was not tied to this launch operation; retry the action",
+                code="profile_operation_mismatch",
+            )
         register_room_pane(
             state,
             workspace_id=workspace_id,
@@ -979,7 +1227,24 @@ def main() -> int:
             state_dir,
             state_path,
             state,
+            participants=participants,
         )
+
+        if profile is not None and failures:
+            # A profile room is atomic: it never opens with zero or one role.
+            state.pop("selected_profile", None)
+            save_launcher_state(state_dir, state, state_path)
+            raise BootstrapError(
+                f"the {profile} profile requires every participant to verify "
+                "native-ui evidence; the room was not opened",
+                code="profile_incomplete",
+            )
+        if profile:
+            # Trust the profile only for this room, whose id lands in last_room_id.
+            state["selected_profile"] = profile
+        else:
+            state.pop("selected_profile", None)
+        save_launcher_state(state_dir, state, state_path)
 
         close_tracked_tab(
             herdr_bin,
@@ -1014,19 +1279,67 @@ def main() -> int:
         os.environ.pop(SETUP_FAILURES_ENV, None)
 
     executable = Path(__file__).resolve().parent / "herdr-group-chat"
+    arguments = [str(executable), "--room", room, "--agents-workspace", agents_workspace_id]
+    if profile:
+        profile_arguments, receipt = profile_room_exec(profile, participants)
+        arguments.extend(profile_arguments)
+        os.environ[PROFILE_RECEIPT_ENV] = receipt
+    else:
+        os.environ.pop(PROFILE_RECEIPT_ENV, None)
     os.execv(
         str(executable),
-        [
-            str(executable),
-            "--room",
-            room,
-            "--agents-workspace",
-            agents_workspace_id,
-        ],
+        arguments,
     )
 
 
+def reverify_profile_participants(
+    herdr_bin: str,
+    agents_workspace_id: str,
+    agents_cwd: str,
+    state: dict[str, Any],
+    participants: Sequence[Participant],
+) -> None:
+    """Re-verify each role against its exact live agent and native evidence.
+
+    Uses the same catalog/pane primitives as a fresh launch; never starts or
+    closes anything, and any mismatch stops the reopen before exec.
+    """
+    if not agents_workspace_id or not agents_cwd:
+        raise BootstrapError(
+            "room profile re-verification is missing the agents workspace or cwd",
+            code="profile_reverify_failed",
+        )
+    listed = run_json(herdr_bin, ["agent", "list"])
+    agents = listed.get("result", {}).get("agents", [])
+    live_agents = {
+        item["name"]: item for item in agents if isinstance(item, dict) and item.get("name")
+    }
+    participant_panes = state.get("participant_pane_ids", {})
+    participant_tabs = state.get("participant_tab_ids", {})
+    for participant in participants:
+        live_agent = live_agents.get(participant.name)
+        live_cwd = str((live_agent or {}).get("cwd") or "")
+        recorded_pane = participant_panes.get(participant.role)
+        if (
+            live_agent is None
+            or str(live_agent.get("kind") or live_agent.get("agent")) != participant.kind
+            or str(live_agent.get("workspace_id")) != agents_workspace_id
+            or str(live_agent.get("pane_id")) != recorded_pane
+            or str(live_agent.get("tab_id")) != participant_tabs.get(participant.role)
+            or not live_cwd
+            or not same_cwd(live_cwd, agents_cwd)
+            or not catalog_proof(participant)
+            or not pane_proof(herdr_bin, participant, recorded_pane)
+        ):
+            raise BootstrapError(
+                f"@{participant.role}: {participant.name} failed room profile re-verification; "
+                "the room was not reopened",
+                code="profile_reverify_failed",
+            )
+
+
 def room_entrypoint() -> int:
+    herdr_bin = os.environ.get("HERDR_BIN_PATH", "herdr")
     workspace_id = os.environ.get("HERDR_WORKSPACE_ID", "").strip()
     pane_id = os.environ.get("HERDR_PANE_ID", "").strip()
     tab_id = os.environ.get("HERDR_TAB_ID", "").strip()
@@ -1037,6 +1350,17 @@ def room_entrypoint() -> int:
     state_dir = plugin_state_dir()
     with launcher_state_lock(state_dir) as state_path:
         state = load_launcher_state(state_dir, state_path)
+        # The profile is trusted only for the single retained room: the stored
+        # binding is last_room_id, so a stale cross-room profile is rejected
+        # before registration could rewrite it.
+        profile = str(state.get("selected_profile") or "") or None
+        if profile is not None and state.get("last_room_id") != room:
+            raise BootstrapError(
+                "stored room profile is bound to a different room; the room was "
+                "not reopened as a profile room",
+                code="profile_room_mismatch",
+            )
+        participants = resolve_profile(profile) if profile else ()
         register_room_pane(
             state,
             workspace_id=workspace_id,
@@ -1045,9 +1369,15 @@ def room_entrypoint() -> int:
             room=room,
             operation_id=operation_id,
         )
-        clean_stale_room_panes(
-            os.environ.get("HERDR_BIN_PATH", "herdr"), state, state_dir, state_path
-        )
+        clean_stale_room_panes(herdr_bin, state, state_dir, state_path)
+        if profile:
+            reverify_profile_participants(
+                herdr_bin,
+                str(state.get("agents_workspace_id") or ""),
+                str(state.get("agents_cwd") or ""),
+                state,
+                participants,
+            )
         save_launcher_state(state_dir, state, state_path)
         agents_workspace_id = str(state.get("agents_workspace_id") or "")
     # Reopening a retained room must not replay a previous launch's setup failures.
@@ -1056,20 +1386,44 @@ def room_entrypoint() -> int:
     arguments = [str(executable), "--room", room]
     if agents_workspace_id:
         arguments.extend(["--agents-workspace", agents_workspace_id])
+    if profile:
+        profile_arguments, receipt = profile_room_exec(profile, participants)
+        arguments.extend(profile_arguments)
+        os.environ[PROFILE_RECEIPT_ENV] = receipt
+    else:
+        os.environ.pop(PROFILE_RECEIPT_ENV, None)
     os.execv(str(executable), arguments)
     return 0
 
 
+def parse_launch_arguments(arguments: list[str]) -> tuple[str, str | None]:
+    """Return (mode, profile) for the exact launcher argv; anything else fails."""
+    if not arguments:
+        return "setup", None
+    mode = arguments[0]
+    rest = arguments[1:]
+    profile: str | None = None
+    if rest[:1] == ["--profile"]:
+        if len(rest) < 2 or not rest[1]:
+            raise BootstrapError("--profile requires a profile name")
+        profile = rest[1]
+        rest = rest[2:]
+    if rest or mode not in {"--launch", "--open", "--room-entrypoint"}:
+        raise BootstrapError(f"unknown arguments: {' '.join(arguments)}")
+    if profile is not None and mode != "--launch":
+        raise BootstrapError("--profile only applies to --launch")
+    return mode, profile
+
+
 if __name__ == "__main__":
     try:
-        if sys.argv[1:] == ["--launch"]:
-            raise SystemExit(launch_room(open_existing=False))
-        if sys.argv[1:] == ["--open"]:
+        mode, profile = parse_launch_arguments(sys.argv[1:])
+        if mode == "--launch":
+            raise SystemExit(launch_room(open_existing=False, profile=profile))
+        if mode == "--open":
             raise SystemExit(launch_room(open_existing=True))
-        if sys.argv[1:] == ["--room-entrypoint"]:
+        if mode == "--room-entrypoint":
             raise SystemExit(room_entrypoint())
-        if sys.argv[1:]:
-            raise BootstrapError(f"unknown arguments: {' '.join(sys.argv[1:])}")
         raise SystemExit(main())
     except BootstrapError as error:
         print(f"new-room: {error}", file=sys.stderr)

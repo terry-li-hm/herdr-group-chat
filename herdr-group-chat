@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import quote
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
 
 DEFAULT_AGENTS = {
     "pi": "pi-peer",
@@ -35,6 +35,13 @@ DEFAULT_AGENTS = {
     "codex": "codex-peer",
     "grok": "grok-peer",
 }
+# One bounded built-in profile: its exact required roles and default synthesizer.
+# Targets and matched evidence come only from the launcher's verified receipt
+# payload; no profile-derived target fallback and no duplicated model detail.
+PROFILE_ROLES = {"sol-fable": ("sol", "fable")}
+PROFILE_SYNTHESIZER = {"sol-fable": "sol"}
+PROFILE_RECEIPT_KIND = "profile_receipt"
+PROFILE_RECEIPT_ENV = "HERDR_GROUP_CHAT_PROFILE_RECEIPT"
 DEFAULT_STATE_DIR = Path("~/.local/state/herdr-group-chat")
 ROOM_ENV = "HERDR_GROUP_CHAT_ROOM"
 AGENTS_WORKSPACE_ENV = "HERDR_GROUP_CHAT_AGENTS_WORKSPACE_ID"
@@ -207,6 +214,7 @@ class Transcript:
         kind: str = "message",
         round_id: str | None = None,
         provisional: bool = False,
+        meta: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             messages = self._read_unlocked()
@@ -222,6 +230,8 @@ class Transcript:
                 item["round_id"] = round_id
             if provisional:
                 item["provisional"] = True
+            if meta is not None:
+                item["meta"] = dict(meta)
             with self.path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
                 stream.flush()
@@ -1303,6 +1313,7 @@ class GroupChat:
 
 
 def parse_agent_overrides(values: Sequence[str]) -> dict[str, str]:
+    """Apply --agent NAME=TARGET overrides over the closed default roster."""
     agents = dict(DEFAULT_AGENTS)
     for value in values:
         if "=" not in value:
@@ -1312,6 +1323,105 @@ def parse_agent_overrides(values: Sequence[str]) -> dict[str, str]:
             raise ChatError(f"invalid agent mapping: {value}")
         agents[name] = target
     return agents
+
+
+def parse_profile_agents(values: Sequence[str], roles: Sequence[str]) -> dict[str, str]:
+    """Build a profile roster from explicit --agent mappings only.
+
+    The profile requires exactly its roles, each mapped to an explicit target;
+    there is no profile-derived target fallback and extra roles are rejected.
+    """
+    expected = tuple(roles)
+    agents: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            raise ChatError("--agent must be NAME=HERDR_TARGET")
+        name, target = value.split("=", 1)
+        if name not in expected or not target:
+            raise ChatError(f"invalid agent mapping for this profile: {value}")
+        agents[name] = target
+    if set(agents) != set(expected):
+        missing = [name for name in expected if name not in agents]
+        raise ChatError(
+            "the profile requires exactly the explicit --agent mappings "
+            f"for {', '.join(f'@{name}' for name in expected)}"
+            + (f"; missing {', '.join(f'@{name}' for name in missing)}" if missing else "")
+        )
+    return agents
+
+
+def load_profile_receipt(
+    profile: str, agents: Mapping[str, str], environ: Mapping[str, str]
+) -> dict[str, Any]:
+    """Load and validate the launcher's verified receipt payload.
+
+    The payload exists only after complete native-ui verification in new-room;
+    the room fails closed without it or when its role/target set disagrees with
+    the explicit roster. Model, provider, and effort evidence is carried from
+    the single profile definition in new-room, never re-inferred here.
+    """
+    raw = environ.get(PROFILE_RECEIPT_ENV, "").strip()
+    if not raw:
+        raise ChatError(f"the {profile} profile room has no verified receipt; refusing to open")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ChatError("the profile receipt payload is invalid") from error
+    if not isinstance(payload, dict) or payload.get("profile") != profile:
+        raise ChatError("the profile receipt payload is invalid")
+    entries = payload.get("verified")
+    if not isinstance(entries, list):
+        raise ChatError("the profile receipt payload is invalid")
+    for entry in entries:
+        required = ("role", "target", "harness", "model", "effort")
+        if not isinstance(entry, dict) or not all(
+            isinstance(entry.get(field_name), str) and entry[field_name] for field_name in required
+        ):
+            raise ChatError("the profile receipt payload is invalid")
+        if entry.get("verification") != "native-ui verified" or (
+            "provider" in entry and not entry["provider"]
+        ):
+            raise ChatError("the profile receipt payload is invalid")
+    receipt_mapping = {entry["role"]: entry["target"] for entry in entries}
+    if len(receipt_mapping) != len(entries) or receipt_mapping != dict(agents):
+        raise ChatError("the profile receipt does not match this room's agent mappings")
+    return {"profile": profile, "verified": sorted(entries, key=lambda entry: entry["role"])}
+
+
+def profile_receipt_body(payload: Mapping[str, Any]) -> str:
+    """Render the verified receipt payload as the non-secret transcript body."""
+    parts = []
+    for entry in payload["verified"]:
+        fields = [
+            f"role @{entry['role']}",
+            f"harness {entry['harness']}",
+            f"target {entry['target']}",
+            f"model {entry['model']}",
+            f"effort {entry['effort']}",
+        ]
+        if entry.get("provider"):
+            fields.insert(2, f"provider {entry['provider']}")
+        parts.append(" · ".join([*fields, "native-ui verified"]))
+    return f"{payload['profile']} room profile receipt (non-secret): " + "; ".join(parts)
+
+
+def record_profile_receipt(transcript: Transcript, payload: Mapping[str, Any]) -> None:
+    """Append the verified receipt once, deduped on its exact structured metadata.
+
+    The transcript is append-only, so reopening or restarting a profile room
+    re-passes the same deterministic payload and never duplicates the entry;
+    default rooms record nothing.
+    """
+    for item in transcript.read():
+        if item.get("kind") == PROFILE_RECEIPT_KIND and item.get("meta") == dict(payload):
+            return
+    transcript.append(
+        "system",
+        ("human", "all"),
+        profile_receipt_body(payload),
+        kind=PROFILE_RECEIPT_KIND,
+        meta=dict(payload),
+    )
 
 
 def parse_agent_timeouts(values: Sequence[str], agents: Sequence[str]) -> dict[str, int]:
@@ -1793,8 +1903,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--synthesizer",
-        default=os.environ.get("HERDR_GROUP_CHAT_SYNTHESIZER", "pi"),
+        default=None,
     )
+    parser.add_argument("--profile", choices=sorted(PROFILE_ROLES), default=None)
     parser.add_argument("--agents-workspace", default=os.environ.get(AGENTS_WORKSPACE_ENV))
     parser.add_argument("--once", metavar="MESSAGE")
     parser.add_argument("--show", action="store_true")
@@ -1809,7 +1920,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             for line in message_lines(transcript.read(), 100):
                 print(line)
             return 0
-        agents = parse_agent_overrides(args.agent)
+        if args.profile:
+            agents = parse_profile_agents(args.agent, PROFILE_ROLES[args.profile])
+            receipt = load_profile_receipt(args.profile, agents, os.environ)
+        else:
+            agents = parse_agent_overrides(args.agent)
+            receipt = None
+        synthesizer = args.synthesizer
+        if synthesizer is None:
+            synthesizer = (
+                PROFILE_SYNTHESIZER[args.profile]
+                if args.profile
+                else os.environ.get("HERDR_GROUP_CHAT_SYNTHESIZER", "pi")
+            )
         agent_timeouts = parse_agent_timeouts(args.agent_timeout, tuple(agents))
         chat = GroupChat(
             transcript,
@@ -1820,10 +1943,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             max_turns=args.max_turns,
             agents_workspace_id=args.agents_workspace,
-            synthesizer=args.synthesizer,
+            synthesizer=synthesizer,
             agent_timeouts=agent_timeouts,
         )
         record_setup_failures(transcript)
+        if receipt is not None:
+            record_profile_receipt(transcript, receipt)
         if args.once is not None:
             before = len(transcript.read())
             if args.once.strip() == "/review" or args.once.strip().startswith("/review "):

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 from collections.abc import Callable
 from importlib.machinery import SourceFileLoader
@@ -1257,3 +1258,771 @@ def test_agent_start_does_not_retry_other_error_codes(
     assert len(failures) == 1 and "pane is gone" in failures[0]
     starts = [call for call in calls if call[:2] == ["agent", "start"]]
     assert len(starts) == 1
+
+
+# --- bounded sol-fable model profile -------------------------------------------------
+
+SOL_SCREEN = "Pi\nprovider openai-codex\nmodel gpt-5.6-sol • high\n"
+FABLE_SCREEN = "Claude Code\nFable 5\nreasoning: high effort\n"
+
+
+def install_profile_host(
+    monkeypatch: pytest.MonkeyPatch,
+    calls: list[list[str]],
+    pane_screens: dict[str, str],
+    catalog_rows: dict[tuple[str, str], bool] | None = None,
+    live_agents: list[dict] | None = None,
+) -> None:
+    """Fake Herdr plus the native Pi catalog for profile participant flows."""
+    catalog_rows = catalog_rows if catalog_rows is not None else {}
+    live_agents = [] if live_agents is None else live_agents
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {"result": {"agents": live_agents}}
+        if arguments == ["workspace", "list"]:
+            return {
+                "result": {
+                    "workspaces": [{"workspace_id": "w-agents", "label": "agents · group-chat"}]
+                }
+            }
+        if arguments[:2] == ["tab", "create"]:
+            label = arguments[arguments.index("--label") + 1]
+            role = label.split("-")[1]
+            return {
+                "result": {
+                    "tab": {"tab_id": f"w-agents:t-{role}"},
+                    "root_pane": {"pane_id": f"w-agents:p-{role}"},
+                }
+            }
+        if arguments[:2] == ["pane", "process-info"]:
+            return {"result": {"process_info": {"foreground_processes": [{"name": "zsh"}]}}}
+        return {"result": {"type": "ok"}}
+
+    def fake_run_text(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
+        del timeout
+        calls.append(arguments)
+        return pane_screens.get(arguments[2], "")
+
+    def fake_catalog(command: object, provider: object, model: object) -> bool:
+        assert isinstance(command, tuple)
+        calls.append(list(command))
+        return catalog_rows.get((str(provider), str(model)), True)
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    monkeypatch.setattr(module, "run_text", fake_run_text)
+    monkeypatch.setattr(module, "native_catalog_row_present", fake_catalog)
+    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+
+
+def test_sol_fable_start_uses_exact_ordered_participants_and_native_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    install_profile_host(
+        monkeypatch,
+        calls,
+        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+    )
+    state: dict = {"schema_version": 1}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=module.resolve_profile("sol-fable"),
+    )
+
+    assert failures == []
+    starts = [call for call in calls if call[:2] == ["agent", "start"]]
+    assert starts == [
+        [
+            "agent",
+            "start",
+            "sol-peer",
+            "--kind",
+            "pi",
+            "--pane",
+            "w-agents:p-sol",
+            "--timeout",
+            "120000",
+            "--",
+            "--provider",
+            "openai-codex",
+            "--model",
+            "gpt-5.6-sol",
+            "--thinking",
+            "high",
+        ],
+        [
+            "agent",
+            "start",
+            "fable-peer",
+            "--kind",
+            "claude",
+            "--pane",
+            "w-agents:p-fable",
+            "--timeout",
+            "120000",
+            "--",
+            "--model",
+            "fable",
+            "--effort",
+            "high",
+        ],
+    ]
+    # The catalog proof precedes every Sol tab creation and agent start.
+    first_sol_tab = next(i for i, call in enumerate(calls) if call[:2] == ["tab", "create"])
+    sol_catalog = calls.index(["pi", "--list-models", "gpt-5.6-sol"])
+    assert sol_catalog < first_sol_tab
+
+
+def test_catalog_proof_is_structural_not_substring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def with_stdout(stdout: str, returncode: int = 0):
+        return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+
+    def install(stdout: str, returncode: int = 0) -> None:
+        monkeypatch.setattr(
+            module.subprocess,
+            "run",
+            lambda *_args, **_kwargs: with_stdout(stdout, returncode),
+        )
+
+    catalog = module.native_catalog_row_present
+    install("openai-codex  gpt-5.6-sol\n")
+    assert catalog(("pi",), "openai-codex", "gpt-5.6-sol")
+    install("  openai-codex  gpt-5.6-sol  extra columns\n")
+    assert catalog(("pi",), "openai-codex", "gpt-5.6-sol")
+    install("openai-codex  gpt-5.6-sol-01\n")  # suffixed model
+    assert not catalog(("pi",), "openai-codex", "gpt-5.6-sol")
+    install("xopenai-codex  gpt-5.6-sol\n")  # prefixed provider
+    assert not catalog(("pi",), "openai-codex", "gpt-5.6-sol")
+    install("openai-codex-remote  gpt-5.6-sol\n")
+    assert not catalog(("pi",), "openai-codex", "gpt-5.6-sol")
+    install("openai-codex  gpt-5.6-sol\n", returncode=1)
+    assert not catalog(("pi",), "openai-codex", "gpt-5.6-sol")
+
+
+def test_pane_proof_is_bounded_token_and_sequence_matching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def install(screen: str) -> None:
+        calls.clear()
+
+        def fake_run_text(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
+            del timeout
+            calls.append(arguments)
+            return screen
+
+        monkeypatch.setattr(module, "run_text", fake_run_text)
+
+    def proves(screen: str, proofs: object) -> bool:
+        install(screen)
+        monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+        assert isinstance(proofs, tuple)
+        return module.native_pane_proves("herdr", "w-agents:p-x", proofs)
+
+    sol = (module.SOL_PANE_PROOF,)
+    fable = module.FABLE_PANE_PROOFS
+    assert proves("model gpt-5.6-sol • high\n", sol)
+    assert proves("model: gpt-5.6-sol · high (local)\n", sol)
+    assert not proves("model gpt-5.6-sol-01 • high\n", sol)  # suffixed model identifier
+    assert not proves("model gpt-5.6-sol • highest\n", sol)  # suffixed effort token
+    assert not proves("provider gpt-5.6-sol openai-codex • high\n", sol)
+    assert proves("Claude Code\nFable 5\nreasoning: high effort\n", fable)
+    assert not proves("Claude Code\nFable 5-deluxe\nhigh effort\n", fable)
+    assert not proves("Claude Code\nFable 5\nreasoning: effortful\n", fable)
+    assert not proves("Claude Code\nPrefable 5\nhigh effort\n", fable)
+    # Retries stay bounded when evidence never renders.
+    assert not proves("", sol)
+    assert len(calls) == module.VERIFY_PANE_ATTEMPTS
+
+
+def test_pane_proof_retries_because_startup_uis_render_asynchronously(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    screens = ["", FABLE_SCREEN]  # evidence appears on the second read
+
+    def fake_run_text(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
+        del timeout
+        calls.append(arguments)
+        return screens.pop(0) if screens else FABLE_SCREEN
+
+    monkeypatch.setattr(module, "run_text", fake_run_text)
+    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+
+    assert module.native_pane_proves("herdr", "w-agents:p-fable", module.FABLE_PANE_PROOFS)
+    assert len(calls) == 2
+
+
+def test_failed_catalog_preflight_creates_and_starts_no_sol_tab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    install_profile_host(
+        monkeypatch,
+        calls,
+        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        catalog_rows={("openai-codex", "gpt-5.6-sol"): False},
+    )
+    state: dict = {"schema_version": 1}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=module.resolve_profile("sol-fable"),
+    )
+
+    assert any("catalog preflight" in failure and "@sol" in failure for failure in failures)
+    sol_calls = [call for call in calls if "sol" in " ".join(call)]
+    assert not any(call[:2] in (["tab", "create"], ["agent", "start"]) for call in sol_calls)
+    # Fable still started: the preflight is per-role and precedes only Sol's tab.
+    assert any(call[:2] == ["agent", "start"] and call[2] == "fable-peer" for call in calls)
+
+
+def test_new_tab_failing_pane_verification_is_closed_and_not_routable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    install_profile_host(monkeypatch, calls, {"w-agents:p-fable": "Claude Code\n"})
+    state: dict = {"schema_version": 1}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=(module.PROFILE_PARTICIPANTS["sol-fable"][1],),
+    )
+
+    assert len(failures) == 1 and "the new tab was closed" in failures[0]
+    assert ["tab", "close", "w-agents:t-fable"] in calls
+    assert "fable" not in state.get("participant_pane_ids", {})
+    assert "fable" not in state.get("participant_tab_ids", {})
+    assert "fable" not in state.get("pending_participant_tabs", {})
+
+
+def test_agent_start_passes_native_arguments_behind_exactly_one_separator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+
+    sol, fable = module.resolve_profile("sol-fable")
+    module.start_agent("herdr", "sol-peer", sol.kind, "w-agents:p-sol", sol.start_args)
+    module.start_agent("herdr", "fable-peer", fable.kind, "w-agents:p-fable", fable.start_args)
+    # A default participant with no native arguments adds no separator.
+    module.start_agent("herdr", "pi-peer", "pi", "w-agents:p-pi")
+
+    starts = [call for call in calls if call[:2] == ["agent", "start"]]
+    assert starts == [
+        [
+            "agent",
+            "start",
+            "sol-peer",
+            "--kind",
+            "pi",
+            "--pane",
+            "w-agents:p-sol",
+            "--timeout",
+            "120000",
+            "--",
+            "--provider",
+            "openai-codex",
+            "--model",
+            "gpt-5.6-sol",
+            "--thinking",
+            "high",
+        ],
+        [
+            "agent",
+            "start",
+            "fable-peer",
+            "--kind",
+            "claude",
+            "--pane",
+            "w-agents:p-fable",
+            "--timeout",
+            "120000",
+            "--",
+            "--model",
+            "fable",
+            "--effort",
+            "high",
+        ],
+        [
+            "agent",
+            "start",
+            "pi-peer",
+            "--kind",
+            "pi",
+            "--pane",
+            "w-agents:p-pi",
+            "--timeout",
+            "120000",
+        ],
+    ]
+
+
+def test_default_participants_stay_unverified_and_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "PARTICIPANTS", (("pi", "pi-peer"),))
+
+    def unexpected_text(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("default participants must not read native panes")
+
+    def unexpected_catalog(*_args: object, **_kwargs: object) -> bool:
+        raise AssertionError("default participants must not query native catalogs")
+
+    monkeypatch.setattr(module, "run_text", unexpected_text)
+    monkeypatch.setattr(module, "native_catalog_row_present", unexpected_catalog)
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {
+                "result": {
+                    "agents": [
+                        {
+                            "name": "pi-peer",
+                            "workspace_id": "w-agents",
+                            "cwd": str(tmp_path),
+                            "pane_id": "w-agents:p1",
+                            "tab_id": "w-agents:t1",
+                        }
+                    ]
+                }
+            }
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {
+        "schema_version": 1,
+        "participant_pane_ids": {"pi": "w-agents:p1"},
+        "participant_tab_ids": {"pi": "w-agents:t1"},
+    }
+
+    failures = module.start_participants(
+        "herdr", str(tmp_path), "w-agents", tmp_path, launcher_state_path(tmp_path), state
+    )
+
+    assert failures == []
+
+
+def profile_launch_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, captured: dict[str, object]
+) -> None:
+    """The default launch_env context, plus profile env hygiene and capture."""
+    launch_env(tmp_path, monkeypatch, captured)
+    monkeypatch.delenv(module.PROFILE_ENV, raising=False)
+    monkeypatch.delenv(module.PROFILE_RECEIPT_ENV, raising=False)
+
+
+def install_launch_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pane_screens: dict[str, str],
+    catalog_rows: dict[tuple[str, str], bool] | None = None,
+) -> list[list[str]]:
+    """Wire a fake Herdr for main() with a pre-existing agents workspace/agents."""
+    calls: list[list[str]] = []
+    live = [
+        {
+            "name": "sol-peer",
+            "kind": "pi",
+            "workspace_id": "w-agents",
+            "cwd": str(tmp_path),
+            "pane_id": "w-agents:p-sol",
+            "tab_id": "w-agents:t-sol",
+        },
+        {
+            "name": "fable-peer",
+            "kind": "claude",
+            "workspace_id": "w-agents",
+            "cwd": str(tmp_path),
+            "pane_id": "w-agents:p-fable",
+            "tab_id": "w-agents:t-fable",
+        },
+    ]
+    install_profile_host(
+        monkeypatch, calls, pane_screens, catalog_rows=catalog_rows, live_agents=live
+    )
+    return calls
+
+
+def profile_room_state(tmp_path: Path, room: str = "chat-profile") -> dict:
+    return {
+        "schema_version": 1,
+        "agents_workspace_id": "w-agents",
+        "agents_cwd": str(tmp_path),
+        "participant_pane_ids": {"sol": "w-agents:p-sol", "fable": "w-agents:p-fable"},
+        "participant_tab_ids": {"sol": "w-agents:t-sol", "fable": "w-agents:t-fable"},
+        "pending_room_id": room,
+        "pending_room_operation_id": "operation-test",
+        "pending_room_profile": "sol-fable",
+        "pending_room_started_unix_ms": int(module.time.time() * 1000),
+    }
+
+
+def test_main_execs_profile_room_only_after_complete_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    profile_launch_env(tmp_path, monkeypatch, captured)
+    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable")
+    monkeypatch.setenv(module.ROOM_ENV, "chat-profile")
+    calls = install_launch_host(
+        tmp_path, monkeypatch, {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+    )
+    save_launcher_state(tmp_path, profile_room_state(tmp_path))
+
+    module.main()
+
+    # The verified existing sessions are reused and re-verified, not restarted.
+    assert not any(call[:2] in (["tab", "create"], ["agent", "start"]) for call in calls)
+    assert ["pi", "--list-models", "gpt-5.6-sol"] in calls
+    argv = captured["argv"]
+    assert argv[argv.index("--profile") + 1] == "sol-fable"
+    mappings = [value for index, value in enumerate(argv) if argv[index - 1] == "--agent"]
+    assert mappings == ["sol=sol-peer", "fable=fable-peer"]
+    assert argv[argv.index("--synthesizer") + 1] == "sol"
+    receipt = json.loads(captured["env"][module.PROFILE_RECEIPT_ENV])
+    assert receipt["profile"] == "sol-fable"
+    assert {entry["role"] for entry in receipt["verified"]} == {"sol", "fable"}
+    state = load_launcher_state(tmp_path)
+    assert state["selected_profile"] == "sol-fable"
+    assert state["last_room_id"] == "chat-profile"
+
+
+def test_main_never_execs_a_profile_room_when_one_role_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    profile_launch_env(tmp_path, monkeypatch, captured)
+    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable")
+    monkeypatch.setenv(module.ROOM_ENV, "chat-profile")
+    calls = install_launch_host(
+        tmp_path,
+        monkeypatch,
+        # Sol's pane shows a suffixed model identifier: verification fails.
+        {"w-agents:p-sol": "Pi\nmodel gpt-5.6-sol-01 • high\n", "w-agents:p-fable": FABLE_SCREEN},
+    )
+    save_launcher_state(tmp_path, profile_room_state(tmp_path))
+
+    with pytest.raises(BootstrapError, match="requires every participant"):
+        module.main()
+
+    assert "argv" not in captured
+    assert "selected_profile" not in load_launcher_state(tmp_path)
+    # The mismatched existing Sol session is excluded without being closed.
+    mutations = (("tab", "close"), ("pane", "close"), ("agent", "send-keys"))
+    assert not any(tuple(call[:2]) in mutations for call in calls)
+
+
+def test_main_never_execs_a_profile_room_when_both_roles_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    profile_launch_env(tmp_path, monkeypatch, captured)
+    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable")
+    monkeypatch.setenv(module.ROOM_ENV, "chat-profile")
+    install_launch_host(
+        tmp_path,
+        monkeypatch,
+        {"w-agents:p-sol": "Pi\n", "w-agents:p-fable": "Claude Code\n"},
+    )
+    save_launcher_state(tmp_path, profile_room_state(tmp_path))
+
+    with pytest.raises(BootstrapError, match="requires every participant"):
+        module.main()
+
+    assert "argv" not in captured
+    assert "selected_profile" not in load_launcher_state(tmp_path)
+
+
+def test_main_default_room_exec_carries_no_profile_and_clears_stale_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    launch_env(tmp_path, monkeypatch, captured)
+    monkeypatch.setenv(module.ROOM_ENV, "chat-default")
+    install_launch_host(
+        tmp_path, monkeypatch, {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+    )
+    state = profile_room_state(tmp_path, room="chat-default")
+    state.pop("pending_room_profile")
+    state["selected_profile"] = "sol-fable"
+    state["last_room_id"] = "chat-older"
+    save_launcher_state(tmp_path, state)
+
+    module.main()
+
+    argv = captured["argv"]
+    assert "--profile" not in argv and "--agent" not in argv and "--synthesizer" not in argv
+    final_state = load_launcher_state(tmp_path)
+    assert "selected_profile" not in final_state
+
+
+def room_reopen_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, captured: dict[str, object], room: str
+) -> None:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("HERDR_WORKSPACE_ID", "w-chat")
+    monkeypatch.setenv("HERDR_TAB_ID", "w-chat:t-room")
+    monkeypatch.setenv("HERDR_PANE_ID", "w-chat:p-room")
+    monkeypatch.setenv(module.ROOM_OPERATION_ENV, "operation-reopen")
+    monkeypatch.setenv(module.ROOM_ENV, room)
+    monkeypatch.delenv(module.PROFILE_RECEIPT_ENV, raising=False)
+    monkeypatch.setattr(
+        module.os, "execv", lambda path, argv: captured.update(path=path, argv=argv)
+    )
+
+
+def test_room_reopen_reverifies_and_execs_with_receipt_and_mappings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    room_reopen_env(tmp_path, monkeypatch, captured, "chat-profile")
+    calls = install_launch_host(
+        tmp_path, monkeypatch, {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+    )
+    state = profile_room_state(tmp_path)
+    state.pop("pending_room_id")
+    state.pop("pending_room_operation_id")
+    state.pop("pending_room_profile")
+    state.pop("pending_room_started_unix_ms")
+    state["selected_profile"] = "sol-fable"
+    state["last_room_id"] = "chat-profile"
+    save_launcher_state(tmp_path, state)
+
+    module.room_entrypoint()
+
+    argv = captured["argv"]
+    assert argv[argv.index("--profile") + 1] == "sol-fable"
+    mappings = [value for index, value in enumerate(argv) if argv[index - 1] == "--agent"]
+    assert mappings == ["sol=sol-peer", "fable=fable-peer"]
+    assert argv[argv.index("--synthesizer") + 1] == "sol"
+    receipt = json.loads(os.environ[module.PROFILE_RECEIPT_ENV])
+    assert receipt == module.profile_receipt_payload(
+        "sol-fable", module.resolve_profile("sol-fable")
+    )
+    # Reopen only re-verifies: nothing is started or closed.
+    assert not any(
+        call[:2] in (["agent", "start"], ["tab", "close"], ["pane", "close"]) for call in calls
+    )
+
+
+def test_room_reopen_fails_closed_on_a_renamed_or_replaced_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    room_reopen_env(tmp_path, monkeypatch, captured, "chat-profile")
+    calls = install_launch_host(
+        tmp_path, monkeypatch, {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+    )
+    # The live Sol agent moved to a new pane: the recorded pane is stale.
+    calls.clear()
+    original = module.run_json
+
+    def shifted_agents(herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        result = original(herdr_bin, arguments, timeout)
+        if arguments == ["agent", "list"]:
+            for agent in result["result"]["agents"]:
+                if agent["name"] == "sol-peer":
+                    agent["pane_id"] = "w-agents:p-replaced"
+        return result
+
+    monkeypatch.setattr(module, "run_json", shifted_agents)
+    state = profile_room_state(tmp_path)
+    state.pop("pending_room_id")
+    state.pop("pending_room_operation_id")
+    state.pop("pending_room_profile")
+    state.pop("pending_room_started_unix_ms")
+    state["selected_profile"] = "sol-fable"
+    state["last_room_id"] = "chat-profile"
+    save_launcher_state(tmp_path, state)
+
+    with pytest.raises(BootstrapError, match="re-verification"):
+        module.room_entrypoint()
+
+    assert "argv" not in captured
+    assert not any(call[:2] in (["agent", "start"], ["tab", "close"]) for call in calls)
+
+
+def test_room_reopen_fails_closed_when_native_evidence_lapsed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    room_reopen_env(tmp_path, monkeypatch, captured, "chat-profile")
+    install_launch_host(
+        tmp_path,
+        monkeypatch,
+        {"w-agents:p-sol": "Pi\nmodel gpt-5.6-sol-01 • high\n", "w-agents:p-fable": FABLE_SCREEN},
+    )
+    state = profile_room_state(tmp_path)
+    state.pop("pending_room_id")
+    state.pop("pending_room_operation_id")
+    state.pop("pending_room_profile")
+    state.pop("pending_room_started_unix_ms")
+    state["selected_profile"] = "sol-fable"
+    state["last_room_id"] = "chat-profile"
+    save_launcher_state(tmp_path, state)
+
+    with pytest.raises(BootstrapError, match=r"@sol.*re-verification"):
+        module.room_entrypoint()
+
+    assert "argv" not in captured
+
+
+def test_room_reopen_rejects_stale_cross_room_profile_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    room_reopen_env(tmp_path, monkeypatch, captured, "chat-newer")
+    install_launch_host(
+        tmp_path, monkeypatch, {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+    )
+    state = profile_room_state(tmp_path)
+    state.pop("pending_room_id")
+    state.pop("pending_room_operation_id")
+    state.pop("pending_room_profile")
+    state.pop("pending_room_started_unix_ms")
+    state["selected_profile"] = "sol-fable"
+    state["last_room_id"] = "chat-profile"  # bound to a different room
+    save_launcher_state(tmp_path, state)
+
+    with pytest.raises(BootstrapError, match="different room"):
+        module.room_entrypoint()
+
+    assert "argv" not in captured
+
+
+def test_room_reopen_without_a_profile_skips_reverification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    room_reopen_env(tmp_path, monkeypatch, captured, "chat-default")
+    calls = install_launch_host(
+        tmp_path, monkeypatch, {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+    )
+    save_launcher_state(tmp_path, {"agents_workspace_id": "w-agents"})
+
+    module.room_entrypoint()
+
+    argv = captured["argv"]
+    assert "--profile" not in argv and "--agent" not in argv
+    # No agent listing or pane read happens for a default reopen.
+    assert not any(call[:2] in (["agent", "list"], ["pane", "read"]) for call in calls)
+
+
+def test_launch_room_with_profile_propagates_env_and_pending_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_launcher_state(tmp_path, {"chat_workspace_id": "w-chat"})
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_cwd": str(tmp_path)}))
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["workspace", "list"]:
+            return {"result": {"workspaces": [{"workspace_id": "w-chat"}]}}
+        if arguments[:3] == ["plugin", "pane", "open"]:
+            return {
+                "result": {
+                    "plugin_pane": {"pane": {"pane_id": "w-chat:p-new", "tab_id": "w-chat:t-new"}}
+                }
+            }
+        return {"result": {"type": "tab_info"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+
+    assert launch_room(open_existing=False, profile="sol-fable") == 0
+    open_arguments = next(call for call in calls if call[:3] == ["plugin", "pane", "open"])
+    assert f"{module.PROFILE_ENV}=sol-fable" in open_arguments
+    state = load_launcher_state(tmp_path)
+    assert state["room_pane_id"] == "w-chat:p-new"
+    assert "pending_room_profile" not in state
+
+
+def test_unknown_profile_fails_before_opening_any_tab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_call(*_args: object, **_kwargs: object) -> dict:
+        raise AssertionError("an unknown profile must fail before any Herdr call")
+
+    monkeypatch.setattr(module, "run_json", unexpected_call)
+
+    with pytest.raises(BootstrapError, match="unknown profile: bogus"):
+        launch_room(open_existing=False, profile="bogus")
+
+
+def test_profile_must_be_tied_to_the_pending_room_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    profile_launch_env(tmp_path, monkeypatch, captured)
+    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable")
+    save_launcher_state(
+        tmp_path,
+        {
+            "pending_room_id": "chat-pending",
+            "pending_room_operation_id": "operation-test",
+            "pending_room_profile": "default-ish",
+            "pending_room_started_unix_ms": int(module.time.time() * 1000),
+        },
+    )
+
+    def unexpected_call(*_args: object, **_kwargs: object) -> dict:
+        raise AssertionError("a cross-wired profile must fail before any Herdr mutation")
+
+    monkeypatch.setattr(module, "run_json", unexpected_call)
+
+    with pytest.raises(BootstrapError, match="not tied to this launch operation"):
+        module.main()
+
+    assert "argv" not in captured
+
+
+def test_launch_argument_parsing_is_exact() -> None:
+    assert module.parse_launch_arguments([]) == ("setup", None)
+    assert module.parse_launch_arguments(["--launch"]) == ("--launch", None)
+    assert module.parse_launch_arguments(["--launch", "--profile", "sol-fable"]) == (
+        "--launch",
+        "sol-fable",
+    )
+    assert module.parse_launch_arguments(["--open"]) == ("--open", None)
+    with pytest.raises(BootstrapError, match="only applies to --launch"):
+        module.parse_launch_arguments(["--open", "--profile", "sol-fable"])
+    with pytest.raises(BootstrapError, match="requires a profile name"):
+        module.parse_launch_arguments(["--launch", "--profile"])
+    with pytest.raises(BootstrapError, match="unknown arguments"):
+        module.parse_launch_arguments(["--launch", "--profile", "sol-fable", "extra"])
+    with pytest.raises(BootstrapError, match="unknown arguments"):
+        module.parse_launch_arguments(["--frobnicate"])

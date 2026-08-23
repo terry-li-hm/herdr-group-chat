@@ -4,6 +4,28 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Add the bounded `sol-fable` model profile, selected by `new-room --launch
+  --profile sol-fable` or the `New Sol + Fable chat` action. The room is
+  atomic: it opens only when both exact ordered participants verify — `@sol`
+  (`sol-peer`, Pi with `--provider openai-codex --model gpt-5.6-sol --thinking
+  high`) and `@fable` (`fable-peer`, Claude with `--model fable --effort high`,
+  no fallback) — on every fresh launch and every room-process reopen. Sol
+  requires a structurally exact `pi --list-models` catalog row (first token the
+  provider, second the model) checked before its tab is created or started,
+  plus the bounded `gpt-5.6-sol • high` pane token sequence; Fable requires
+  bounded `Fable 5` and `high effort` sequences; prefixed or suffixed
+  lookalikes never verify. A mismatching existing session is left open and
+  excluded, a newly created unverified tab is closed and never routed, and any
+  role failure aborts the profile launch or reopen closed. The room process
+  requires exactly the two explicit `--agent` role mappings plus the
+  launcher's deterministic receipt payload — generated only after complete
+  verification and carrying the canonical matched evidence — and records it
+  once per transcript, deduplicated by exact structured metadata across
+  reopens. Reopens re-verify recorded workspace, pane, tab, cwd, kind/name, and
+  native evidence before exec, bind the stored profile to the exact room id,
+  and reject stale cross-room profile state. The default Pi/Claude/Codex/Grok
+  room is unchanged.
+
 ## [0.4.1] - 2026-08-24
 
 - Add `/anneal @author,@critic QUESTION`: a thin two-participant composition over

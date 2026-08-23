@@ -1614,7 +1614,15 @@ def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:
     project = tomllib.loads((EFFECTOR.parent / "pyproject.toml").read_text(encoding="utf-8"))
     assert manifest["min_herdr_version"] == "0.8.0"
     assert manifest["version"] == project["project"]["version"]
-    assert [action["id"] for action in manifest["actions"]] == ["new", "open"]
+    assert [action["id"] for action in manifest["actions"]] == [
+        "new",
+        "new-sol-fable",
+        "open",
+    ]
+    sol_fable = manifest["actions"][1]
+    assert sol_fable["title"] == "New Sol + Fable chat"
+    assert sol_fable["command"] == ["./new-room", "--launch", "--profile", "sol-fable"]
+    assert sol_fable["contexts"] == ["workspace", "tab", "pane"]
     assert [pane["id"] for pane in manifest["panes"]] == ["new-room", "room"]
     assert all(pane["placement"] == "tab" for pane in manifest["panes"])
     assert "events" not in manifest
@@ -1978,3 +1986,402 @@ def test_anneal_command_wiring_rejects_before_any_transcript_mutation(tmp_path: 
         with pytest.raises(ChatError):
             handle_local_command(bad, chat, controller)
     assert transcript.read() == []
+
+
+# --- bounded sol-fable model profile -------------------------------------------------
+
+
+class ProfileClient(FakeClient):
+    def live_targets(self) -> set[str]:
+        return {"sol-peer", "fable-peer"}
+
+    def states(self) -> dict[str, str]:
+        return {"sol-peer": "idle", "fable-peer": "idle"}
+
+
+def make_sol_fable_chat(tmp_path: Path) -> tuple[GroupChat, ProfileClient, Transcript]:
+    transcript = Transcript(tmp_path, "sol-fable-room")
+    client = ProfileClient()
+    chat = GroupChat(
+        transcript,
+        {"sol": "sol-peer", "fable": "fable-peer"},
+        client,
+        synthesizer="sol",
+    )
+    return chat, client, transcript
+
+
+VALID_RECEIPT = {
+    "profile": "sol-fable",
+    "verified": [
+        {
+            "role": "sol",
+            "target": "sol-peer",
+            "harness": "pi",
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "effort": "high",
+            "verification": "native-ui verified",
+        },
+        {
+            "role": "fable",
+            "target": "fable-peer",
+            "harness": "claude",
+            "model": "fable",
+            "effort": "high",
+            "verification": "native-ui verified",
+        },
+    ],
+}
+valid_receipt_json = json.dumps(VALID_RECEIPT)
+
+
+def valid_receipt_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], valid_receipt_json)
+
+
+def test_profile_room_routes_only_sol_and_fable_and_composes_review_and_anneal(
+    tmp_path: Path,
+) -> None:
+    chat, client, transcript = make_sol_fable_chat(tmp_path)
+
+    created = chat.dispatch("hello")
+    chat.review("challenge this plan")
+    chat.anneal("@sol,@fable harden this plan")
+
+    assert [item["sender"] for item in created] == ["human", "sol", "fable"]
+    assert [target for target, _prompt in client.calls if "group chat" in _prompt][:2] == [
+        "sol-peer",
+        "fable-peer",
+    ]
+    kinds = [(item["sender"], item["kind"]) for item in transcript.read()]
+    assert ("sol", "review_synthesis") in kinds
+    assert ("sol", "anneal_final") in kinds
+    assert ("fable", "anneal_challenge") in kinds
+
+
+def test_default_overrides_stay_unchanged_and_closed() -> None:
+    parse = namespace["parse_agent_overrides"]
+    assert parse([]) == dict(namespace["DEFAULT_AGENTS"])
+    assert parse(["pi=other-peer"])["pi"] == "other-peer"
+    with pytest.raises(ChatError, match="invalid agent mapping"):
+        parse(["sol=sol-peer"])  # profile roles are not default-roster names
+
+
+def test_profile_requires_exactly_both_explicit_agent_roles_through_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StaticClient(ProfileClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(module, "HerdrClient", StaticClient)
+    valid_receipt_env(monkeypatch)
+    base = ["--state-dir", str(tmp_path), "--room", "strict-room", "--profile", "sol-fable"]
+
+    # main() reports user-visible failures as exit code 2 without writing.
+    assert main([*base, "--once", "hi"]) == 2  # zero mappings
+    assert main([*base, "--agent", "sol=sol-peer", "--once", "hi"]) == 2  # partial
+    assert (
+        main(
+            [
+                *base,
+                "--agent",
+                "sol=sol-peer",
+                "--agent",
+                "fable=fable-peer",
+                "--agent",
+                "zork=zork-peer",  # extra ROOM_RE-valid role
+                "--once",
+                "hi",
+            ]
+        )
+        == 2
+    )
+    assert Transcript(tmp_path, "strict-room").read() == []
+
+
+def test_exact_two_role_mapping_runs_and_receipt_is_recorded_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class StaticClient(ProfileClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(module, "HerdrClient", StaticClient)
+    valid_receipt_env(monkeypatch)
+    base = [
+        "--state-dir",
+        str(tmp_path),
+        "--room",
+        "receipt-room",
+        "--profile",
+        "sol-fable",
+        "--agent",
+        "sol=sol-peer",
+        "--agent",
+        "fable=fable-peer",
+    ]
+
+    assert main([*base, "--once", "hello from the human"]) == 0
+    assert main([*base, "--once", "hello again after reopen"]) == 0
+
+    transcript = Transcript(tmp_path, "receipt-room")
+    items = transcript.read()
+    receipts = [item for item in items if item["kind"] == namespace["PROFILE_RECEIPT_KIND"]]
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert receipt["meta"]["profile"] == "sol-fable"
+    assert {entry["role"] for entry in receipt["meta"]["verified"]} == {"sol", "fable"}
+    body = receipt["body"]
+    for needle in (
+        "native-ui verified",
+        "harness pi",
+        "provider openai-codex",
+        "model gpt-5.6-sol",
+        "effort high",
+        "model fable",
+        "sol-peer",
+        "fable-peer",
+    ):
+        assert needle in body, needle
+    assert "attest" not in body.lower()
+    senders = [item["sender"] for item in items]
+    assert senders.count("sol") == 2 and senders.count("fable") == 2  # both turns, one receipt
+
+
+def test_missing_receipt_fails_the_profile_room_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StaticClient(ProfileClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(module, "HerdrClient", StaticClient)
+    monkeypatch.delenv(namespace["PROFILE_RECEIPT_ENV"], raising=False)
+
+    assert (
+        main(
+            [
+                "--state-dir",
+                str(tmp_path),
+                "--room",
+                "no-receipt-room",
+                "--profile",
+                "sol-fable",
+                "--agent",
+                "sol=sol-peer",
+                "--agent",
+                "fable=fable-peer",
+                "--once",
+                "hi",
+            ]
+        )
+        == 2
+    )
+
+    assert Transcript(tmp_path, "no-receipt-room").read() == []
+
+
+def test_receipt_roster_mismatch_fails_the_profile_room_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StaticClient(ProfileClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(module, "HerdrClient", StaticClient)
+    valid_receipt_env(monkeypatch)
+
+    assert (
+        main(
+            [
+                "--state-dir",
+                str(tmp_path),
+                "--room",
+                "mismatch-room",
+                "--profile",
+                "sol-fable",
+                "--agent",
+                "sol=someone-else",
+                "--agent",
+                "fable=fable-peer",
+                "--once",
+                "hi",
+            ]
+        )
+        == 2
+    )
+
+    assert Transcript(tmp_path, "mismatch-room").read() == []
+
+
+def test_invalid_receipt_payloads_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StaticClient(ProfileClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(module, "HerdrClient", StaticClient)
+    base = [
+        "--state-dir",
+        str(tmp_path),
+        "--room",
+        "invalid-room",
+        "--profile",
+        "sol-fable",
+        "--agent",
+        "sol=sol-peer",
+        "--agent",
+        "fable=fable-peer",
+        "--once",
+        "hi",
+    ]
+    for payload in (
+        "not json",
+        json.dumps({"profile": "other", "verified": []}),
+        json.dumps({"profile": "sol-fable", "verified": [{"role": "sol"}]}),
+        json.dumps(
+            {
+                "profile": "sol-fable",
+                "verified": [
+                    {
+                        "role": "sol",
+                        "target": "sol-peer",
+                        "harness": "pi",
+                        "model": "gpt-5.6-sol",
+                        "effort": "high",
+                        "verification": "model-service attested",
+                    },
+                    {
+                        "role": "fable",
+                        "target": "fable-peer",
+                        "harness": "claude",
+                        "model": "fable",
+                        "effort": "high",
+                        "verification": "native-ui verified",
+                    },
+                ],
+            }
+        ),
+    ):
+        monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], payload)
+        assert main(base) == 2
+
+    assert Transcript(tmp_path, "invalid-room").read() == []
+
+
+def test_main_profile_defaults_the_synthesizer_to_sol(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    synthesizers: list[str] = []
+
+    class SynthTrackingClient(ProfileClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            if "designated synthesizer" in prompt:
+                synthesizers.append(target)
+            return super().turn(target, prompt, timeout_ms, cancel_event)
+
+    monkeypatch.setattr(module, "HerdrClient", SynthTrackingClient)
+    valid_receipt_env(monkeypatch)
+    monkeypatch.delenv("HERDR_GROUP_CHAT_SYNTHESIZER", raising=False)
+    assert (
+        main(
+            [
+                "--state-dir",
+                str(tmp_path),
+                "--room",
+                "synth-room",
+                "--profile",
+                "sol-fable",
+                "--agent",
+                "sol=sol-peer",
+                "--agent",
+                "fable=fable-peer",
+                "--once",
+                "/review question",
+            ]
+        )
+        == 0
+    )
+    assert synthesizers == ["sol-peer"]
+    transcript = Transcript(tmp_path, "synth-room")
+    synthesis = [item for item in transcript.read() if item["kind"] == "review_synthesis"]
+    assert synthesis and synthesis[0]["sender"] == "sol"
+
+
+def test_main_default_room_records_no_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StaticClient(FakeClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(module, "HerdrClient", StaticClient)
+    monkeypatch.delenv(namespace["PROFILE_RECEIPT_ENV"], raising=False)
+
+    assert main(["--state-dir", str(tmp_path), "--room", "plain-room", "--once", "hi"]) == 0
+
+    assert all(
+        item.get("kind") != namespace["PROFILE_RECEIPT_KIND"]
+        for item in Transcript(tmp_path, "plain-room").read()
+    )
+
+
+def test_receipt_dedupe_uses_exact_structured_metadata_not_profile_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StaticClient(ProfileClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(module, "HerdrClient", StaticClient)
+    base = [
+        "--state-dir",
+        str(tmp_path),
+        "--room",
+        "dedupe-room",
+        "--profile",
+        "sol-fable",
+        "--agent",
+        "sol=sol-peer",
+        "--agent",
+        "fable=fable-peer",
+        "--once",
+        "hi",
+    ]
+    receipt = json.loads(valid_receipt_json)
+    changed_effort = {
+        "profile": "sol-fable",
+        "verified": [dict(receipt["verified"][0], effort="low"), receipt["verified"][1]],
+    }
+
+    monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], valid_receipt_json)
+    assert main(base) == 0
+    monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], json.dumps(changed_effort))
+    assert main(base) == 0
+
+    receipts = [
+        item
+        for item in Transcript(tmp_path, "dedupe-room").read()
+        if item["kind"] == namespace["PROFILE_RECEIPT_KIND"]
+    ]
+
+    # Identical payload dedupes; different evidence metadata is a new receipt.
+    def normalized(payload: dict) -> dict:
+        return {**payload, "verified": sorted(payload["verified"], key=lambda e: e["role"])}
+
+    assert [item["meta"] for item in receipts] == [
+        normalized(receipt),
+        normalized(changed_effort),
+    ]
