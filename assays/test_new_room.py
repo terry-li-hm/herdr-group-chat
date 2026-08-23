@@ -792,6 +792,7 @@ def test_hook_notice_summary_is_dismissed_with_esc(
     assert calls == [
         ["pane", "read", "w-agents:p-codex", "--source", "visible", "--lines", "80"],
         ["agent", "send-keys", "codex-peer", "esc"],
+        ["pane", "read", "w-agents:p-codex", "--source", "visible", "--lines", "80"],
     ]
     assert "unreviewed hooks left inactive" in capsys.readouterr().out
 
@@ -808,12 +809,17 @@ def test_hook_notice_detection_survives_viewport_clipping(
 
     module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
 
-    assert calls[-1] == ["agent", "send-keys", "codex-peer", "esc"]
+    assert calls[1] == ["agent", "send-keys", "codex-peer", "esc"]
+    assert len(calls) == 3, "dismissal must be confirmed by a fresh read"
 
 
-def test_hook_menu_variant_continues_without_trusting(
+def test_hook_menu_variant_is_stepped_back_with_esc_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Live Codex v0.149 opened Review Hooks for the menu's down-down-enter
+    path, so the menu is never answered: esc steps it back to the summary, a
+    fresh read observes the summary, and a second esc closes it — exactly two
+    esc keys, no enter, arrows, or t."""
     calls: list[list[str]] = []
     monkeypatch.setattr(
         module,
@@ -823,7 +829,9 @@ def test_hook_menu_variant_continues_without_trusting(
                 "\u203a 1. Review hooks\n"
                 "  2. Trust all and continue\n"
                 "  3. Continue without trusting (hooks won't run)\n"
-                "Press enter to confirm or esc to go back"
+                "Press enter to confirm or esc to go back",
+                "Codex detected unreviewed lifecycle hooks.\n"
+                "Press t to trust all; enter to review hooks; esc to close",
             ],
             calls,
         ),
@@ -831,11 +839,16 @@ def test_hook_menu_variant_continues_without_trusting(
 
     module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
 
-    assert calls[1:] == [
-        ["agent", "send-keys", "codex-peer", "down"],
-        ["agent", "send-keys", "codex-peer", "down"],
-        ["agent", "send-keys", "codex-peer", "enter"],
+    assert calls == [
+        ["pane", "read", "w-agents:p-codex", "--source", "visible", "--lines", "80"],
+        ["agent", "send-keys", "codex-peer", "esc"],
+        ["pane", "read", "w-agents:p-codex", "--source", "visible", "--lines", "80"],
+        ["agent", "send-keys", "codex-peer", "esc"],
+        ["pane", "read", "w-agents:p-codex", "--source", "visible", "--lines", "80"],
     ]
+    key_sends = [call for call in calls if call[:2] == ["agent", "send-keys"]]
+    assert key_sends == [["agent", "send-keys", "codex-peer", "esc"]] * 2
+    assert not any(call[-1] in {"t", "enter", "down", "up"} for call in key_sends)
 
 
 def test_hook_notice_retry_catches_a_late_rendering_dialog(
@@ -855,8 +868,9 @@ def test_hook_notice_retry_catches_a_late_rendering_dialog(
     module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
 
     reads = [call for call in calls if call[:2] == ["pane", "read"]]
-    assert len(reads) == 3
-    assert calls[-1] == ["agent", "send-keys", "codex-peer", "esc"]
+    assert len(reads) == 4, "two render-wait reads, the notice, and the confirmation"
+    key_sends = [call for call in calls if call[:2] == ["agent", "send-keys"]]
+    assert key_sends == [["agent", "send-keys", "codex-peer", "esc"]]
 
 
 def test_hook_notice_absent_dialog_is_silent_and_bounded(
@@ -870,6 +884,26 @@ def test_hook_notice_absent_dialog_is_silent_and_bounded(
 
     assert len(calls) == module.HOOK_DISMISS_ATTEMPTS
     assert all(call[:2] == ["pane", "read"] for call in calls)
+    assert capsys.readouterr().out == ""
+
+
+def test_hook_dismissal_sends_no_key_to_an_unknown_dialog(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A visible dialog that is not the hooks notice never receives a key."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(module, "HOOK_DISMISS_INTERVAL_S", 0)
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        hook_notice_fake(["Sign-in expired.\nPress enter to re-authenticate."], calls),
+    )
+
+    module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
+
+    assert len(calls) == module.HOOK_DISMISS_ATTEMPTS
+    assert all(call[:2] == ["pane", "read"] for call in calls)
+    assert ["agent", "send-keys"] not in [call[:2] for call in calls]
     assert capsys.readouterr().out == ""
 
 

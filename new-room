@@ -295,9 +295,11 @@ def wait_for_shell(herdr_bin: str, pane_id: str, timeout: float = 10) -> None:
 
 
 HOOK_DIALOG_NEEDLE = "trust all"
-HOOK_MENU_NEEDLE = "continue without trusting"
 HOOK_DISMISS_ATTEMPTS = 10
 HOOK_DISMISS_INTERVAL_S = 1.0
+# The hooks UI stacks at most two variants (menu over summary), each cleared by
+# one esc; a UI that survives this many escs is not the notice and is left alone.
+HOOK_DISMISS_MAX_ESCS = 3
 
 
 def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> None:
@@ -305,28 +307,35 @@ def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> Non
 
     The dialog can render after `agent start` reports ready, and the visible-pane
     read clips lines at viewport width, so detection retries briefly and matches
-    short case-insensitive needles that survive clipping. Hooks stay inactive:
-    the summary notice is closed with esc, and the menu variant is answered with
-    "Continue without trusting".
+    a short case-insensitive needle that survives clipping. Live Codex v0.149
+    evidence showed the menu's "down down enter" path opening Review Hooks
+    instead of Continue without trusting, so both variants are handled with esc
+    alone — the menu steps back to the summary, the summary closes — one key at
+    a time, each decided by a fresh visible-pane read, until the UI is confirmed
+    gone or the bounded budget expires. enter, arrows, and t are never sent, so
+    unreviewed hooks stay inactive, and a pane that never shows the notice
+    receives no key at all.
     """
+    dismissed = False
+    escs = 0
     for attempt in range(HOOK_DISMISS_ATTEMPTS):
         payload = run_json(
             herdr_bin,
             ["pane", "read", pane_id, "--source", "visible", "--lines", "80"],
         )
         text = payload.get("result", {}).get("read", {}).get("text", "")
-        lowered = text.lower()
-        if HOOK_DIALOG_NEEDLE not in lowered:
+        if HOOK_DIALOG_NEEDLE not in text.lower():
+            if dismissed:
+                print("notice @codex unreviewed hooks left inactive", flush=True)
+                return
             if attempt + 1 < HOOK_DISMISS_ATTEMPTS:
                 time.sleep(HOOK_DISMISS_INTERVAL_S)
             continue
-        if HOOK_MENU_NEEDLE in lowered:
-            for key in ("down", "down", "enter"):
-                run_json(herdr_bin, ["agent", "send-keys", name, key])
-        else:
-            run_json(herdr_bin, ["agent", "send-keys", name, "esc"])
-        print("notice @codex unreviewed hooks left inactive", flush=True)
-        return
+        if escs >= HOOK_DISMISS_MAX_ESCS:
+            break
+        run_json(herdr_bin, ["agent", "send-keys", name, "esc"])
+        escs += 1
+        dismissed = True
 
 
 AGENT_START_BUSY_ATTEMPTS = 5
