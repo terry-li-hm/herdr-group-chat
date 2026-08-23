@@ -11,6 +11,14 @@ default. Review rounds run their independent first-pass calls concurrently,
 then ask one configured agent to synthesize the collected answers. All messages
 are recorded as append-only JSONL in the resolved state directory.
 
+## Architecture boundary
+
+Herdr Group Chat stays a local relay for visible native agents. It does not use
+Cumora as its backend. Cumora mechanisms are adopted only when a focused assay
+shows the matching failure here. A future networked mode would instead make
+this TUI a thin Cumora client, with one backend owner and no dual writes. See
+[the Cumora boundary decision](docs/cumora-boundary.md).
+
 ## Install
 
 Prerequisites are Herdr 0.8.0 or newer, [`uv`](https://docs.astral.sh/uv/), and
