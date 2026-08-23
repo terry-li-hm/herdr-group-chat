@@ -23,7 +23,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, NoReturn, Protocol
 from urllib.parse import quote
 
 if TYPE_CHECKING:
@@ -55,14 +55,33 @@ TERMINAL_READ_TIMEOUT_S = 30.0
 # consecutive stable unmarked reads the turn fails fast instead of stalling to timeout.
 STABLE_UNMARKED_POLLS = 20
 TUI_TIMESTAMP_RE = re.compile(r"[ \t]{2,}\d{1,2}:\d{2}\s+[AP]M[ \t█]*(?:\n[ \t]*)?")
+# Codex's unreviewed-hooks notice is the one blocking dialog the relay recovers
+# from at submission time; the needle is short enough to survive the visible
+# read's clipping at viewport width.
+HOOK_DIALOG_NEEDLE = "trust all"
+# The notice stacks at most two variants (menu over summary), each cleared by
+# one esc, so a bounded esc budget plus a confirmation read covers it; a dialog
+# that survives them is not this notice and stays blocked.
+HOOK_RECOVERY_MAX_ESCS = 3
 
 
 class ChatError(RuntimeError):
     """A user-visible relay failure."""
 
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 class CommandLaunchError(ChatError):
     """The Herdr command could not start, so no agent turn was submitted."""
+
+
+def herdr_error_code(detail: str) -> str | None:
+    """Extract Herdr's structured error code from a command failure, if any."""
+    with suppress(json.JSONDecodeError, KeyError, TypeError):
+        return str(json.loads(detail)["error"]["code"])
+    return None
 
 
 class AgentClient(Protocol):
@@ -273,7 +292,7 @@ class HerdrClient:
             raise ChatError(f"Herdr command failed: {error}") from error
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
-            raise ChatError(f"Herdr command failed: {detail}")
+            raise ChatError(f"Herdr command failed: {detail}", code=herdr_error_code(detail))
         return result
 
     @staticmethod
@@ -321,7 +340,7 @@ class HerdrClient:
             )
             if result.returncode != 0:
                 detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
-                raise ChatError(f"Herdr command failed: {detail}")
+                raise ChatError(f"Herdr command failed: {detail}", code=herdr_error_code(detail))
             return result
 
     def _agents(self) -> list[dict[str, Any]]:
@@ -375,17 +394,30 @@ class HerdrClient:
         submitted_at = time.monotonic()
         deadline = submitted_at + (effective_timeout_ms / 1000)
         try:
-            self._run_interruptible(
-                ["agent", "prompt", target, prompt],
-                cancel_event,
-                timeout=max(1, min(30, effective_timeout_ms / 1000)),
-            )
+            self._submit_prompt(target, prompt, cancel_event, effective_timeout_ms)
         except ChatError as error:
-            if not isinstance(error, CommandLaunchError):
-                # The prompt may still have landed, but no status is known here,
-                # so this cancel stays best-effort.
-                self._cancel_if_working(target, None)
-            raise
+            if error.code != "agent_blocked":
+                self._raise_submission_failure(target, error)
+            # Herdr rejects a blocked agent's prompt before any input is sent, so
+            # the target is blocked, not working: never cancel here (an idle
+            # Codex TUI treats Ctrl-C as quit). Startup polling is not the
+            # correctness boundary for Codex's unreviewed-hooks notice — it can
+            # render after every bounded window — so recover at submission: esc
+            # it away, then retry the prompt exactly once.
+            if cancel_event is not None and cancel_event.is_set():
+                raise ChatError("review cancelled") from error
+            if not self._dismiss_blocked_hooks_notice(target):
+                return "blocked", ""
+            try:
+                self._submit_prompt(target, prompt, cancel_event, effective_timeout_ms)
+            except ChatError as retry_error:
+                if retry_error.code == "agent_blocked":
+                    return "blocked", ""
+                self._raise_submission_failure(target, retry_error)
+            # The retry is a fresh submission; recovery time must not be charged
+            # against the turn's observation window.
+            submitted_at = time.monotonic()
+            deadline = submitted_at + (effective_timeout_ms / 1000)
         saw_working = False
         stable_unmarked = 0
         last_unmarked_read: str | None = None
@@ -428,7 +460,7 @@ class HerdrClient:
                     stable_unmarked = 0
                     last_unmarked_read = None
                 else:
-                    if "trust all" in terminal.lower():
+                    if HOOK_DIALOG_NEEDLE in terminal.lower():
                         return "blocked", ""
                     try:
                         return status, extract_reply(terminal, reply_marker_id)
@@ -466,6 +498,56 @@ class HerdrClient:
             ).stdout
         except ChatError:
             return None
+
+    def _submit_prompt(
+        self, target: str, prompt: str, cancel_event: threading.Event | None, timeout_ms: int
+    ) -> None:
+        self._run_interruptible(
+            ["agent", "prompt", target, prompt],
+            cancel_event,
+            timeout=max(1, min(30, timeout_ms / 1000)),
+        )
+
+    def _raise_submission_failure(self, target: str, error: ChatError) -> NoReturn:
+        if not isinstance(error, CommandLaunchError):
+            # The prompt may still have landed, but no status is known here,
+            # so this cancel stays best-effort.
+            self._cancel_if_working(target, None)
+        raise error
+
+    def _read_visible(self, target: str) -> str:
+        """Read the target's visible pane; a refused or slow read reads as blank.
+
+        Recovery must fail closed: a terminal that cannot be observed is an
+        unknown blocked dialog, never something to send keys to.
+        """
+        try:
+            return self._run(
+                ["agent", "read", target, "--source", "visible", "--lines", "80"],
+                timeout=5,
+            ).stdout
+        except ChatError:
+            return ""
+
+    def _dismiss_blocked_hooks_notice(self, target: str) -> bool:
+        """Dismiss the unreviewed Codex hooks notice with esc only, then report success.
+
+        Called only after `agent prompt` was rejected with agent_blocked, so a
+        dialog is holding the target and only that target is inspected. Each
+        step observes fresh visible state: while the notice is on screen send
+        esc — never t, enter, arrows, or Ctrl-C, so the hooks stay untrusted and
+        no other dialog is answered — until a fresh read confirms it is gone.
+        True means the notice was confirmed dismissed and the prompt may be
+        retried; an unreadable or unrecognized dialog, or one surviving the esc
+        budget, stays blocked untouched for the user to handle.
+        """
+        dismissed = False
+        for _ in range(HOOK_RECOVERY_MAX_ESCS):
+            if HOOK_DIALOG_NEEDLE not in self._read_visible(target).lower():
+                return dismissed
+            self._run(["agent", "send-keys", target, "esc"], timeout=5)
+            dismissed = True
+        return HOOK_DIALOG_NEEDLE not in self._read_visible(target).lower()
 
     def cancel(self, target: str) -> None:
         self._run(["agent", "send-keys", target, "ctrl+c"], timeout=5)

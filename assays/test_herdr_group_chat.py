@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import tomllib
+from collections.abc import Callable
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from os import X_OK, access
@@ -1180,6 +1181,201 @@ def test_herdr_turn_detects_clipped_hooks_dialog_as_blocked(
         f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
         12_000,
     ) == ("blocked", "")
+
+
+def hook_recovery_runner(
+    calls: list[list[str]],
+    visible_texts: list[str],
+    *,
+    prompt_rejections: list[bool],
+    visible_read_fails: bool = False,
+    token: str = "9" * 32,
+) -> Callable[..., subprocess.CompletedProcess[str]]:
+    """Fake herdr for agent_blocked-at-submission recovery tests.
+
+    `visible_texts` is consumed one entry per `agent read --source visible`
+    call; the marker reply arrives on `agent read --source recent-unwrapped`.
+    """
+    statuses = iter(("working", "done"))
+    rejections = iter(prompt_rejections)
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1:3] == ["agent", "prompt"]:
+            if next(rejections, False):
+                return subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    stdout="",
+                    stderr='{"error":{"code":"agent_blocked","message":"agent is blocked"}}',
+                )
+            return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+        if argv[1:3] == ["agent", "read"]:
+            if argv[4:6] == ["--source", "visible"]:
+                if visible_read_fails:
+                    return subprocess.CompletedProcess(
+                        argv, 1, stdout='{"error":{"code":"agent_not_idle"}}', stderr=""
+                    )
+                text = visible_texts.pop(0) if visible_texts else ""
+                return subprocess.CompletedProcess(argv, 0, stdout=text, stderr="")
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=f"HGCHAT_REPLY_BEGIN {token}\nanswer\nHGCHAT_REPLY_END {token}\n",
+                stderr="",
+            )
+        if argv[1:3] == ["agent", "get"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=f'{{"result":{{"agent":{{"agent_status":"{next(statuses)}"}}}}}}',
+                stderr="",
+            )
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    return runner
+
+
+def test_herdr_turn_recovers_agent_blocked_codex_hooks_notice_with_esc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late-rendering hooks notice is the correctness boundary at submission,
+    not startup: esc it away, confirm with a fresh read, retry the prompt once."""
+    calls: list[list[str]] = []
+    token = "9" * 32
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    runner = hook_recovery_runner(
+        calls,
+        [
+            "Codex detected unreviewed lifecycle hooks.\n"
+            "Press t to trust all; enter to review hooks; esc to close",
+            "",
+        ],
+        prompt_rejections=[True, False],
+    )
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    status, reply = client.turn(
+        "codex-peer",
+        f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+        12_000,
+    )
+
+    assert (status, reply) == ("done", "answer")
+    prompts = [call for call in calls if call[1:3] == ["agent", "prompt"]]
+    assert len(prompts) == 2, "the prompt must be retried exactly once"
+    assert prompts[0] == prompts[1]
+    key_sends = [call[1:] for call in calls if call[1:3] == ["agent", "send-keys"]]
+    assert key_sends == [["agent", "send-keys", "codex-peer", "esc"]]
+    # Inspect only the blocked target, esc only after observing the notice,
+    # and confirm dismissal with a fresh read before the retry.
+    assert [call[1:3] for call in calls[:5]] == [
+        ["agent", "prompt"],
+        ["agent", "read"],
+        ["agent", "send-keys"],
+        ["agent", "read"],
+        ["agent", "prompt"],
+    ]
+    assert all(call[-1] == "esc" for call in calls if call[1:3] == ["agent", "send-keys"])
+
+
+def test_herdr_turn_recovers_the_hooks_menu_variant_with_esc_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The menu variant never gets enter or arrows: esc steps it back to the
+    summary, a fresh observation sees the summary, and a second esc closes it."""
+    calls: list[list[str]] = []
+    token = "a" * 32
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    runner = hook_recovery_runner(
+        calls,
+        [
+            "\u203a 1. Review hooks\n"
+            "  2. Trust all and continue\n"
+            "  3. Continue without trusting (hooks won't run)\n"
+            "Press enter to confirm or esc to go back",
+            "Codex detected unreviewed lifecycle hooks.\n"
+            "Press t to trust all; enter to review hooks; esc to close",
+            "",
+        ],
+        prompt_rejections=[True, False],
+        token=token,
+    )
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    status, reply = client.turn(
+        "codex-peer",
+        f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+        12_000,
+    )
+
+    assert (status, reply) == ("done", "answer")
+    key_sends = [call[1:] for call in calls if call[1:3] == ["agent", "send-keys"]]
+    assert key_sends == [["agent", "send-keys", "codex-peer", "esc"]] * 2
+    assert all(
+        call[-1] not in {"t", "enter", "down", "up", "ctrl+c"}
+        for call in calls
+        if call[1:3] == ["agent", "send-keys"]
+    )
+
+
+def test_herdr_turn_leaves_an_unknown_blocked_dialog_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blocked dialog that is not the hooks notice stays blocked: no keys,
+    no prompt retry, and the caller still sees a blocked status."""
+    calls: list[list[str]] = []
+    token = "b" * 32
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    runner = hook_recovery_runner(
+        calls,
+        ["Sign-in expired.\nPress enter to re-authenticate."],
+        prompt_rejections=[True],
+    )
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    assert client.turn(
+        "codex-peer",
+        f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+        12_000,
+    ) == ("blocked", "")
+
+    assert [call[1:3] for call in calls] == [
+        ["agent", "prompt"],
+        ["agent", "read"],
+    ]
+    assert ["agent", "send-keys"] not in [call[1:3] for call in calls]
+
+
+def test_herdr_turn_sends_no_ctrl_c_for_agent_blocked_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """agent_blocked means nothing was sent and the agent is not working; the
+    best-effort cancel-on-submit-failure path must never reach it (Ctrl-C would
+    quit an idle Codex TUI), and an unreadable terminal stays blocked."""
+    calls: list[list[str]] = []
+    token = "c" * 32
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    runner = hook_recovery_runner(
+        calls,
+        [],
+        prompt_rejections=[True],
+        visible_read_fails=True,
+    )
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    assert client.turn(
+        "codex-peer",
+        f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+        12_000,
+    ) == ("blocked", "")
+
+    assert [call[1:3] for call in calls] == [
+        ["agent", "prompt"],
+        ["agent", "read"],
+    ]
+    assert all(call[-1] != "ctrl+c" for call in calls if call[1:3] == ["agent", "send-keys"])
+    assert len([call for call in calls if call[1:3] == ["agent", "prompt"]]) == 1
 
 
 def test_herdr_turn_fails_fast_when_a_completed_reply_stays_unmarked(

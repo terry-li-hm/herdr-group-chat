@@ -300,17 +300,14 @@ HOOK_DISMISS_ATTEMPTS = 10
 HOOK_DISMISS_INTERVAL_S = 1.0
 
 
-def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> bool:
+def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> None:
     """Dismiss Codex's hooks dialog without trusting hooks the user has not reviewed.
 
     The dialog can render after `agent start` reports ready, and the visible-pane
     read clips lines at viewport width, so detection retries briefly and matches
     short case-insensitive needles that survive clipping. Hooks stay inactive:
     the summary notice is closed with esc, and the menu variant is answered with
-    "Continue without trusting". Returns True when a notice was dismissed, or
-    False when this fixed startup window elapsed without one — Codex v0.149 can
-    render the notice only after that window, while later participants are still
-    starting, so callers re-check once participant startup completes.
+    "Continue without trusting".
     """
     for attempt in range(HOOK_DISMISS_ATTEMPTS):
         payload = run_json(
@@ -329,8 +326,7 @@ def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> boo
         else:
             run_json(herdr_bin, ["agent", "send-keys", name, "esc"])
         print("notice @codex unreviewed hooks left inactive", flush=True)
-        return True
-    return False
+        return
 
 
 AGENT_START_BUSY_ATTEMPTS = 5
@@ -762,8 +758,6 @@ def start_participants(
     participant_panes = state.setdefault("participant_pane_ids", {})
     participant_tabs = state.setdefault("participant_tab_ids", {})
     pending_tabs = state.setdefault("pending_participant_tabs", {})
-    codex_hook_notice_pending = False
-    codex_hook_name = ""
     for kind, name in PARTICIPANTS:
         live_agent = live_agents.get(name)
         if live_agent is not None:
@@ -878,13 +872,9 @@ def start_participants(
                     ["tab", "rename", participant_tab_id, f"{kind} · group-chat"],
                 )
             if kind == "codex":
-                codex_hook_name = name
-                codex_hook_notice_pending = True
                 with suppress(BootstrapError):
                     assert_server_identity(state_dir, state_path)
-                    codex_hook_notice_pending = not dismiss_inactive_hook_notice(
-                        herdr_bin, name, pane_id
-                    )
+                    dismiss_inactive_hook_notice(herdr_bin, name, pane_id)
             print(f"ready  @{kind}", flush=True)
         except (BootstrapError, KeyError, TypeError) as error:
             if not isinstance(error, BootstrapError) or error.code not in INDETERMINATE_OPEN_CODES:
@@ -905,15 +895,6 @@ def start_participants(
                 save_launcher_state(state_dir, state, state_path)
             failures.append(f"@{kind}: {error}")
             print(f"failed @{kind}", flush=True)
-    # Codex v0.149 can render the hooks notice only after the fixed startup
-    # window above is exhausted, while later participants are still starting;
-    # when the startup pass confirmed no dismissal, check again now that every
-    # participant has had its chance to start.
-    codex_pane_id = participant_panes.get("codex")
-    if codex_hook_notice_pending and codex_pane_id:
-        with suppress(BootstrapError):
-            assert_server_identity(state_dir, state_path)
-            dismiss_inactive_hook_notice(herdr_bin, codex_hook_name, codex_pane_id)
     if not participant_panes:
         state.pop("participant_pane_ids", None)
     if not participant_tabs:
