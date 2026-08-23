@@ -51,6 +51,7 @@ participants review. Pi synthesizes by default.
 ```text
 /review Review this email draft and recommend the final wording.
 /review @claude,@codex Challenge this architecture.
+/anneal @pi,@claude Harden this plan.
 /cancel
 /retry claude
 /retry synthesis
@@ -62,6 +63,14 @@ skipped. `/cancel` interrupts only active participant tabs. A failed, blocked,
 timed-out, or cancelled first pass can be retried without rerunning the other
 reviewers; a successful retry triggers a fresh synthesis. Use Page Up and Page
 Down to scroll the transcript while work continues.
+
+Use `/anneal @author,@critic QUESTION` for a two-participant adversarial pass
+over one question. Both answer blind and concurrently (a missing blind reply
+stops the round before synthesis), the author drafts a provisional synthesis,
+the critic challenges it once, and the author alone writes the `anneal_final`.
+Anneal runs through the same single review controller as `/review`, so
+`/cancel` works at every phase, ordinary messages wait, and `/retry` stays
+review-only until a later ordinary review replaces the last round.
 
 `/inbox` switches the transcript to a presentation-only inbox of final agent
 replies, review syntheses, system notices, and review statuses that need
@@ -86,6 +95,7 @@ The standalone CLI remains available:
 ./herdr-group-chat
 ./herdr-group-chat --once "@all Compare these options."
 ./herdr-group-chat --once "/review @claude,@codex Compare these options."
+./herdr-group-chat --once "/anneal @pi,@claude Harden this plan."
 ./herdr-group-chat --synthesizer codex --agent-timeout grok=900000
 ./herdr-group-chat --show
 ```

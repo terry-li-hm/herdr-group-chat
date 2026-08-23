@@ -38,6 +38,8 @@ build_synthesis_prompt = namespace["build_synthesis_prompt"]
 message_lines = namespace["message_lines"]
 parse_agent_timeouts = namespace["parse_agent_timeouts"]
 parse_route = namespace["parse_route"]
+parse_anneal = namespace["parse_anneal"]
+main = namespace["main"]
 resolve_state_dir = namespace["resolve_state_dir"]
 participant_status = namespace["participant_status"]
 handle_local_command = namespace["handle_local_command"]
@@ -1556,3 +1558,357 @@ def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:
         target = EFFECTOR.parent / command[0]
         assert target.is_file()
         assert access(target, X_OK)
+
+
+class AnnealClient(FakeClient):
+    """Routes anneal phases by prompt markers; blind replies meet at a barrier."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.blind = threading.Barrier(2)
+        self.call_lock = threading.Lock()
+        self.fail_next_review_blind = False
+        self.single_blind = False
+
+    def _record(self, target: str, prompt: str, timeout_ms: int | None) -> None:
+        with self.call_lock:
+            self.calls.append((target, prompt))
+            self.timeouts.append(timeout_ms)
+
+    def turn(
+        self,
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, str]:
+        self._record(target, prompt, timeout_ms)
+        if "Question for independent review" in prompt:
+            if self.fail_next_review_blind and target == "claude-peer":
+                self.fail_next_review_blind = False
+                raise ChatError("temporary blind failure")
+            if not self.single_blind:
+                self.blind.wait(timeout=2)
+            return "done", f"blind from {target}"
+        if "Independent reviews:" in prompt:
+            return "done", f"synthesis from {target}"
+        if "the critic in a two-participant anneal" in prompt:
+            return "done", f"challenge from {target}"
+        if "the sole final author in a two-participant anneal" in prompt:
+            return "done", f"final from {target}"
+        return "done", f"reply from {target}"
+
+
+def make_anneal_chat(
+    tmp_path: Path, client: FakeClient, room: str = "anneal-room"
+) -> tuple[GroupChat, Transcript]:
+    transcript = Transcript(tmp_path, room)
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer", "grok": "grok-peer"},
+        client,
+        synthesizer="pi",
+    )
+    return chat, transcript
+
+
+def test_anneal_parser_requires_exactly_two_distinct_known_participants() -> None:
+    known = ("pi", "claude", "codex", "grok")
+    assert parse_anneal("@pi,@claude refine", known) == ("pi", "claude", "refine")
+    assert parse_anneal("@Pi,@claude  refine this  ", known) == ("pi", "claude", "refine this")
+    for bad, message in [
+        ("", "usage"),
+        ("refine this", "usage"),
+        ("@all refine", "all"),
+        ("@pi,@all refine", "all"),
+        ("@pi refine", "exactly two"),
+        ("@pi,@pi refine", "exactly two"),
+        ("@pi,@claude,@codex refine", "exactly two"),
+        ("@pi,@gemini refine", "unknown participant"),
+        ("@gemini,@pi refine", "unknown participant"),
+        ("@pi,@claude", "usage"),
+        ("@pi,@claude   ", "usage"),
+    ]:
+        with pytest.raises(ChatError, match=message):
+            parse_anneal(bad, known)
+
+
+def test_anneal_runs_blind_concurrently_then_challenge_and_final_in_order(
+    tmp_path: Path,
+) -> None:
+    client = AnnealClient()
+    chat, transcript = make_anneal_chat(tmp_path, client)
+
+    review = chat.anneal("@claude,@grok Harden this plan")
+
+    blind = [call for call in client.calls if "Question for independent review" in call[1]]
+    assert {target for target, _ in blind} == {"claude-peer", "grok-peer"}
+    assert all("blind from" not in prompt for _, prompt in blind)
+    synthesis = [call for call in client.calls if "Independent reviews:" in call[1]]
+    assert [target for target, _ in synthesis] == ["claude-peer"]
+    assert "blind from claude-peer" in synthesis[0][1]
+    assert "blind from grok-peer" in synthesis[0][1]
+    challenge = [
+        call for call in client.calls if "the critic in a two-participant anneal" in call[1]
+    ]
+    assert [target for target, _ in challenge] == ["grok-peer"]
+    assert "Harden this plan" in challenge[0][1]
+    assert "synthesis from claude-peer" in challenge[0][1]
+    final = [
+        call
+        for call in client.calls
+        if "the sole final author in a two-participant anneal" in call[1]
+    ]
+    assert [target for target, _ in final] == ["claude-peer"]
+    for needle in (
+        "Harden this plan",
+        "blind from claude-peer",
+        "blind from grok-peer",
+        "synthesis from claude-peer",
+        "challenge from grok-peer",
+    ):
+        assert needle in final[0][1]
+    for prompt in (challenge[0][1], final[0][1]):
+        assert "eligibility never transfers" in prompt
+        assert "routing identities, not attestation" in prompt
+
+    messages = transcript.read()
+    kinds = [item["kind"] for item in messages]
+    assert kinds[0] == "review_question"
+    assert kinds.count("review_response") == 2
+    assert kinds[-3:] == ["review_synthesis", "anneal_challenge", "anneal_final"]
+    assert messages[-3].get("provisional") is True
+    assert messages[-2].get("provisional") is None
+    assert messages[-1].get("provisional") is None
+    assert messages[-3]["sender"] == "claude"
+    assert messages[-2]["sender"] == "grok"
+    assert messages[-1]["sender"] == "claude"
+    assert len({item["round_id"] for item in messages}) == 1
+    assert review.mode == "anneal"
+    assert review.states == {"claude": "done", "grok": "done"}
+
+    client.single_blind = True
+    chat.review("@claude plain review")
+    assert client.calls[-1][0] == "pi-peer"
+
+
+def test_anneal_missing_blind_reply_stops_without_synthesis_or_final(tmp_path: Path) -> None:
+    class DropBlindClient(AnnealClient):
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            if target == "grok-peer" and "Question for independent review" in prompt:
+                self._record(target, prompt, timeout_ms)
+                self.blind.wait(timeout=2)
+                raise ChatError("simulated blind failure")
+            return super().turn(target, prompt, timeout_ms, cancel_event)
+
+    client = DropBlindClient()
+    chat, transcript = make_anneal_chat(tmp_path, client)
+
+    review = chat.anneal("@claude,@grok Harden this plan")
+
+    kinds = [item["kind"] for item in transcript.read()]
+    assert "review_synthesis" not in kinds
+    assert "anneal_challenge" not in kinds
+    assert "anneal_final" not in kinds
+    assert review.states["grok"] == "failed"
+    assert any(
+        "Anneal stopped" in item["body"] and item["kind"] == "review_status"
+        for item in transcript.read()
+    )
+
+
+def test_one_controller_prevents_review_and_anneal_overlap(tmp_path: Path) -> None:
+    class BlockingBlindClient(AnnealClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blind_started = threading.Event()
+            self.release = threading.Event()
+
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            if "Question for independent review" in prompt:
+                self._record(target, prompt, timeout_ms)
+                self.blind_started.set()
+                assert self.release.wait(timeout=5)
+                return "done", f"blind from {target}"
+            return super().turn(target, prompt, timeout_ms, cancel_event)
+
+    client = BlockingBlindClient()
+    chat, _ = make_anneal_chat(tmp_path, client, "overlap-room")
+    controller = ReviewController(chat)
+    try:
+        assert (
+            controller.start_anneal("@claude,@grok Harden this plan")
+            == "Anneal started: @claude authors, @grok critiques."
+        )
+        assert client.blind_started.wait(timeout=1)
+        with pytest.raises(ChatError, match="already running"):
+            controller.start("@claude ordinary review")
+        with pytest.raises(ChatError, match="already running"):
+            controller.start_anneal("@claude,@grok again")
+        assert controller.is_active()
+        assert "Anneal:" in controller.status()
+    finally:
+        client.release.set()
+    assert controller.wait(timeout=2)
+    assert controller.status() == "Anneal complete."
+
+
+@pytest.mark.parametrize(
+    "phase,marker",
+    [
+        ("blind", "Question for independent review"),
+        ("challenge", "the critic in a two-participant anneal"),
+        ("final", "the sole final author in a two-participant anneal"),
+    ],
+)
+def test_cancel_stops_anneal_at_each_phase(tmp_path: Path, phase: str, marker: str) -> None:
+    class PhaseGateClient(AnnealClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.phase_started = threading.Event()
+
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            if marker in prompt:
+                self._record(target, prompt, timeout_ms)
+                self.phase_started.set()
+                assert cancel_event is not None
+                while not cancel_event.wait(timeout=0.01):
+                    pass
+                raise ChatError("review cancelled")
+            return super().turn(target, prompt, timeout_ms, cancel_event)
+
+    client = PhaseGateClient()
+    chat, transcript = make_anneal_chat(tmp_path, client, f"cancel-{phase}-room")
+    controller = ReviewController(chat)
+    try:
+        controller.start_anneal("@claude,@grok Harden this plan")
+        assert client.phase_started.wait(timeout=2)
+        assert controller.cancel() == "Cancellation requested."
+        assert controller.wait(timeout=2)
+    finally:
+        client.phase_started.set()
+
+    kinds = [item["kind"] for item in transcript.read()]
+    assert "anneal_final" not in kinds
+    if phase in ("blind", "challenge"):
+        assert "anneal_challenge" not in kinds
+    if phase == "blind":
+        assert "review_synthesis" not in kinds
+    assert controller.status() == "Anneal cancelled."
+
+
+def test_retry_is_rejected_after_anneal_until_a_later_review(tmp_path: Path) -> None:
+    client = AnnealClient()
+    chat, _ = make_anneal_chat(tmp_path, client, "retry-room")
+    controller = ReviewController(chat)
+    controller.start_anneal("@claude,@grok Harden this plan")
+    assert controller.wait(timeout=2)
+    for target in ("claude", "grok", "synthesis"):
+        with pytest.raises(ChatError, match="review-only"):
+            controller.retry(target)
+
+    client.fail_next_review_blind = True
+    client.single_blind = True
+    controller.start("@claude ordinary review")
+    assert controller.wait(timeout=2)
+    assert controller.retry("claude") == "Retrying @claude."
+    assert controller.wait(timeout=2)
+    assert controller.status() == "Review complete."
+
+
+def test_once_anneal_runs_synchronously_through_group_chat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorded: dict[str, str] = {}
+
+    def fake_anneal(self: GroupChat, text: str) -> object:
+        recorded["text"] = text
+        return None
+
+    monkeypatch.setattr(GroupChat, "anneal", fake_anneal)
+    monkeypatch.delenv("HERDR_GROUP_CHAT_SETUP_FAILURES", raising=False)
+
+    code = main(
+        [
+            "--room",
+            "once-room",
+            "--state-dir",
+            str(tmp_path),
+            "--once",
+            "/anneal @pi,@claude anneal once",
+        ]
+    )
+
+    assert code == 0
+    assert recorded["text"] == "@pi,@claude anneal once"
+
+
+def test_inbox_keeps_anneal_final_and_attention_but_drops_challenge() -> None:
+    messages = [
+        {
+            "seq": 1,
+            "sender": "claude",
+            "kind": "review_synthesis",
+            "body": "provisional",
+            "provisional": True,
+        },
+        {"seq": 2, "sender": "pi", "kind": "review_synthesis", "body": "ordinary synthesis"},
+        {"seq": 3, "sender": "grok", "kind": "anneal_challenge", "body": "challenge"},
+        {"seq": 4, "sender": "claude", "kind": "anneal_final", "body": "final"},
+        {
+            "seq": 5,
+            "sender": "system",
+            "kind": "review_status",
+            "body": "@grok anneal challenge failed: boom",
+        },
+        {"seq": 6, "sender": "system", "kind": "review_status", "body": "quiet update"},
+    ]
+
+    assert [item["seq"] for item in inbox_messages(messages)] == [2, 4, 5]
+
+
+def test_inbox_after_anneal_keeps_only_the_final_not_the_provisional_synthesis(
+    tmp_path: Path,
+) -> None:
+    client = AnnealClient()
+    chat, transcript = make_anneal_chat(tmp_path, client, "inbox-anneal-room")
+
+    chat.anneal("@claude,@grok Harden this plan")
+
+    inbox = inbox_messages(transcript.read())
+    assert [item["kind"] for item in inbox] == ["anneal_final"]
+    assert inbox[0]["sender"] == "claude"
+    assert inbox[0]["body"] == "final from claude-peer"
+
+
+def test_anneal_command_wiring_rejects_before_any_transcript_mutation(tmp_path: Path) -> None:
+    chat, _, transcript = make_chat(tmp_path)
+    controller = ReviewController(chat)
+
+    assert handle_local_command("/anneal", chat, None) == "Review control is unavailable."
+    assert handle_local_command("/anneal", chat, controller) == (
+        "Usage: /anneal @author,@critic QUESTION"
+    )
+    assert handle_local_command("/annealx hi", chat, controller) == "Unknown command. Use /help."
+    for bad in ("/anneal @pi,@pi hi", "/anneal @pi,@claude,@grok hi", "/anneal @gemini,@pi hi"):
+        with pytest.raises(ChatError):
+            handle_local_command(bad, chat, controller)
+    assert transcript.read() == []

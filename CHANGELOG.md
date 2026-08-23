@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Add `/anneal @author,@critic QUESTION`: a thin two-participant composition over
+  the existing review round. Both participants answer blind and concurrently, the
+  author synthesizes provisionally, the critic appends one `anneal_challenge`,
+  and the author alone appends `anneal_final`. Anneal reuses the single review
+  controller (`/cancel` at any phase, ordinary-message exclusion) and a missing
+  blind reply stops the round without synthesis; `/retry` stays review-only
+  until a later ordinary review replaces the last round. The inbox keeps
+  `anneal_final` and attention-bearing failures.
+
 ## [0.4.0] - 2026-08-24
 
 - Add an experimental Orca adapter that reuses the transcript, routing, review,
