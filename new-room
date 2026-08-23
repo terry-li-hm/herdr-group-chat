@@ -310,6 +310,7 @@ HOOK_DIALOG_NEEDLE = "trust all"
 HOOK_MENU_NEEDLE = "continue without trusting"
 HOOK_DISMISS_ATTEMPTS = 10
 HOOK_DISMISS_INTERVAL_S = 1.0
+HOOK_DISMISS_TIMEOUT_S = 5.0
 
 
 def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> None:
@@ -321,23 +322,35 @@ def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> Non
     emits raw terminal text rather than a JSON envelope, so the screen is read
     through the raw-text command helper. Hooks stay inactive: the summary notice
     is closed with esc, and the menu variant is answered with
-    "Continue without trusting".
+    "Continue without trusting". Every pane read, retry sleep, and key send
+    draws on one monotonic deadline, so slow-but-successful reads cannot hold
+    the launcher lock for minutes; an expired deadline returns quietly with
+    the notice left untrusted.
     """
+    deadline = time.monotonic() + HOOK_DISMISS_TIMEOUT_S
     for attempt in range(HOOK_DISMISS_ATTEMPTS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
         text = run_text(
             herdr_bin,
             ["pane", "read", pane_id, "--source", "visible", "--lines", "80"],
+            timeout=remaining,
         )
         lowered = text.lower()
         if HOOK_DIALOG_NEEDLE not in lowered:
             if attempt + 1 < HOOK_DISMISS_ATTEMPTS:
-                time.sleep(HOOK_DISMISS_INTERVAL_S)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                time.sleep(min(HOOK_DISMISS_INTERVAL_S, remaining))
             continue
-        if HOOK_MENU_NEEDLE in lowered:
-            for key in ("down", "down", "enter"):
-                run_json(herdr_bin, ["agent", "send-keys", name, key])
-        else:
-            run_json(herdr_bin, ["agent", "send-keys", name, "esc"])
+        keys = ("down", "down", "enter") if HOOK_MENU_NEEDLE in lowered else ("esc",)
+        for key in keys:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            run_json(herdr_bin, ["agent", "send-keys", name, key], timeout=remaining)
         print("notice @codex unreviewed hooks left inactive", flush=True)
         return
 

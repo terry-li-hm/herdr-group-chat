@@ -8,6 +8,7 @@ import sys
 from collections.abc import Callable
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
+from itertools import pairwise
 from pathlib import Path
 from threading import Event, Thread
 
@@ -912,6 +913,107 @@ def test_pane_read_follows_herdrs_raw_text_cli_contract(
     module.dismiss_inactive_hook_notice(str(herdr), "codex-peer", "w-agents:p-codex")
 
     assert sent_keys.read_text(encoding="utf-8").splitlines() == ["down", "down", "enter"]
+
+
+def test_hook_notice_reads_and_sleeps_share_one_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One monotonic deadline bounds every pane read, retry sleep, and key send."""
+    calls: list[list[str]] = []
+    time_now = [0.0]
+    read_budgets: list[float] = []
+    sleeps: list[float] = []
+
+    def fake_run_text(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
+        calls.append(arguments)
+        read_budgets.append(timeout or 0.0)
+        time_now[0] += 0.6
+        return ""
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        return {"result": {"type": "ok"}}
+
+    def fake_sleep(duration: float) -> None:
+        sleeps.append(duration)
+        time_now[0] += duration
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: time_now[0])
+    monkeypatch.setattr(module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(module, "run_text", fake_run_text)
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+
+    module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
+
+    reads = [call for call in calls if call[:2] == ["pane", "read"]]
+    # 0.6 s reads + 1.0 s sleeps exhaust the 5 s budget before the 10-attempt ceiling.
+    assert len(reads) == 4
+    assert not any(call[:2] == ["agent", "send-keys"] for call in calls)
+    assert read_budgets == pytest.approx([5.0, 3.4, 1.8, 0.2])
+    assert all(earlier > later for earlier, later in pairwise(read_budgets))
+    assert sleeps == pytest.approx([1.0, 1.0, 1.0])
+
+
+def test_hook_notice_send_keys_receive_the_remaining_shared_budget(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[list[str]] = []
+    budgets: list[float] = []
+    time_now = [0.0]
+
+    def fake_run_text(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
+        del timeout
+        calls.append(arguments)
+        time_now[0] += 0.5
+        return HOOK_MENU_SCREEN
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        calls.append(arguments)
+        budgets.append(timeout or 0.0)
+        time_now[0] += 0.5
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: time_now[0])
+    monkeypatch.setattr(module, "run_text", fake_run_text)
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+
+    module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
+
+    assert [call[-1] for call in calls[1:]] == ["down", "down", "enter"]
+    assert budgets == pytest.approx([4.5, 4.0, 3.5])
+    assert all(earlier > later for earlier, later in pairwise(budgets))
+    assert "unreviewed hooks left inactive" in capsys.readouterr().out
+
+
+def test_hook_notice_deadline_expiry_sends_no_further_key(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[list[str]] = []
+    time_now = [0.0]
+
+    def fake_run_text(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
+        del timeout
+        calls.append(arguments)
+        time_now[0] = 4.0
+        return HOOK_MENU_SCREEN
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        time_now[0] += 0.75
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: time_now[0])
+    monkeypatch.setattr(module, "run_text", fake_run_text)
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+
+    module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
+
+    # The menu was found at 4.0 s; two key sends fit, the third does not, and the
+    # confirming enter is never sent, so nothing is trusted.
+    assert [call[-1] for call in calls[1:]] == ["down", "down"]
+    assert capsys.readouterr().out == ""
 
 
 def test_started_participant_tabs_are_labeled_for_group_chat(
