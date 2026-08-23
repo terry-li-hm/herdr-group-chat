@@ -308,7 +308,11 @@ class HerdrClient:
             process.communicate(timeout=1)
         except subprocess.TimeoutExpired:
             process.kill()
-            process.communicate()
+            try:
+                process.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                # An unkillable process must never hang the caller; give up on reaping.
+                return
 
     def _run_interruptible(
         self,
@@ -956,6 +960,21 @@ class GroupChat:
                 "system",
                 ("human",),
                 f"@{agent} review {state.replace('_', ' ')}: {error}",
+                kind="review_status",
+                round_id=review.id,
+            )
+            return
+        except Exception as error:
+            # An unexpected crash in one reviewer's relay must not abort the
+            # as_completed drain: the peers' already-completed results survive,
+            # synthesis still runs, and only this reviewer is marked failed.
+            # BaseException subclasses (KeyboardInterrupt, SystemExit) still
+            # propagate untouched.
+            self._set_review_state(review, agent, "failed", on_state)
+            self.transcript.append(
+                "system",
+                ("human",),
+                f"@{agent} review failed: unexpected {error!r}",
                 kind="review_status",
                 round_id=review.id,
             )

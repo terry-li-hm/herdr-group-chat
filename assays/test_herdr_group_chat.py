@@ -748,6 +748,44 @@ def test_review_timeout_is_visible_and_does_not_block_other_agents(tmp_path: Pat
     assert "reply from codex-peer" in client.calls[-1][1]
 
 
+def test_unexpected_reviewer_error_still_drains_peers_and_synthesizes(tmp_path: Path) -> None:
+    class CrashingClient(FakeClient):
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            if target == "claude-peer" and "Question for independent review" in prompt:
+                raise RuntimeError("relay exploded")
+            return super().turn(target, prompt, timeout_ms, cancel_event)
+
+    transcript = Transcript(tmp_path, "crash-room")
+    client = CrashingClient()
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        client,
+    )
+
+    review = chat.review("@claude,@codex Check the invariant")
+
+    assert review.states["claude"] == "failed"
+    assert review.states["codex"] == "done"
+    assert review.states["pi"] == "done"
+    statuses = [item for item in transcript.read() if item["kind"] == "review_status"]
+    assert len(statuses) == 1
+    assert statuses[0]["sender"] == "system"
+    assert "RuntimeError" in statuses[0]["body"]
+    assert "relay exploded" in statuses[0]["body"]
+    assert review.responses == {"codex": "reply from codex-peer"}
+    synthesis_prompt = client.calls[-1][1]
+    assert "[" + "@claude] (no usable response)" in synthesis_prompt
+    assert "reply from codex-peer" in synthesis_prompt
+    assert review.synthesis == "reply from pi-peer"
+
+
 def test_review_controller_is_non_blocking_and_cancels_exact_active_target(
     tmp_path: Path,
 ) -> None:
@@ -1256,6 +1294,34 @@ def test_herdr_submission_process_is_terminated_on_immediate_cancel() -> None:
         ["agent", "prompt"],
         ["agent", "send-keys"],
     ]
+
+
+def test_herdr_stop_process_returns_after_a_second_communicate_timeout() -> None:
+    class StubbornProcess:
+        def __init__(self) -> None:
+            self.returncode = 0
+            self.terminated = False
+            self.killed = False
+            self.communicate_timeouts: list[float | None] = []
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            self.communicate_timeouts.append(timeout)
+            raise subprocess.TimeoutExpired("herdr-test", timeout)
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = StubbornProcess()
+
+    HerdrClient._stop_process(process)
+
+    assert process.terminated
+    assert process.killed
+    assert len(process.communicate_timeouts) == 2
+    assert all(timeout is not None and timeout > 0 for timeout in process.communicate_timeouts)
 
 
 def test_herdr_turn_timeout_interrupts_active_target(monkeypatch: pytest.MonkeyPatch) -> None:
