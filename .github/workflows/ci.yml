@@ -25,6 +25,6 @@ jobs:
       - run: uv sync --locked
       - run: uv lock --check
       - run: uv run pytest -q
-      - run: uv run ruff check herdr-group-chat new-room assays
-      - run: uv run ruff format --check herdr-group-chat new-room assays
-      - run: test -x herdr-group-chat && test -x new-room
+      - run: uv run ruff check herdr-group-chat new-room orca-group-chat assays
+      - run: uv run ruff format --check herdr-group-chat new-room orca-group-chat assays
+      - run: test -x herdr-group-chat && test -x new-room && test -x orca-group-chat
