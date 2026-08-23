@@ -409,7 +409,8 @@ class HerdrClient:
                 self._cancel_if_working(target, None)
                 raise
             try:
-                status = json.loads(result.stdout)["result"]["agent"]["agent_status"]
+                agent_info = json.loads(result.stdout)["result"]["agent"]
+                status = agent_info["agent_status"]
             except (json.JSONDecodeError, KeyError, TypeError) as error:
                 self._cancel_if_working(target, None)
                 raise ChatError(f"Herdr returned an invalid result for {target}") from error
@@ -423,6 +424,13 @@ class HerdrClient:
             elif status in {"idle", "done"} and (
                 saw_working or time.monotonic() - submitted_at >= SUBMIT_GRACE_S
             ):
+                # A verified Claude target with an exact session record gets
+                # the clean transcript before any terminal capture, so TUI
+                # artifacts (and refused or slow captures) cannot contaminate
+                # the reply.
+                reply = self._local_claude_reply(target, reply_marker_id, agent_info)
+                if reply is not None:
+                    return status, reply
                 terminal = self._read_terminal(target, timeout=remaining)
                 if terminal is None:
                     stable_unmarked = 0
@@ -433,9 +441,9 @@ class HerdrClient:
                     try:
                         return status, extract_reply(terminal, reply_marker_id)
                     except ChatError:
-                        reply = self._local_grok_reply(target, reply_marker_id)
-                        if reply is not None:
-                            return status, reply
+                        grok_reply = self._local_grok_reply(target, reply_marker_id)
+                        if grok_reply is not None:
+                            return status, grok_reply
                     if saw_working and terminal == last_unmarked_read:
                         stable_unmarked += 1
                     else:
@@ -491,6 +499,36 @@ class HerdrClient:
         with suppress(ChatError):
             self.cancel(target)
 
+    def _local_claude_reply(
+        self, target: str, token: str, agent: dict[str, Any] | None = None
+    ) -> str | None:
+        """Recover a Claude reply from its exact session transcript.
+
+        Claude's TUI can render collapsed prompt-summary lines between the reply
+        markers, so the clean session JSONL is preferred when Herdr's metadata
+        names the exact session. Only that one derived path is read.
+        """
+        try:
+            if agent is None:
+                result = self._run(["agent", "get", target])
+                agent = json.loads(result.stdout)["result"]["agent"]
+            session = agent["agent_session"]
+            if agent["agent"] != "claude" or session["source"] != "herdr:claude":
+                return None
+            session_id = str(session["value"])
+            if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", session_id):
+                return None
+            session_file = (
+                Path.home()
+                / ".claude"
+                / "projects"
+                / claude_project_dir_name(str(agent["cwd"]))
+                / f"{session_id}.jsonl"
+            )
+            return extract_claude_session_reply(session_file, token)
+        except (ChatError, KeyError, TypeError, json.JSONDecodeError, OSError):
+            return None
+
     def _local_grok_reply(self, target: str, token: str) -> str | None:
         """Recover a Grok reply hidden above its alternate-screen viewport."""
         try:
@@ -526,6 +564,40 @@ def extract_reply(terminal: str, token: str) -> str:
     if not body:
         raise ChatError("agent returned an empty response")
     return body
+
+
+def claude_project_dir_name(cwd: str) -> str:
+    """Encode a working directory as a Claude Code project directory name.
+
+    Claude Code keeps ASCII letters, digits, and hyphens and replaces every
+    other path character (including `/`, `.`, `_`, and spaces) with `-`.
+    """
+    return re.sub(r"[^A-Za-z0-9-]", "-", cwd)
+
+
+def extract_claude_session_reply(session_file: Path, token: str) -> str:
+    """Extract the token-bound reply from Claude's exact session JSONL."""
+    if not session_file.is_file():
+        raise ChatError("Claude session transcript is unavailable")
+    for line in reversed(session_file.read_text(encoding="utf-8", errors="replace").splitlines()):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict) or record.get("type") != "assistant":
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        blocks = content if isinstance(content, list) else [content]
+        for block in blocks:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                try:
+                    return extract_reply(block["text"], token)
+                except ChatError:
+                    continue
+    raise ChatError("Claude session response marker was not found")
 
 
 def extract_grok_session_reply(session_dir: Path, token: str) -> str:

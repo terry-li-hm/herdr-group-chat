@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -29,6 +30,8 @@ Route = namespace["Route"]
 Transcript = namespace["Transcript"]
 extract_reply = namespace["extract_reply"]
 extract_grok_session_reply = namespace["extract_grok_session_reply"]
+extract_claude_session_reply = namespace.get("extract_claude_session_reply")
+claude_project_dir_name = namespace.get("claude_project_dir_name")
 build_prompt = namespace["build_prompt"]
 build_review_prompt = namespace["build_review_prompt"]
 build_synthesis_prompt = namespace["build_synthesis_prompt"]
@@ -339,6 +342,261 @@ def test_extract_grok_session_reply_recovers_hidden_alternate_screen_output(
     )
 
     assert extract_grok_session_reply(session_dir, token) == "recovered Grok reply"
+
+
+def write_claude_session(projects: Path, cwd: str, session_id: str, token: str) -> Path:
+    """Create a synthetic Claude session JSONL under ~/.claude/projects."""
+    session_dir = projects / claude_project_dir_name(cwd)
+    session_dir.mkdir(parents=True)
+    session_file = session_dir / f"{session_id}.jsonl"
+    records = [
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": (
+                    "\u276f You are @claude, a full participant in a local group chat\n"
+                    "HGCHAT_REPLY_BEGIN " + token
+                ),
+            },
+        },
+        {"type": "summary", "summary": "collapsed prompt summary"},
+        {"not": "a real record"},
+        "not json at all",
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "thinking about "},
+                    {"type": "tool_use", "name": "Read", "input": {}},
+                    {
+                        "type": "text",
+                        "text": (
+                            "HGCHAT_REPLY_BEGIN "
+                            + token
+                            + "\nclean Claude reply\nHGCHAT_REPLY_END "
+                            + token
+                        ),
+                    },
+                ],
+            },
+        },
+    ]
+    session_file.write_text(
+        "\n".join(record if isinstance(record, str) else json.dumps(record) for record in records)
+        + "\n",
+        encoding="utf-8",
+    )
+    return session_file
+
+
+def test_extract_claude_session_reply_prefers_clean_transcript_over_tui_artifact(
+    tmp_path: Path,
+) -> None:
+    assert extract_claude_session_reply is not None
+    token = "c" * 32
+    cwd = "/work space/herdr_rooms/claude-room"
+    session_id = "11111111-2222-3333-4444-555555555555"
+    session_file = write_claude_session(tmp_path / ".claude" / "projects", cwd, session_id, token)
+
+    assert extract_claude_session_reply(session_file, token) == "clean Claude reply"
+
+
+def test_extract_claude_session_reply_fails_closed_on_missing_or_markerless_sessions(
+    tmp_path: Path,
+) -> None:
+    assert extract_claude_session_reply is not None
+    token = "d" * 32
+    missing = tmp_path / "absent.jsonl"
+    markerless = tmp_path / "markerless.jsonl"
+    markerless.write_text(
+        '{"type":"assistant","message":{"role":"assistant","content":'
+        '[{"type":"text","text":"no markers here"}]}}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ChatError):
+        extract_claude_session_reply(missing, token)
+    with pytest.raises(ChatError):
+        extract_claude_session_reply(markerless, token)
+
+
+def test_turn_prefers_exact_claude_session_over_contaminated_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verified Claude target must return the clean session reply even when
+    the terminal capture itself contains both markers plus a TUI artifact."""
+    token = "7" * 32
+    cwd = "/work space/herdr_rooms/claude-room"
+    session_id = "99999999-8888-7777-6666-555555555555"
+    write_claude_session(tmp_path / ".claude" / "projects", cwd, session_id, token)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    agent_meta = {
+        "agent": "claude",
+        "agent_session": {"source": "herdr:claude", "value": session_id},
+        "cwd": cwd,
+    }
+    statuses = ["working", "idle"]
+    calls: list[list[str]] = []
+
+    class FakeCompleted:
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+            self.stderr = ""
+            self.returncode = 0
+
+    def fake_run(arguments: list[str], timeout: float = 30, **_kwargs: object) -> FakeCompleted:
+        calls.append(list(arguments))
+        if arguments[1:3] == ["agent", "get"]:
+            status = statuses.pop(0) if statuses else "idle"
+            return FakeCompleted(
+                json.dumps({"result": {"agent": {"agent_status": status, **agent_meta}}})
+            )
+        if arguments[1:3] == ["agent", "read"]:
+            return FakeCompleted(
+                f"HGCHAT_REPLY_BEGIN {token}\n"
+                "\u276f You are @claude, a full participant in a local group chat\n"
+                f"HGCHAT_REPLY_END {token}\n"
+            )
+        raise AssertionError(f"unexpected herdr call: {arguments}")
+
+    client = HerdrClient(runner=fake_run)
+    monkeypatch.setattr(client, "_run_interruptible", lambda arguments, cancel_event, timeout: None)
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    prompt = f"HGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}"
+
+    status, body = client.turn("claude-peer", prompt, timeout_ms=5_000)
+
+    assert status == "idle"
+    assert body == "clean Claude reply"
+    # Direct terminal extraction of the same contaminated capture would include
+    # the prompt-summary artifact, proving the clean session was preferred.
+    assert "You are @claude" in extract_reply(
+        f"HGCHAT_REPLY_BEGIN {token}\n"
+        "\u276f You are @claude, a full participant in a local group chat\n"
+        f"HGCHAT_REPLY_END {token}\n",
+        token,
+    )
+    # The exact session is preferred before the terminal is read at all.
+    assert not any(call[1:3] == ["agent", "read"] for call in calls)
+
+
+def test_turn_falls_back_to_terminal_when_claude_session_is_markerless(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "8" * 32
+    cwd = "/work space/herdr_rooms/claude-room"
+    session_id = "12345678-1234-1234-1234-123456789012"
+    session_dir = tmp_path / ".claude" / "projects" / claude_project_dir_name(cwd)
+    session_dir.mkdir(parents=True)
+    (session_dir / f"{session_id}.jsonl").write_text(
+        '{"type":"assistant","message":{"role":"assistant",'
+        '"content":[{"type":"text","text":"no markers here"}]}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    terminal = f"HGCHAT_REPLY_BEGIN {token}\nterminal reply\nHGCHAT_REPLY_END {token}\n"
+
+    class FakeCompleted:
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+            self.stderr = ""
+            self.returncode = 0
+
+    def fake_run(arguments: list[str], timeout: float = 30, **_kwargs: object) -> FakeCompleted:
+        if arguments[1:3] == ["agent", "get"]:
+            return FakeCompleted(
+                json.dumps(
+                    {
+                        "result": {
+                            "agent": {
+                                "agent_status": "done",
+                                "agent": "claude",
+                                "agent_session": {
+                                    "source": "herdr:claude",
+                                    "value": session_id,
+                                },
+                                "cwd": cwd,
+                            }
+                        }
+                    }
+                )
+            )
+        if arguments[1:3] == ["agent", "read"]:
+            return FakeCompleted(terminal)
+        raise AssertionError(f"unexpected herdr call: {arguments}")
+
+    client = HerdrClient(runner=fake_run)
+    monkeypatch.setattr(client, "_run_interruptible", lambda arguments, cancel_event, timeout: None)
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    prompt = f"HGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}"
+
+    status, body = client.turn("claude-peer", prompt, timeout_ms=5_000)
+
+    assert (status, body) == ("done", "terminal reply")
+
+
+def test_local_claude_reply_uses_exact_session_and_groks_fall_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = HerdrClient(runner=object)  # _run is stubbed below
+    token = "f" * 32
+    cwd = "/work space/herdr_rooms/claude-room"
+    session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    write_claude_session(tmp_path / ".claude" / "projects", cwd, session_id, token)
+
+    def fake_run(arguments: list[str], timeout: float = 30) -> object:
+        assert arguments[:2] == ["agent", "get"]
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps(
+                {
+                    "result": {
+                        "agent": {
+                            "agent": "claude",
+                            "agent_session": {
+                                "source": "herdr:claude",
+                                "value": session_id,
+                            },
+                            "cwd": cwd,
+                        }
+                    }
+                }
+            ),
+        )
+
+    monkeypatch.setattr(client, "_run", fake_run)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert client._local_claude_reply("claude-peer", token) == "clean Claude reply"
+
+    # Non-Claude or wrong-source metadata never touches the filesystem.
+    grok_meta = json.dumps(
+        {
+            "result": {
+                "agent": {
+                    "agent": "grok",
+                    "agent_session": {
+                        "source": "herdr:grok",
+                        "value": session_id,
+                    },
+                    "cwd": cwd,
+                }
+            }
+        }
+    )
+
+    def grok_run(arguments: list[str], timeout: float = 30) -> object:
+        return subprocess.CompletedProcess([], 0, stdout=grok_meta)
+
+    monkeypatch.setattr(client, "_run", grok_run)
+    assert client._local_claude_reply("grok-peer", token) is None
 
 
 def test_missing_live_agent_fails_before_writing(tmp_path: Path) -> None:
