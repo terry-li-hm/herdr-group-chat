@@ -44,6 +44,11 @@ resolve_state_dir = namespace["resolve_state_dir"]
 participant_status = namespace["participant_status"]
 handle_local_command = namespace["handle_local_command"]
 handle_view_command = namespace["handle_view_command"]
+mention_fragment = namespace["mention_fragment"]
+mention_suggestions = namespace["mention_suggestions"]
+complete_mention = namespace["complete_mention"]
+mention_display = namespace["mention_display"]
+handle_picker_key = namespace["handle_picker_key"]
 inbox_messages = namespace["inbox_messages"]
 inbox_rendered_lines = namespace["inbox_rendered_lines"]
 visible_message_lines = namespace["visible_message_lines"]
@@ -2385,3 +2390,102 @@ def test_receipt_dedupe_uses_exact_structured_metadata_not_profile_alone(
         normalized(receipt),
         normalized(changed_effort),
     ]
+
+
+DEFAULT_ROSTER = ("pi", "claude", "codex", "grok")
+SOL_FABLE_ROSTER = ("sol", "fable")
+
+
+def test_picker_opens_at_start_of_line_and_filters_case_insensitively() -> None:
+    assert mention_suggestions("@", DEFAULT_ROSTER) == (*DEFAULT_ROSTER, "all")
+    assert mention_suggestions("@CO", DEFAULT_ROSTER) == ("codex",)
+    assert mention_suggestions("@sol", SOL_FABLE_ROSTER) == ("sol",)
+
+
+def test_review_includes_all_but_anneal_hides_it() -> None:
+    assert "all" in (mention_suggestions("/review @", DEFAULT_ROSTER) or ())
+    assert mention_suggestions("/anneal @", DEFAULT_ROSTER) == DEFAULT_ROSTER
+    assert "all" not in (mention_suggestions("/anneal @", DEFAULT_ROSTER) or ())
+
+
+def test_anneal_second_mention_offers_only_the_remaining_role() -> None:
+    assert mention_suggestions("/anneal @sol,@", SOL_FABLE_ROSTER) == ("fable",)
+    assert mention_suggestions("/anneal @fable,@", SOL_FABLE_ROSTER) == ("sol",)
+
+
+def test_emails_and_mid_draft_mentions_never_open_the_picker() -> None:
+    for text in ("user@host", "hello @pi", "/review @pi question @codex", "x@y hi"):
+        assert mention_fragment(text) is None, text
+        assert mention_suggestions(text, DEFAULT_ROSTER) is None, text
+
+
+def test_a_comma_alone_does_not_open_the_picker() -> None:
+    assert mention_fragment("@sol,") is None
+    assert mention_suggestions("@pi,", DEFAULT_ROSTER) is None
+
+
+def test_tab_completion_replaces_only_the_active_fragment_without_a_space() -> None:
+    assert complete_mention("@cl", "claude") == "@claude"
+    assert complete_mention("/anneal @sol,@fab", "fable") == "/anneal @sol,@fable"
+    assert not complete_mention("@co", "codex").endswith(" ")
+    # An already-selected handle stays excluded from the next fragment's roster.
+    assert mention_suggestions("/anneal @sol,@", SOL_FABLE_ROSTER) == ("fable",)
+
+
+def test_esc_and_enter_leave_the_buffer_untouched() -> None:
+    suggestions = mention_suggestions("@co", DEFAULT_ROSTER)
+    assert suggestions == ("codex",)
+    escaped = handle_picker_key("@co", "ESC", suggestions, 0)
+    assert escaped == ("@co", 0)
+    # ENTER is not consumed by the picker, so submission sees the exact buffer.
+    assert handle_picker_key("@co", "ENTER", suggestions, 0) is None
+
+
+def test_up_down_selection_cycles_through_candidates() -> None:
+    suggestions = mention_suggestions("/anneal @", SOL_FABLE_ROSTER)
+    assert suggestions == ("sol", "fable")
+    assert handle_picker_key("/anneal @", "DOWN", suggestions, 0) == ("/anneal @", 1)
+    assert handle_picker_key("/anneal @", "UP", suggestions, 0) == ("/anneal @", 1)
+    assert mention_display(suggestions, 0) == "Mentions: [@sol] @fable"
+    assert mention_display(suggestions, 1) == "Mentions: @sol [@fable]"
+
+
+def test_parse_route_is_unchanged_for_picker_completed_inputs() -> None:
+    assert parse_route("@claude hi there", DEFAULT_ROSTER) == Route(("claude",), "hi there")
+    assert parse_route("@all hi", DEFAULT_ROSTER) == Route(DEFAULT_ROSTER, "hi")
+    assert parse_route("@codex q", DEFAULT_ROSTER) == Route(("codex",), "q")
+    assert parse_anneal("@sol,@fable QUESTION", SOL_FABLE_ROSTER) == (
+        "sol",
+        "fable",
+        "QUESTION",
+    )
+    with pytest.raises(ChatError):
+        parse_route("@nope q", SOL_FABLE_ROSTER)
+
+
+def test_candidate_rosters_come_from_actual_room_participants(tmp_path: Path) -> None:
+    chat, _, _ = make_chat(tmp_path)
+    assert mention_suggestions("@", tuple(chat.agents)) == (*DEFAULT_ROSTER, "all")
+    profile_chat, _, _ = make_chat(tmp_path)
+    profile_chat.agents = {"sol": "sol-peer", "fable": "fable-peer"}
+    assert mention_suggestions("/anneal @", tuple(profile_chat.agents)) == ("sol", "fable")
+
+
+def test_tab_closes_the_fragment_and_fresh_mention_after_comma_reopens() -> None:
+    completed = handle_picker_key("/anneal @so", "TAB", ("sol", "fable"), 0)
+    assert completed == ("/anneal @sol", 0)
+    # The completed fragment is closed, but a later comma plus fresh @ reopens
+    # with the remaining role only.
+    assert mention_suggestions("/anneal @sol,@", SOL_FABLE_ROSTER) == ("fable",)
+
+
+def test_esc_closes_an_unmatched_query_without_changing_text() -> None:
+    assert mention_suggestions("@zzz", DEFAULT_ROSTER) == ()
+    assert handle_picker_key("@zzz", "ESC", (), 0) == ("@zzz", 0)
+
+
+def test_tab_on_an_unmatched_query_closes_without_changing_text() -> None:
+    assert handle_picker_key("@zzz", "TAB", (), 0) == ("@zzz", 0)
+    # Up/Down remain no-ops with no suggestions.
+    assert handle_picker_key("@zzz", "UP", (), 0) is None
+    assert handle_picker_key("@zzz", "DOWN", (), 0) is None

@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Add a presentation-only mention picker in the TUI. Typing `@` at the start
+  of the routing token (line start, right after exact `/review `/`/anneal `,
+  or right after a comma still inside that token) shows the live handles on
+  the status row; prose, emails, and bare commas never open it. Typing filters
+  case-insensitively, Up/Down cycle, Tab replaces only the active `@query`
+  fragment with no trailing space, Esc closes byte-identical, and Enter keeps
+  normal submission. Already selected handles are excluded from subsequent
+  suggestions, `@all` is offered for ordinary messages and `/review` but hidden
+  for `/anneal`, and candidate rosters derive from `tuple(chat.agents)` so
+  profile rooms show exactly `@sol`/`@fable`. `parse_route`, `parse_anneal`,
+  routing maps, and profile verification are unchanged.
+
 - Add the bounded `sol-fable` model profile, selected by `new-room --launch
   --profile sol-fable` or the `New Sol + Fable chat` action. The room is
   atomic: it opens only when both exact ordered participants verify — `@sol`

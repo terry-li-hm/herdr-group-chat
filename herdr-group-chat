@@ -1547,6 +1547,91 @@ def visible_wrapped_lines(
     return lines[start:end], max_offset
 
 
+MENTION_COMMAND_PREFIXES = ("/review ", "/anneal ")
+MENTION_NAME_RE = re.compile(r"@([a-z0-9_-]+)", re.IGNORECASE)
+
+
+def mention_fragment(buffer: str) -> tuple[int, str] | None:
+    """Locate the active trailing `@query` fragment in the routing prefix, if any.
+
+    The fragment must start the recipient token (beginning of the line, right
+    after the exact `/review `/`/anneal ` prefix, or right after a comma still
+    inside that unbroken token). Prose, emails, and a bare trailing comma never
+    open the picker.
+    """
+    prefix_len = next(
+        (len(prefix) for prefix in MENTION_COMMAND_PREFIXES if buffer.startswith(prefix)), 0
+    )
+    token = buffer[prefix_len:]
+    if " " in token or "\t" in token:
+        return None
+    base = token.rfind(",") + 1
+    if token[base : base + 1] != "@":
+        return None
+    return prefix_len + base, token[base + 1 :]
+
+
+def mention_suggestions(buffer: str, participants: Sequence[str]) -> tuple[str, ...] | None:
+    """Filter the live roster for the active fragment; None when no fragment is open."""
+    fragment = mention_fragment(buffer)
+    if fragment is None:
+        return None
+    start, query = fragment
+    already = {name.lower() for name in MENTION_NAME_RE.findall(buffer[:start])}
+    candidates = tuple(participants)
+    if not buffer.startswith("/anneal "):
+        candidates += ("all",)
+    lowered = query.lower()
+    return tuple(
+        name
+        for name in candidates
+        if name.lower() not in already and name.lower().startswith(lowered)
+    )
+
+
+def complete_mention(buffer: str, handle: str) -> str:
+    """Replace only the active `@query` fragment with `@handle`; no trailing space."""
+    fragment = mention_fragment(buffer)
+    if fragment is None:
+        return buffer
+    return buffer[: fragment[0]] + "@" + handle
+
+
+def mention_display(suggestions: Sequence[str], index: int) -> str:
+    if not suggestions:
+        return ""
+    selected = index % len(suggestions)
+    labels = [
+        f"[@{name}]" if position == selected else f"@{name}"
+        for position, name in enumerate(suggestions)
+    ]
+    return "Mentions: " + " ".join(labels)
+
+
+def handle_picker_key(
+    buffer: str, key: str, suggestions: Sequence[str], index: int
+) -> tuple[str, int] | None:
+    """Handle one picker key; returns (buffer, index) when consumed, else None.
+
+    Up/Down need a non-empty suggestion list; Esc and Tab close even an
+    unmatched fragment. ENTER is deliberately not consumed here so normal
+    submission is unchanged.
+    """
+    if not suggestions and key not in {"ESC", "TAB"}:
+        return None
+    if key == "UP":
+        return buffer, (index - 1) % len(suggestions)
+    if key == "DOWN":
+        return buffer, (index + 1) % len(suggestions)
+    if key == "TAB":
+        if not suggestions:
+            return buffer, index
+        return complete_mention(buffer, suggestions[index % len(suggestions)]), 0
+    if key == "ESC":
+        return buffer, index
+    return None
+
+
 class ReviewController:
     def __init__(self, chat: GroupChat) -> None:
         self.chat = chat
@@ -1708,7 +1793,7 @@ def handle_local_command(
         return (
             "Commands: /review [@agents] QUESTION · /anneal @author,@critic QUESTION · "
             "/retry <agent|synthesis> · /cancel · /agents · /show <agent> · /inbox · /room · "
-            "PgUp/PgDn"
+            "PgUp/PgDn · @ opens a mention picker (Tab completes, Esc closes)"
         )
     if stripped == "/review" or stripped.startswith("/review "):
         if reviews is None:
@@ -1791,14 +1876,30 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
     view = "room"
     status = participant_status(chat, "Ready.")
     status_override = False
+    picker_dismissed_start: int | None = None
+    picker_index = 0
     while True:
         review_status = reviews.status()
+        fragment = mention_fragment(buffer)
+        if fragment is None:
+            picker_dismissed_start = None
+        suggestions = (
+            mention_suggestions(buffer, participants)
+            if fragment is not None and picker_dismissed_start != fragment[0]
+            else None
+        )
+        picker_active = suggestions is not None
+        if suggestions:
+            picker_index %= len(suggestions)
+            shown_status = mention_display(suggestions, picker_index)
+        else:
+            shown_status = status if status_override else (review_status or status)
         max_scroll = draw_tui(
             screen,
             chat.transcript,
             room,
             buffer,
-            status if status_override else (review_status or status),
+            shown_status,
             participants,
             scroll_offset,
             title=f"{chat.host_label} group chat",
@@ -1808,6 +1909,24 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
             key = screen.get_wch()
         except curses.error:
             continue
+        if picker_active:
+            picker_key = (
+                "UP"
+                if key == curses.KEY_UP
+                else "DOWN"
+                if key == curses.KEY_DOWN
+                else "TAB"
+                if key == "\t"
+                else "ESC"
+                if key == "\x1b"
+                else ""
+            )
+            handled = handle_picker_key(buffer, picker_key, suggestions or (), picker_index)
+            if handled is not None:
+                if picker_key in {"ESC", "TAB"} and fragment is not None:
+                    picker_dismissed_start = fragment[0]
+                buffer, picker_index = handled
+                continue
         if key in ("\x03", "\x11"):
             if reviews.is_active():
                 with suppress(ChatError):

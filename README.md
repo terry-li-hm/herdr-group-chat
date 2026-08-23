@@ -64,6 +64,16 @@ timed-out, or cancelled first pass can be retried without rerunning the other
 reviewers; a successful retry triggers a fresh synthesis. Use Page Up and Page
 Down to scroll the transcript while work continues.
 
+Typing `@` at the start of the recipient token — at the beginning of the line
+or right after `/review `, `/anneal `, or a comma still inside that token —
+opens a compact mention picker on the status row (`Mentions: [@sol] @fable`).
+Typed characters filter it case-insensitively, Up/Down cycle the selection,
+Tab completes the selected handle without adding a trailing space (a comma
+continues the recipient list, a space begins the message), Esc closes it with
+the text unchanged, and Enter still submits exactly what is shown. Already
+selected handles are excluded from later suggestions; `@all` is offered for
+plain messages and `/review` but never for `/anneal`.
+
 Use `/anneal @author,@critic QUESTION` for a two-participant adversarial pass
 over one question. Both answer blind and concurrently (a missing blind reply
 stops the round before synthesis), the author drafts a provisional synthesis,
