@@ -4,9 +4,17 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-24
+
+- Add an experimental Orca adapter that reuses the transcript, routing, review,
+  synthesis, retry, cancellation, and TUI core with exact terminal handles.
+- Recover marker-bound Orca replies after stale waiters and require an
+  authoritative terminal completion before accepting a turn.
 - Add `/inbox` and `/room` view switches: a presentation-only inbox projection
   of final replies, syntheses, system notices, and attention-bearing review
   statuses over the unchanged full-room transcript.
+- Keep Cumora outside the local relay boundary, with measured-gap reuse gates
+  and a single-owner pivot rule for any future networked mode.
 
 ## [0.3.0] - 2026-08-16
 
