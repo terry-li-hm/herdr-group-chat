@@ -46,7 +46,9 @@ class BootstrapError(RuntimeError):
         self.code = code
 
 
-def run_json(herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict[str, Any]:
+def _run_herdr(
+    herdr_bin: str, arguments: list[str], timeout: float | None = 30
+) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
             [herdr_bin, *arguments],
@@ -68,6 +70,11 @@ def run_json(herdr_bin: str, arguments: list[str], timeout: float | None = 30) -
         with suppress(json.JSONDecodeError, KeyError, TypeError):
             code = str(json.loads(detail)["error"]["code"])
         raise BootstrapError(detail, code=code)
+    return result
+
+
+def run_json(herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict[str, Any]:
+    result = _run_herdr(herdr_bin, arguments, timeout)
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as error:
@@ -75,6 +82,11 @@ def run_json(herdr_bin: str, arguments: list[str], timeout: float | None = 30) -
     if not isinstance(payload, dict):
         raise BootstrapError("Herdr returned an invalid response")
     return payload
+
+
+def run_text(herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
+    """Run a Herdr command whose stdout is raw terminal text, not a JSON envelope."""
+    return _run_herdr(herdr_bin, arguments, timeout).stdout
 
 
 def plugin_state_dir() -> Path:
@@ -305,16 +317,17 @@ def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> Non
 
     The dialog can render after `agent start` reports ready, and the visible-pane
     read clips lines at viewport width, so detection retries briefly and matches
-    short case-insensitive needles that survive clipping. Hooks stay inactive:
-    the summary notice is closed with esc, and the menu variant is answered with
+    short case-insensitive needles that survive clipping. Herdr's `pane read`
+    emits raw terminal text rather than a JSON envelope, so the screen is read
+    through the raw-text command helper. Hooks stay inactive: the summary notice
+    is closed with esc, and the menu variant is answered with
     "Continue without trusting".
     """
     for attempt in range(HOOK_DISMISS_ATTEMPTS):
-        payload = run_json(
+        text = run_text(
             herdr_bin,
             ["pane", "read", pane_id, "--source", "visible", "--lines", "80"],
         )
-        text = payload.get("result", {}).get("read", {}).get("text", "")
         lowered = text.lower()
         if HOOK_DIALOG_NEEDLE not in lowered:
             if attempt + 1 < HOOK_DISMISS_ATTEMPTS:

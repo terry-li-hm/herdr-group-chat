@@ -759,32 +759,38 @@ def test_fresh_room_ids_are_unique_and_valid() -> None:
     assert len(first) <= 32
 
 
-def hook_notice_fake(reads: list[str], calls: list[list[str]]) -> Callable[..., dict]:
+def install_hook_notice_fake(
+    monkeypatch: pytest.MonkeyPatch, reads: list[str], calls: list[list[str]]
+) -> None:
+    """Serve pane reads as raw terminal text via run_text; sends stay structured JSON."""
+
+    def fake_run_text(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
+        del timeout
+        calls.append(arguments)
+        assert arguments[:2] == ["pane", "read"], arguments
+        return reads.pop(0) if reads else ""
+
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
         calls.append(arguments)
-        if arguments[:2] == ["pane", "read"]:
-            text = reads.pop(0) if reads else ""
-            return {"result": {"read": {"text": text}}}
+        assert arguments[:2] != ["pane", "read"], "pane read must use the raw-text contract"
         return {"result": {"type": "ok"}}
 
-    return fake_run_json
+    monkeypatch.setattr(module, "run_text", fake_run_text)
+    monkeypatch.setattr(module, "run_json", fake_run_json)
 
 
 def test_hook_notice_summary_is_dismissed_with_esc(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     calls: list[list[str]] = []
-    monkeypatch.setattr(
-        module,
-        "run_json",
-        hook_notice_fake(
-            [
-                "Codex detected unreviewed lifecycle hooks.\n"
-                "Press t to trust all; enter to review hooks; esc to close"
-            ],
-            calls,
-        ),
+    install_hook_notice_fake(
+        monkeypatch,
+        [
+            "Codex detected unreviewed lifecycle hooks.\n"
+            "Press t to trust all; enter to review hooks; esc to close"
+        ],
+        calls,
     )
 
     module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
@@ -800,10 +806,8 @@ def test_hook_notice_detection_survives_viewport_clipping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[list[str]] = []
-    monkeypatch.setattr(
-        module,
-        "run_json",
-        hook_notice_fake(["Press T to TRUST ALL; enter to review hooks; es"], calls),
+    install_hook_notice_fake(
+        monkeypatch, ["Press T to TRUST ALL; enter to review hooks; es"], calls
     )
 
     module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
@@ -815,18 +819,15 @@ def test_hook_menu_variant_continues_without_trusting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[list[str]] = []
-    monkeypatch.setattr(
-        module,
-        "run_json",
-        hook_notice_fake(
-            [
-                "\u203a 1. Review hooks\n"
-                "  2. Trust all and continue\n"
-                "  3. Continue without trusting (hooks won't run)\n"
-                "Press enter to confirm or esc to go back"
-            ],
-            calls,
-        ),
+    install_hook_notice_fake(
+        monkeypatch,
+        [
+            "\u203a 1. Review hooks\n"
+            "  2. Trust all and continue\n"
+            "  3. Continue without trusting (hooks won't run)\n"
+            "Press enter to confirm or esc to go back"
+        ],
+        calls,
     )
 
     module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
@@ -843,13 +844,10 @@ def test_hook_notice_retry_catches_a_late_rendering_dialog(
 ) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(module, "HOOK_DISMISS_INTERVAL_S", 0)
-    monkeypatch.setattr(
-        module,
-        "run_json",
-        hook_notice_fake(
-            ["", "", "Press t to trust all; enter to review hooks; es"],
-            calls,
-        ),
+    install_hook_notice_fake(
+        monkeypatch,
+        ["", "", "Press t to trust all; enter to review hooks; es"],
+        calls,
     )
 
     module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
@@ -864,7 +862,7 @@ def test_hook_notice_absent_dialog_is_silent_and_bounded(
 ) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(module, "HOOK_DISMISS_INTERVAL_S", 0)
-    monkeypatch.setattr(module, "run_json", hook_notice_fake([], calls))
+    install_hook_notice_fake(monkeypatch, [], calls)
 
     module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
 
@@ -873,12 +871,60 @@ def test_hook_notice_absent_dialog_is_silent_and_bounded(
     assert capsys.readouterr().out == ""
 
 
+HOOK_MENU_SCREEN = (
+    "Codex detected unreviewed lifecycle hooks.\n"
+    "\u203a 1. Review hooks\n"
+    "  2. Trust all and continue\n"
+    "  3. Continue without trusting\n"
+    "Press enter to confirm or esc to go back"
+)
+
+
+def test_pane_read_follows_herdrs_raw_text_cli_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: pane read emits raw terminal text with no JSON envelope.
+
+    Dismissal must run end to end against that raw output. Routing the read
+    through run_json, or parsing the raw text as JSON, raises
+    "Herdr returned invalid JSON" and no key is ever sent.
+    """
+    sent_keys = tmp_path / "sent-keys"
+    monkeypatch.setenv("HOOK_FAKE_SENT_KEYS", str(sent_keys))
+    herdr = tmp_path / "herdr"
+    herdr.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "pane" ] && [ "$2" = "read" ]; then\n'
+        f"    cat <<'HOOKS'\n{HOOK_MENU_SCREEN}\nHOOKS\n"
+        "    exit 0\n"
+        "fi\n"
+        'if [ "$1" = "agent" ] && [ "$2" = "send-keys" ]; then\n'
+        '    printf \'%s\\n\' "$4" >> "$HOOK_FAKE_SENT_KEYS"\n'
+        '    printf \'{"result":{"type":"ok"}}\'\n'
+        "    exit 0\n"
+        "fi\n"
+        'printf \'{"error":{"code":"unexpected_command"}}\' >&2\n'
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    herdr.chmod(0o755)
+
+    module.dismiss_inactive_hook_notice(str(herdr), "codex-peer", "w-agents:p-codex")
+
+    assert sent_keys.read_text(encoding="utf-8").splitlines() == ["down", "down", "enter"]
+
+
 def test_started_participant_tabs_are_labeled_for_group_chat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(module, "PARTICIPANTS", (("pi", "pi-peer"), ("codex", "codex-peer")))
     monkeypatch.setattr(module, "HOOK_DISMISS_INTERVAL_S", 0)
     calls: list[list[str]] = []
+
+    def fake_run_text(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
+        del timeout
+        calls.append(arguments)
+        return ""
 
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
@@ -896,10 +942,9 @@ def test_started_participant_tabs_are_labeled_for_group_chat(
             }
         if arguments[:2] == ["pane", "process-info"]:
             return {"result": {"process_info": {"foreground_processes": [{"name": "zsh"}]}}}
-        if arguments[:2] == ["pane", "read"]:
-            return {"result": {"read": {"text": ""}}}
         return {"result": {"type": "ok"}}
 
+    monkeypatch.setattr(module, "run_text", fake_run_text)
     monkeypatch.setattr(module, "run_json", fake_run_json)
     state: dict = {"schema_version": 1}
 
