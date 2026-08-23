@@ -759,16 +759,38 @@ def test_fresh_room_ids_are_unique_and_valid() -> None:
     assert len(first) <= 32
 
 
-def hook_notice_fake(reads: list[str], calls: list[list[str]]) -> Callable[..., dict]:
-    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+def hook_notice_fake(reads: list[str], calls: list[list[str]]) -> Callable[..., str]:
+    def fake_run_raw(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
         del timeout
         calls.append(arguments)
         if arguments[:2] == ["pane", "read"]:
-            text = reads.pop(0) if reads else ""
-            return {"result": {"read": {"text": text}}}
+            return reads.pop(0) if reads else ""
+        return ""
+
+    return fake_run_raw
+
+
+def hook_notice_send_fake(calls: list[list[str]]) -> Callable[..., dict]:
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
         return {"result": {"type": "ok"}}
 
     return fake_run_json
+
+
+def test_run_raw_preserves_successful_plain_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: module.subprocess.CompletedProcess(
+            args[0], 0, "plain Herdr pane output", ""
+        ),
+    )
+
+    assert module.run_raw("herdr", ["pane", "read"]) == "plain Herdr pane output"
 
 
 def test_hook_notice_summary_is_dismissed_with_esc(
@@ -777,7 +799,7 @@ def test_hook_notice_summary_is_dismissed_with_esc(
     calls: list[list[str]] = []
     monkeypatch.setattr(
         module,
-        "run_json",
+        "run_raw",
         hook_notice_fake(
             [
                 "Codex detected unreviewed lifecycle hooks.\n"
@@ -786,6 +808,7 @@ def test_hook_notice_summary_is_dismissed_with_esc(
             calls,
         ),
     )
+    monkeypatch.setattr(module, "run_json", hook_notice_send_fake(calls))
 
     module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
 
@@ -802,9 +825,10 @@ def test_hook_notice_detection_survives_viewport_clipping(
     calls: list[list[str]] = []
     monkeypatch.setattr(
         module,
-        "run_json",
+        "run_raw",
         hook_notice_fake(["Press T to TRUST ALL; enter to review hooks; es"], calls),
     )
+    monkeypatch.setattr(module, "run_json", hook_notice_send_fake(calls))
 
     module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
 
@@ -817,7 +841,7 @@ def test_hook_menu_variant_continues_without_trusting(
     calls: list[list[str]] = []
     monkeypatch.setattr(
         module,
-        "run_json",
+        "run_raw",
         hook_notice_fake(
             [
                 "\u203a 1. Review hooks\n"
@@ -828,6 +852,7 @@ def test_hook_menu_variant_continues_without_trusting(
             calls,
         ),
     )
+    monkeypatch.setattr(module, "run_json", hook_notice_send_fake(calls))
 
     module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
 
@@ -845,12 +870,13 @@ def test_hook_notice_retry_catches_a_late_rendering_dialog(
     monkeypatch.setattr(module, "HOOK_DISMISS_INTERVAL_S", 0)
     monkeypatch.setattr(
         module,
-        "run_json",
+        "run_raw",
         hook_notice_fake(
             ["", "", "Press t to trust all; enter to review hooks; es"],
             calls,
         ),
     )
+    monkeypatch.setattr(module, "run_json", hook_notice_send_fake(calls))
 
     module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
 
@@ -859,12 +885,75 @@ def test_hook_notice_retry_catches_a_late_rendering_dialog(
     assert calls[-1] == ["agent", "send-keys", "codex-peer", "esc"]
 
 
+def test_hook_notice_uses_one_total_deadline_for_reads_and_sleeps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    time_now = [0.0]
+    timeouts: list[float] = []
+    sleeps: list[float] = []
+
+    def fake_run_raw(_herdr_bin: str, arguments: list[str], timeout: float = 30) -> str:
+        calls.append(arguments)
+        timeouts.append(timeout)
+        time_now[0] += 0.6
+        return ""
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: time_now[0])
+    monkeypatch.setattr(module, "run_raw", fake_run_raw)
+    monkeypatch.setattr(
+        module.time,
+        "sleep",
+        lambda duration: (
+            sleeps.append(duration),
+            time_now.__setitem__(0, time_now[0] + duration),
+        ),
+    )
+
+    module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
+
+    assert len(calls) == 4
+    assert all(timeout <= 5.0 for timeout in timeouts)
+    assert sum(sleeps) <= 3.0
+
+
+def test_hook_notice_passes_nested_remaining_budgets_to_send_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    budgets: list[float] = []
+    time_now = [0.0]
+
+    def fake_run_raw(_herdr_bin: str, arguments: list[str], timeout: float = 30) -> str:
+        del timeout
+        calls.append(arguments)
+        time_now[0] += 0.5
+        return "Trust all and continue; Continue without trusting"
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float = 30) -> dict:
+        calls.append(arguments)
+        budgets.append(timeout)
+        time_now[0] += 0.5
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: time_now[0])
+    monkeypatch.setattr(module, "run_raw", fake_run_raw)
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+
+    module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
+
+    assert [call[-1] for call in calls[1:]] == ["down", "down", "enter"]
+    assert budgets == [4.5, 4.0, 3.5]
+    assert "trust all" not in [call[-1] for call in calls]
+
+
 def test_hook_notice_absent_dialog_is_silent_and_bounded(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(module, "HOOK_DISMISS_INTERVAL_S", 0)
-    monkeypatch.setattr(module, "run_json", hook_notice_fake([], calls))
+    monkeypatch.setattr(module, "run_raw", hook_notice_fake([], calls))
+    monkeypatch.setattr(module, "run_json", hook_notice_send_fake(calls))
 
     module.dismiss_inactive_hook_notice("herdr", "codex-peer", "w-agents:p-codex")
 
@@ -901,6 +990,11 @@ def test_started_participant_tabs_are_labeled_for_group_chat(
         return {"result": {"type": "ok"}}
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
+    monkeypatch.setattr(
+        module,
+        "run_raw",
+        lambda _herdr_bin, arguments, timeout=30: calls.append(arguments) or "",
+    )
     state: dict = {"schema_version": 1}
 
     failures = module.start_participants(

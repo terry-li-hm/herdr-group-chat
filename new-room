@@ -46,9 +46,11 @@ class BootstrapError(RuntimeError):
         self.code = code
 
 
-def run_json(herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict[str, Any]:
+def _run_herdr(
+    herdr_bin: str, arguments: list[str], timeout: float | None
+) -> subprocess.CompletedProcess[str]:
     try:
-        result = subprocess.run(
+        return subprocess.run(
             [herdr_bin, *arguments],
             capture_output=True,
             text=True,
@@ -62,12 +64,28 @@ def run_json(herdr_bin: str, arguments: list[str], timeout: float | None = 30) -
         raise BootstrapError(
             f"Herdr command failed: {error}", code="command_spawn_failed"
         ) from error
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "unknown Herdr error"
-        code = None
-        with suppress(json.JSONDecodeError, KeyError, TypeError):
-            code = str(json.loads(detail)["error"]["code"])
-        raise BootstrapError(detail, code=code)
+
+
+def _raise_for_herdr_failure(result: subprocess.CompletedProcess[str]) -> None:
+    if result.returncode == 0:
+        return
+    detail = result.stderr.strip() or result.stdout.strip() or "unknown Herdr error"
+    code = None
+    with suppress(json.JSONDecodeError, KeyError, TypeError):
+        code = str(json.loads(detail)["error"]["code"])
+    raise BootstrapError(detail, code=code)
+
+
+def run_raw(herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
+    """Run Herdr commands whose successful response is raw text."""
+    result = _run_herdr(herdr_bin, arguments, timeout)
+    _raise_for_herdr_failure(result)
+    return result.stdout
+
+
+def run_json(herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict[str, Any]:
+    result = _run_herdr(herdr_bin, arguments, timeout)
+    _raise_for_herdr_failure(result)
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as error:
@@ -298,6 +316,7 @@ HOOK_DIALOG_NEEDLE = "trust all"
 HOOK_MENU_NEEDLE = "continue without trusting"
 HOOK_DISMISS_ATTEMPTS = 10
 HOOK_DISMISS_INTERVAL_S = 1.0
+HOOK_DISMISS_TIMEOUT_S = 5.0
 
 
 def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> None:
@@ -309,22 +328,30 @@ def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> Non
     the summary notice is closed with esc, and the menu variant is answered with
     "Continue without trusting".
     """
+    deadline = time.monotonic() + min(HOOK_DISMISS_TIMEOUT_S, 5.0)
     for attempt in range(HOOK_DISMISS_ATTEMPTS):
-        payload = run_json(
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        text = run_raw(
             herdr_bin,
             ["pane", "read", pane_id, "--source", "visible", "--lines", "80"],
+            timeout=remaining,
         )
-        text = payload.get("result", {}).get("read", {}).get("text", "")
         lowered = text.lower()
         if HOOK_DIALOG_NEEDLE not in lowered:
             if attempt + 1 < HOOK_DISMISS_ATTEMPTS:
-                time.sleep(HOOK_DISMISS_INTERVAL_S)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                time.sleep(min(HOOK_DISMISS_INTERVAL_S, remaining))
             continue
-        if HOOK_MENU_NEEDLE in lowered:
-            for key in ("down", "down", "enter"):
-                run_json(herdr_bin, ["agent", "send-keys", name, key])
-        else:
-            run_json(herdr_bin, ["agent", "send-keys", name, "esc"])
+        keys = ("down", "down", "enter") if HOOK_MENU_NEEDLE in lowered else ("esc",)
+        for key in keys:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            run_json(herdr_bin, ["agent", "send-keys", name, key], timeout=remaining)
         print("notice @codex unreviewed hooks left inactive", flush=True)
         return
 
