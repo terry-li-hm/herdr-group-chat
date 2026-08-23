@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-24
+
+- Keep room-pane registration two-phase so the outer launcher records the
+  returned pane without clearing the profile operation before the inner setup
+  process claims it; an unclaimed launch remains recoverable through the
+  existing pending-operation grace path.
+- Reverify post-turn Fable sessions with bounded `Fable 5` pane evidence and
+  exact native `claude --model fable --effort high` process arguments, while
+  fresh launches retain the stronger startup-banner check.
 - Add a presentation-only mention picker in the TUI. Typing `@` at the start
   of the routing token (line start, right after exact `/review `/`/anneal `,
   or right after a comma still inside that token) shows the live handles on
