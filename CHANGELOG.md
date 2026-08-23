@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-24
+
 - Add `/anneal @author,@critic QUESTION`: a thin two-participant composition over
   the existing review round. Both participants answer blind and concurrently, the
   author synthesizes provisionally, the critic appends one `anneal_challenge`,
@@ -12,6 +14,14 @@ All notable changes to this project are documented here.
   blind reply stops the round without synthesis; `/retry` stays review-only
   until a later ordinary review replaces the last round. The inbox keeps
   `anneal_final` and attention-bearing failures.
+- Read Codex hook screens through Herdr's raw pane-output contract so startup
+  actually leaves unreviewed hooks inactive before the room opens, with one
+  five-second deadline across reads, sleeps, and key sends while the launcher
+  lock is held.
+- Bound relay process reaping and isolate an unexpected reviewer exception so
+  one failed participant cannot strand the remaining review round.
+- Harden experimental Orca turns against unsafe reply-file types, incomplete
+  interruption, unbounded process-stop waits, and CI coverage drift.
 
 ## [0.4.0] - 2026-08-24
 
