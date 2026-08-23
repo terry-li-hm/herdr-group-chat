@@ -460,6 +460,78 @@ def test_room_registration_recovers_lost_response_and_tracks_displaced_pane() ->
     assert "pending_room_operation_id" not in state
 
 
+def test_outer_registration_records_ownership_but_retains_pending_operation() -> None:
+    """The launcher registers the pane yet leaves pending state for the inner claim."""
+    state = {
+        "room_pane_id": "w-chat:p-old",
+        "pending_room_id": "chat-new",
+        "pending_room_operation_id": "operation-new",
+        "pending_room_profile": "sol-fable",
+        "pending_room_started_unix_ms": 1,
+    }
+
+    module.register_room_pane(
+        state,
+        workspace_id="w-chat",
+        pane_id="w-chat:p-new",
+        tab_id="w-chat:t-new",
+        room="chat-new",
+        operation_id="operation-new",
+        consume_pending=False,
+    )
+
+    assert state["room_pane_id"] == "w-chat:p-new"
+    assert state["room_tab_id"] == "w-chat:t-new"
+    assert state["stale_room_pane_ids"] == ["w-chat:p-old"]
+    assert state["last_room_id"] == "chat-new"
+    assert state["pending_room_id"] == "chat-new"
+    assert state["pending_room_operation_id"] == "operation-new"
+    assert state["pending_room_profile"] == "sol-fable"
+    assert state["pending_room_started_unix_ms"] == 1
+
+    # The matching inner registration then consumes the pending fields.
+    module.register_room_pane(
+        state,
+        workspace_id="w-chat",
+        pane_id="w-chat:p-new",
+        tab_id="w-chat:t-new",
+        room="chat-new",
+        operation_id="operation-new",
+    )
+    assert state["room_pane_id"] == "w-chat:p-new"
+    for field in (
+        "pending_room_id",
+        "pending_room_operation_id",
+        "pending_room_profile",
+        "pending_room_started_unix_ms",
+    ):
+        assert field not in state
+
+
+def test_inner_registration_with_mismatched_operation_fails_without_consuming() -> None:
+    """A superseding operation must not steal or clear another launch's pending claim."""
+    state = {
+        "pending_room_id": "chat-new",
+        "pending_room_operation_id": "operation-new",
+        "pending_room_profile": "sol-fable",
+        "pending_room_started_unix_ms": 1,
+    }
+
+    with pytest.raises(BootstrapError, match="superseded by a newer operation"):
+        module.register_room_pane(
+            state,
+            workspace_id="w-chat",
+            pane_id="w-chat:p-new",
+            tab_id="w-chat:t-new",
+            room="chat-new",
+            operation_id="operation-other",
+        )
+
+    assert state["pending_room_operation_id"] == "operation-new"
+    assert state["pending_room_profile"] == "sol-fable"
+    assert "room_pane_id" not in state
+
+
 def test_participant_start_does_not_move_a_globally_named_external_agent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -747,6 +819,14 @@ def test_rename_failure_is_recovered_before_the_next_open_returns(
     with pytest.raises(BootstrapError, match="temporary failure"):
         launch_room(open_existing=False)
     assert load_launcher_state(tmp_path)["chat_placeholder_tab_id"] == ("w-chat:t-placeholder")
+
+    # The outer registration retains the pending operation for the inner claim;
+    # a retry stays grace-blocked until the pending launch ages out.
+    with pytest.raises(BootstrapError, match="still pending"):
+        launch_room(open_existing=True)
+    aged = load_launcher_state(tmp_path)
+    aged["pending_room_started_unix_ms"] = 1
+    save_launcher_state(tmp_path, aged)
 
     assert launch_room(open_existing=True) == 0
     assert "chat_placeholder_tab_id" not in load_launcher_state(tmp_path)
@@ -1940,6 +2020,68 @@ def test_room_reopen_without_a_profile_skips_reverification(
     assert not any(call[:2] in (["agent", "list"], ["pane", "read"]) for call in calls)
 
 
+def test_room_reopen_consumes_its_matching_pending_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The inner room entrypoint claims the pane left pending by the outer open."""
+    captured: dict[str, object] = {}
+    room_reopen_env(tmp_path, monkeypatch, captured, "chat-default")
+    install_launch_host(
+        tmp_path, monkeypatch, {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+    )
+    save_launcher_state(
+        tmp_path,
+        {
+            "agents_workspace_id": "w-agents",
+            "pending_room_id": "chat-default",
+            "pending_room_operation_id": "operation-reopen",
+            "pending_room_started_unix_ms": int(module.time.time() * 1000),
+        },
+    )
+
+    module.room_entrypoint()
+
+    assert captured["argv"][0].endswith("herdr-group-chat")
+    state = load_launcher_state(tmp_path)
+    assert state["room_pane_id"] == "w-chat:p-room"
+    for field in (
+        "pending_room_id",
+        "pending_room_operation_id",
+        "pending_room_profile",
+        "pending_room_started_unix_ms",
+    ):
+        assert field not in state
+
+
+def test_room_reopen_rejects_mismatched_pending_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reopen from a different operation never consumes another launch's claim."""
+    captured: dict[str, object] = {}
+    room_reopen_env(tmp_path, monkeypatch, captured, "chat-default")
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must fail first")),
+    )
+    save_launcher_state(
+        tmp_path,
+        {
+            "pending_room_id": "chat-default",
+            "pending_room_operation_id": "operation-newer",
+            "pending_room_started_unix_ms": int(module.time.time() * 1000),
+        },
+    )
+
+    with pytest.raises(BootstrapError, match="superseded by a newer operation"):
+        module.room_entrypoint()
+
+    state = load_launcher_state(tmp_path)
+    assert state["pending_room_operation_id"] == "operation-newer"
+    assert "room_pane_id" not in state
+    assert "argv" not in captured
+
+
 def test_launch_room_with_profile_propagates_env_and_pending_operation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1968,7 +2110,88 @@ def test_launch_room_with_profile_propagates_env_and_pending_operation(
     assert f"{module.PROFILE_ENV}=sol-fable" in open_arguments
     state = load_launcher_state(tmp_path)
     assert state["room_pane_id"] == "w-chat:p-new"
-    assert "pending_room_profile" not in state
+    # The outer registration records pane ownership but retains the pending
+    # operation/profile for the inner entrypoint to consume after the lock.
+    operation = next(
+        setting.split("=", 1)[1]
+        for setting in open_arguments
+        if setting.startswith(f"{module.ROOM_OPERATION_ENV}=")
+    )
+    assert state["pending_room_operation_id"] == operation
+    assert state["pending_room_profile"] == "sol-fable"
+    assert state["pending_room_id"].startswith("chat-")
+    assert state["last_room_id"] == state["pending_room_id"]
+
+
+def test_launch_then_inner_claim_completes_the_two_phase_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the outer launch must not clear the pending profile binding
+    before the inner new-room process claims it after acquiring the lock."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_cwd": str(tmp_path)}))
+    monkeypatch.setenv("HERDR_WORKSPACE_ID", "w-chat")
+    monkeypatch.setenv("HERDR_TAB_ID", "w-chat:p-room:t")
+    monkeypatch.setenv("HERDR_PANE_ID", "w-chat:p-room")
+    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable")
+    monkeypatch.setenv(module.ROOM_ENV, "chat-profile")
+    monkeypatch.delenv(module.PROFILE_RECEIPT_ENV, raising=False)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        module.os,
+        "execv",
+        lambda path, argv: captured.update(path=path, argv=argv, env=dict(os.environ)),
+    )
+    install_profile_host(
+        monkeypatch,
+        [],
+        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+    )
+    original_run_json = module.run_json
+
+    def fake_run_json(herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        if arguments[:3] == ["plugin", "pane", "open"]:
+            operation = next(
+                setting.split("=", 1)[1]
+                for setting in arguments
+                if setting.startswith(f"{module.ROOM_OPERATION_ENV}=")
+            )
+            # The inner process starts concurrently and observes the retained
+            # pending operation/profile once it acquires the lock.
+            monkeypatch.setenv(module.ROOM_OPERATION_ENV, operation)
+            return {
+                "result": {
+                    "plugin_pane": {
+                        "pane": {"pane_id": "w-chat:p-room", "tab_id": "w-chat:p-room:t"}
+                    }
+                }
+            }
+        result = original_run_json(herdr_bin, arguments, timeout)
+        if arguments == ["workspace", "list"]:
+            result["result"]["workspaces"].insert(
+                0, {"workspace_id": "w-chat", "label": "group-chat"}
+            )
+        return result
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    save_launcher_state(
+        tmp_path, {"chat_workspace_id": "w-chat", "agents_workspace_id": "w-agents"}
+    )
+
+    launch_room(open_existing=False, profile="sol-fable")
+    # The inner claim now succeeds instead of failing with profile_operation_mismatch.
+    module.main()
+
+    assert captured["argv"][0].endswith("herdr-group-chat")
+    state = load_launcher_state(tmp_path)
+    assert state["selected_profile"] == "sol-fable"
+    for field in (
+        "pending_room_id",
+        "pending_room_operation_id",
+        "pending_room_profile",
+        "pending_room_started_unix_ms",
+    ):
+        assert field not in state
 
 
 def test_unknown_profile_fails_before_opening_any_tab(

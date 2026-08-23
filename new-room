@@ -746,7 +746,16 @@ def register_room_pane(
     tab_id: str,
     room: str,
     operation_id: str,
+    consume_pending: bool = True,
 ) -> None:
+    """Record room pane ownership.
+
+    The inner entrypoint (default) consumes the matching pending operation so
+    the launch is claimed complete. The outer launcher registers with
+    ``consume_pending=False``: it records pane/tab ownership but retains the
+    pending operation/profile so the inner process still observes them after
+    it acquires the lock.
+    """
     pending_operation = state.get("pending_room_operation_id")
     if pending_operation and pending_operation != operation_id:
         raise BootstrapError("this room launch was superseded by a newer operation")
@@ -765,6 +774,8 @@ def register_room_pane(
             "last_room_id": room,
         }
     )
+    if not consume_pending:
+        return
     state.pop("pending_room_id", None)
     state.pop("pending_room_operation_id", None)
     state.pop("pending_room_profile", None)
@@ -880,6 +891,7 @@ def launch_room(open_existing: bool, profile: str | None = None) -> int:
             tab_id=tab_id,
             room=room,
             operation_id=operation_id,
+            consume_pending=False,
         )
         save_launcher_state(state_dir, state, state_path)
         assert_server_identity(state_dir, state_path)
