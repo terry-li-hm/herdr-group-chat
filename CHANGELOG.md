@@ -13,8 +13,8 @@ All notable changes to this project are documented here.
 - Add `/inbox` and `/room` view switches: a presentation-only inbox projection
   of final replies, syntheses, system notices, and attention-bearing review
   statuses over the unchanged full-room transcript.
-- Recheck Codex after participant startup so a late-rendering hooks notice is
-  dismissed without trusting unreviewed hooks.
+- Recover a late-rendering Codex hooks notice at turn submission with fresh,
+  Esc-only observation while leaving unknown blocked dialogs untouched.
 - Keep Cumora outside the local relay boundary, with measured-gap reuse gates
   and a single-owner pivot rule for any future networked mode.
 

@@ -131,8 +131,9 @@ grok` to focus one native agent directly. Use Herdr's workspace switcher or
 
 If Codex reports unreviewed lifecycle hooks during startup, setup detects the
 dialog even when the pane read clips its text, retries briefly while it renders,
-and leaves those hooks inactive: it closes the summary notice or chooses
-**Continue without trusting** in the menu variant. It never selects **trust
+and backs out with Esc so those hooks stay inactive. If the notice renders
+later, the relay repeats that Esc-only recovery when the turn is submitted.
+Unknown blocked dialogs remain untouched. The plugin never selects **trust
 all** for you.
 
 Like every Herdr plugin, this is ordinary local code running as your user and it
