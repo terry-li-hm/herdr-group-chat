@@ -15,7 +15,9 @@ import type { FileHandle } from "node:fs/promises";
 import {
   Editor,
   type EditorTheme,
+  Key,
   Markdown,
+  matchesKey,
   ScrollView,
   Text,
   TuiAltScreen,
@@ -50,6 +52,15 @@ const EDITOR_THEME: EditorTheme = {
 /** Recover the exact typed text after pi-tui's Editor trims on submit. */
 export function resolveExactText(lastExactText: string, submitted: string): string {
   return lastExactText.trim() === submitted ? lastExactText : submitted;
+}
+
+/**
+ * Exact Ctrl-C test for the exit policy. Uses matchesKey/Key so both the raw
+ * legacy control character (\x03) and Kitty-keyboard-protocol encodings
+ * (e.g. CSI 99;5u) are recognized.
+ */
+export function isCtrlC(data: string): boolean {
+  return matchesKey(data, Key.ctrl("c"));
 }
 
 export type SubmissionKind =
@@ -204,7 +215,7 @@ export class ChatApp {
     // leave the child running. Once idle, Ctrl-C exits cleanly. No /cancel and
     // no signals or terminal keys are ever sent to participants.
     this.tui.addInputListener((data: string) => {
-      if (data !== "\x03") return undefined;
+      if (!isCtrlC(data)) return undefined;
       if (this.child !== null) {
         this.tui.flash("dispatch in progress — Ctrl-C ignored, child left running");
         this.tui.requestRender();
