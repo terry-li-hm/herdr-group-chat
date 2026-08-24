@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-08-24
+
 - Bind transcript and launcher transactions to validated directory descriptors,
   deduplicate profile receipts atomically, and discard late review replies after
   local cancellation while committing one completion or cancellation outcome.
@@ -12,6 +14,10 @@ All notable changes to this project are documented here.
   role intentionally closes the plugin-recorded tab before starting its replacement
   (visible as `replace @role` in setup output), with symmetric regression coverage
   for `sol-fable-grok` → classic and classic → `sol-fable-grok` switches.
+- Add an experimental standalone `prototypes/pi-tui` frontend that uses
+  `@earendil-works/pi-tui` directly, keeps the Python relay as sole transcript
+  writer, preserves exact argv dispatch and local room/inbox views, includes
+  fixtures and tests, and remains unwired from the plugin.
 
 ## [0.5.2] - 2026-08-24
 
