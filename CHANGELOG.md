@@ -14,10 +14,13 @@ All notable changes to this project are documented here.
   role intentionally closes the plugin-recorded tab before starting its replacement
   (visible as `replace @role` in setup output), with symmetric regression coverage
   for `sol-fable-grok` → classic and classic → `sol-fable-grok` switches.
-- Add an experimental standalone `prototypes/pi-tui` frontend that uses
-  `@earendil-works/pi-tui` directly, keeps the Python relay as sole transcript
-  writer, preserves exact argv dispatch and local room/inbox views, includes
-  fixtures and tests, and remains unwired from the plugin.
+- Evaluate and retain the standalone, peer-neutral `prototypes/pi-tui` frontend
+  as a frozen reference. It uses `@earendil-works/pi-tui` directly, keeps the
+  Python relay as sole transcript writer, preserves exact argv dispatch and local
+  room/inbox views, and has fixtures and tests. The live A/B retains curses
+  because it is more compact and exposes participant, delivery, and actionable
+  failure state. The prototype remains unwired from the plugin, has no standing
+  Node CI commitment, and is not an active experimental adoption.
 
 ## [0.5.2] - 2026-08-24
 
