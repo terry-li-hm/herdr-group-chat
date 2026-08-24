@@ -1,0 +1,20 @@
+{
+  "name": "herdr-group-chat-pi-tui-prototype",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Experimental standalone pi-tui frontend for Herdr Group Chat. Prototype only; not wired into the plugin.",
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test --test-reporter=spec dist/test/*.test.js",
+    "typecheck": "tsc --noEmit",
+    "smoke": "npm run build && node dist/main.js --render-fixture fixtures/sample.jsonl"
+  },
+  "dependencies": {
+    "@earendil-works/pi-tui": "0.84.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^22.0.0"
+  }
+}
