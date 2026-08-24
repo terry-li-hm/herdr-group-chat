@@ -83,7 +83,7 @@ def test_main_closes_transcript_on_success_and_failure(
     assert all(instance.closed_by_main for instance in instances)
 
 
-def test_live_targets_and_states_come_from_exact_terminal_handles() -> None:
+def test_live_targets_and_states_come_from_exact_terminal_handles(tmp_path: Path) -> None:
     def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         assert argv == ["orca-test", "terminal", "list", "--json"]
         return subprocess.CompletedProcess(
@@ -99,7 +99,7 @@ def test_live_targets_and_states_come_from_exact_terminal_handles() -> None:
             stderr="",
         )
 
-    client = OrcaClient(orca_bin="orca-test", runner=runner)
+    client = OrcaClient(orca_bin="orca-test", state_dir=tmp_path, runner=runner)
 
     assert client.live_targets() == {"term_ready"}
     assert client.states() == {
@@ -337,7 +337,7 @@ def test_safe_file_reply_rejects_final_component_symlinks(tmp_path: Path) -> Non
     )
     mode_before = poisoned.stat().st_mode & 0o777
     responses = tmp_path / "responses"
-    responses.mkdir()
+    responses.mkdir(mode=0o700)
     response_file = responses / f"{token}.txt"
     response_file.symlink_to(poisoned)
 
@@ -350,7 +350,7 @@ def test_safe_file_reply_rejects_final_component_symlinks(tmp_path: Path) -> Non
 def test_safe_file_reply_rejects_non_regular_files(tmp_path: Path) -> None:
     token = "7" * 32
     responses = tmp_path / "responses"
-    responses.mkdir()
+    responses.mkdir(mode=0o700)
     response_file = responses / f"{token}.txt"
     os.mkfifo(response_file)
 
@@ -359,14 +359,56 @@ def test_safe_file_reply_rejects_non_regular_files(tmp_path: Path) -> None:
     assert client._safe_file_reply(token, response_file) is None
 
 
-def test_cancel_targets_only_the_exact_terminal_handle() -> None:
+def test_response_directory_descriptor_survives_symlink_replacement(
+    tmp_path: Path,
+) -> None:
+    token = "9" * 32
+    client = OrcaClient(orca_bin="orca-test", state_dir=tmp_path, runner=ok_runner)
+    original_responses = client.response_dir
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    outside_file = outside / f"{token}.txt"
+    outside_file.write_text(
+        f"HGCHAT_REPLY_BEGIN {token}\noutside answer\nHGCHAT_REPLY_END {token}\n",
+        encoding="utf-8",
+    )
+    outside_file.chmod(0o600)
+    original_responses.rename(tmp_path / "bound-responses")
+    (tmp_path / "responses").symlink_to(outside, target_is_directory=True)
+
+    response_path = client._response_file(token)
+    bound_file = tmp_path / "bound-responses" / f"{token}.txt"
+    assert response_path == tmp_path / "responses" / f"{token}.txt"
+    assert bound_file.is_file()
+    assert outside_file.read_text(encoding="utf-8").startswith("HGCHAT_REPLY_BEGIN")
+
+    bound_file.write_text(
+        f"HGCHAT_REPLY_BEGIN {token}\nbound answer\nHGCHAT_REPLY_END {token}\n",
+        encoding="utf-8",
+    )
+    assert client._safe_file_reply(token, response_path) == "bound answer"
+
+
+def test_safe_file_reply_rejects_directory_final_component(tmp_path: Path) -> None:
+    token = "0" * 32
+    responses = tmp_path / "responses"
+    responses.mkdir(mode=0o700)
+    response_file = responses / f"{token}.txt"
+    response_file.mkdir(mode=0o700)
+
+    client = OrcaClient(orca_bin="orca-test", state_dir=tmp_path, runner=ok_runner)
+
+    assert client._safe_file_reply(token, response_file) is None
+
+
+def test_cancel_targets_only_the_exact_terminal_handle(tmp_path: Path) -> None:
     calls: list[list[str]] = []
 
     def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
         return subprocess.CompletedProcess(argv, 0, stdout=json_result("{}"), stderr="")
 
-    OrcaClient(orca_bin="orca-test", runner=runner).cancel("term_claude")
+    OrcaClient(orca_bin="orca-test", state_dir=tmp_path, runner=runner).cancel("term_claude")
     assert calls == [
         [
             "orca-test",
@@ -504,7 +546,7 @@ def test_stop_process_returns_after_a_second_communicate_timeout() -> None:
     assert all(timeout is not None and timeout > 0 for timeout in process.communicate_timeouts)
 
 
-def test_orca_json_error_is_user_visible() -> None:
+def test_orca_json_error_is_user_visible(tmp_path: Path) -> None:
     def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(
             argv,
@@ -513,7 +555,7 @@ def test_orca_json_error_is_user_visible() -> None:
             stderr="",
         )
 
-    client = OrcaClient(orca_bin="orca-test", runner=runner)
+    client = OrcaClient(orca_bin="orca-test", state_dir=tmp_path, runner=runner)
     with pytest.raises(ChatError, match=r"terminal_handle_stale.*gone"):
         client.live_targets()
 

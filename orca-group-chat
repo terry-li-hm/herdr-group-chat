@@ -59,6 +59,76 @@ ROOM_ENV = "ORCA_GROUP_CHAT_ROOM"
 HOST_LABEL = "Orca"
 TERMINAL_READ_LIMIT = 1000
 STALE_HANDLE_CODE = "terminal_handle_stale"
+PRIVATE_DIRECTORY_FLAGS = (
+    os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW
+)
+PRIVATE_FILE_FLAGS = os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+
+def _validate_private_directory(descriptor: int, directory_created: bool) -> None:
+    directory_stat = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(directory_stat.st_mode)
+        or directory_stat.st_uid != os.geteuid()
+        or (not directory_created and stat.S_IMODE(directory_stat.st_mode) != 0o700)
+    ):
+        raise ChatError("invalid Orca response directory authority")
+    if directory_created:
+        os.fchmod(descriptor, 0o700)
+
+
+def _open_private_directory(path: Path) -> int:
+    try:
+        path.mkdir(parents=True, mode=0o700)
+        directory_created = True
+    except FileExistsError:
+        directory_created = False
+    except OSError as error:
+        raise ChatError(f"invalid Orca response directory: {error}") from error
+    descriptor = -1
+    transferred = False
+    try:
+        descriptor = os.open(path, PRIVATE_DIRECTORY_FLAGS)
+        _validate_private_directory(descriptor, directory_created)
+        transferred = True
+        return descriptor
+    except OSError as error:
+        raise ChatError(f"invalid Orca response directory: {error}") from error
+    finally:
+        if descriptor >= 0 and not transferred:
+            os.close(descriptor)
+
+
+def _open_private_child_directory(parent_descriptor: int, name: str) -> int:
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+        directory_created = True
+    except FileExistsError:
+        directory_created = False
+    except OSError as error:
+        raise ChatError(f"invalid Orca response directory: {error}") from error
+    descriptor = -1
+    transferred = False
+    try:
+        descriptor = os.open(name, PRIVATE_DIRECTORY_FLAGS, dir_fd=parent_descriptor)
+        _validate_private_directory(descriptor, directory_created)
+        transferred = True
+        return descriptor
+    except OSError as error:
+        raise ChatError(f"invalid Orca response directory: {error}") from error
+    finally:
+        if descriptor >= 0 and not transferred:
+            os.close(descriptor)
+
+
+def _validate_private_file(descriptor: int) -> None:
+    file_stat = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(file_stat.st_mode)
+        or file_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(file_stat.st_mode) != 0o600
+    ):
+        raise ChatError("invalid Orca response file authority")
 
 
 def _is_stale_handle_error(error: ChatError) -> bool:
@@ -120,6 +190,19 @@ class OrcaClient:
             if state_dir is not None
             else resolve_state_dir(None).expanduser()
         )
+        self.response_dir = self.state_dir / "responses"
+        self._lock = threading.RLock()
+        self._state_directory_descriptor: int | None = None
+        self._response_directory_descriptor: int | None = None
+        self._state_directory_descriptor = _open_private_directory(self.state_dir)
+        try:
+            self._response_directory_descriptor = _open_private_child_directory(
+                self._state_directory_descriptor, "responses"
+            )
+        except BaseException:
+            os.close(self._state_directory_descriptor)
+            self._state_directory_descriptor = None
+            raise
         self.runner = runner
         self.popen_factory = (
             subprocess.Popen
@@ -260,11 +343,50 @@ class OrcaClient:
     def cancel(self, target: str) -> None:
         self._run(["terminal", "send", "--terminal", target, "--interrupt", "--json"])
 
+    def _response_directory(self) -> int:
+        descriptor = self._response_directory_descriptor
+        if descriptor is None:
+            raise ChatError("Orca client is closed")
+        return descriptor
+
+    def close(self) -> None:
+        """Close response and state directory descriptors idempotently."""
+        with self._lock:
+            response_descriptor = self._response_directory_descriptor
+            state_descriptor = self._state_directory_descriptor
+            self._response_directory_descriptor = None
+            self._state_directory_descriptor = None
+            if response_descriptor is not None:
+                os.close(response_descriptor)
+            if state_descriptor is not None:
+                os.close(state_descriptor)
+
+    def __del__(self) -> None:
+        with contextlib.suppress(Exception):
+            self.close()
+
     def _response_file(self, reply_marker_id: str) -> Path:
-        directory = self.state_dir / "responses"
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(directory, 0o700)
-        return directory / f"{reply_marker_id}.txt"
+        name = f"{reply_marker_id}.txt"
+        descriptor = self._response_directory()
+        try:
+            file_descriptor = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | PRIVATE_FILE_FLAGS,
+                0o600,
+                dir_fd=descriptor,
+            )
+        except FileExistsError as error:
+            raise ChatError("Orca response file already exists") from error
+        except OSError as error:
+            raise ChatError(f"invalid Orca response file: {error}") from error
+        try:
+            os.fchmod(file_descriptor, 0o600)
+            _validate_private_file(file_descriptor)
+        except OSError as error:
+            raise ChatError(f"invalid Orca response file: {error}") from error
+        finally:
+            os.close(file_descriptor)
+        return self.response_dir / name
 
     def turn(
         self,
@@ -414,19 +536,23 @@ class OrcaClient:
         """
         try:
             fd = os.open(
-                response_file,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+                response_file.name,
+                os.O_RDONLY | PRIVATE_FILE_FLAGS,
+                dir_fd=self._response_directory(),
             )
-        except OSError:
+        except (ChatError, OSError):
             return None
+        transferred = False
         try:
+            _validate_private_file(fd)
             with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
-                if not stat.S_ISREG(os.fstat(fd).st_mode):
-                    return None
+                transferred = True
                 content = handle.read()
-                os.fchmod(fd, 0o600)
-        except OSError:
+        except (ChatError, OSError):
             return None
+        finally:
+            if not transferred:
+                os.close(fd)
         try:
             return extract_reply(content, reply_marker_id)
         except ChatError:
@@ -458,6 +584,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     transcript: Transcript | None = None
+    client: OrcaClient | None = None
     try:
         transcript = Transcript(resolve_state_dir(args.state_dir), args.room)
         if args.show:
@@ -466,14 +593,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         agents = parse_agent_mappings(args.agent)
         agent_timeouts = parse_agent_timeouts(args.agent_timeout, tuple(agents))
+        client = OrcaClient(
+            orca_bin=os.environ.get("ORCA_BIN_PATH", "orca"),
+            timeout_ms=args.timeout_ms,
+            state_dir=resolve_state_dir(args.state_dir),
+        )
         chat = GroupChat(
             transcript,
             agents,
-            OrcaClient(
-                orca_bin=os.environ.get("ORCA_BIN_PATH", "orca"),
-                timeout_ms=args.timeout_ms,
-                state_dir=resolve_state_dir(args.state_dir),
-            ),
+            client,
             max_turns=args.max_turns,
             synthesizer=args.synthesizer,
             agent_timeouts=agent_timeouts,
@@ -500,6 +628,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"orca-group-chat: {error}", file=sys.stderr)
         return 2
     finally:
+        if client is not None:
+            client.close()
         if transcript is not None:
             transcript.close()
 

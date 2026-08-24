@@ -445,6 +445,39 @@ def test_transcript_close_is_idempotent_and_context_managed(tmp_path: Path) -> N
         transcript.read()
 
 
+@pytest.mark.parametrize("failure", ["fstat", "fchmod"])
+def test_transcript_constructor_closes_descriptor_on_validation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    opened: list[int] = []
+    real_open = namespace["os"].open
+    real_fstat = namespace["os"].fstat
+
+    def tracking_open(*args: object, **kwargs: object) -> int:
+        descriptor = real_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(namespace["os"], "open", tracking_open)
+    if failure == "fstat":
+        monkeypatch.setattr(
+            namespace["os"], "fstat", lambda _descriptor: (_ for _ in ()).throw(OSError("injected"))
+        )
+    else:
+
+        def fail_fchmod(_descriptor: int, _mode: int) -> None:
+            raise OSError("injected")
+
+        monkeypatch.setattr(namespace["os"], "fchmod", fail_fchmod)
+
+    with pytest.raises(ChatError, match="invalid state directory"):
+        Transcript(tmp_path / "injected-state", "injected-room")
+    assert opened
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+
+
 def test_existing_state_directory_with_wrong_mode_is_rejected_without_mutation(
     tmp_path: Path,
 ) -> None:
@@ -1723,6 +1756,56 @@ def test_completed_review_notice_can_be_cleared_for_later_chat_status(tmp_path: 
     assert controller.status() == "Review complete."
     controller.clear_notice()
     assert controller.status() == ""
+
+
+def test_immediate_cancel_before_retry_worker_start_targets_fresh_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RetryClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed_once = False
+
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            if target == "claude-peer" and not self.failed_once:
+                self.failed_once = True
+                self.calls.append((target, prompt))
+                self.timeouts.append(timeout_ms)
+                raise ChatError("first attempt failed")
+            return super().turn(target, prompt, timeout_ms, cancel_event)
+
+    transcript = Transcript(tmp_path, "immediate-retry-cancel-room")
+    client = RetryClient()
+    chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client)
+    controller = ReviewController(chat)
+    controller.start("@claude Prepare retry")
+    assert controller.wait(timeout=2)
+
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    original_retry = chat.retry_review
+
+    def gated_retry(*args: object, **kwargs: object) -> object:
+        worker_entered.set()
+        assert release_worker.wait(timeout=2)
+        return original_retry(*args, **kwargs)
+
+    monkeypatch.setattr(chat, "retry_review", gated_retry)
+    assert controller.retry("claude") == "Retrying @claude."
+    assert worker_entered.wait(timeout=1)
+    assert controller.cancel() == "Local cancellation requested; participants may continue working."
+    release_worker.set()
+    assert controller.wait(timeout=2)
+
+    assert controller.status() == "Review cancelled locally; participants may continue working."
+    assert not any(item["kind"] == "review_response" for item in transcript.read())
+    assert len(client.calls) == 1
 
 
 def test_cancel_during_retry_liveness_is_not_erased(tmp_path: Path) -> None:

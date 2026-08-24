@@ -47,6 +47,39 @@ def _run_launcher_lock(state_dir: Path) -> None:
         pass
 
 
+@pytest.mark.parametrize("failure", ["fstat", "fchmod"])
+def test_launcher_directory_closes_descriptor_on_validation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    opened: list[int] = []
+    real_open = module.os.open
+    real_fstat = module.os.fstat
+
+    def tracking_open(*args: object, **kwargs: object) -> int:
+        descriptor = real_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(module.os, "open", tracking_open)
+    if failure == "fstat":
+        monkeypatch.setattr(
+            module.os, "fstat", lambda _descriptor: (_ for _ in ()).throw(OSError("injected"))
+        )
+    else:
+
+        def fail_fchmod(_descriptor: int, _mode: int) -> None:
+            raise OSError("injected")
+
+        monkeypatch.setattr(module.os, "fchmod", fail_fchmod)
+
+    with pytest.raises(BootstrapError, match="invalid launcher state directory"):
+        module._open_launcher_directory(tmp_path / "injected-state")
+    assert opened
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+
+
 def test_launcher_state_is_atomic_private_and_versioned(tmp_path: Path) -> None:
     state = {
         "chat_workspace_id": "w-chat",

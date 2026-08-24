@@ -191,19 +191,26 @@ class Transcript:
             )
         except OSError as error:
             raise ChatError(f"invalid state directory: {error}") from error
-        directory_stat = os.fstat(directory_descriptor)
-        if (
-            not stat.S_ISDIR(directory_stat.st_mode)
-            or directory_stat.st_uid != os.geteuid()
-            or (not directory_created and stat.S_IMODE(directory_stat.st_mode) != 0o700)
-        ):
-            os.close(directory_descriptor)
-            raise ChatError("invalid state directory authority")
-        if directory_created:
-            os.fchmod(directory_descriptor, 0o700)
-        # This descriptor is the authority for the object's whole lifetime.  Do
-        # not reopen the path: its parent may be replaced after validation.
-        self._state_directory_descriptor = directory_descriptor
+        transferred = False
+        try:
+            directory_stat = os.fstat(directory_descriptor)
+            if (
+                not stat.S_ISDIR(directory_stat.st_mode)
+                or directory_stat.st_uid != os.geteuid()
+                or (not directory_created and stat.S_IMODE(directory_stat.st_mode) != 0o700)
+            ):
+                raise ChatError("invalid state directory authority")
+            if directory_created:
+                os.fchmod(directory_descriptor, 0o700)
+            # This descriptor is the authority for the object's whole lifetime.
+            # Do not reopen the path: its parent may be replaced after validation.
+            self._state_directory_descriptor = directory_descriptor
+            transferred = True
+        except OSError as error:
+            raise ChatError(f"invalid state directory: {error}") from error
+        finally:
+            if not transferred:
+                os.close(directory_descriptor)
         self.path = self.state_dir / f"{room}.jsonl"
         self.lock_path = self.state_dir / f"{room}.lock"
         self.cursor_path = self.state_dir / f"{room}.state.json"
@@ -2043,16 +2050,20 @@ class ReviewController:
                     raise ChatError(f"@{name} was not a reviewer in the last round")
                 if name in review.responses:
                     raise ChatError(f"@{name} already has a usable review response")
+                # Install the retry token before publishing the worker.  An
+                # immediate /cancel must target this exact attempt, not the
+                # cancelled token from the prior attempt.
+                review.cancel_event = threading.Event()
             if name == "synthesis":
 
                 def action() -> ReviewRound:
-                    return self.chat.retry_synthesis(review, self._on_state, reset_cancel=True)
+                    return self.chat.retry_synthesis(review, self._on_state, reset_cancel=False)
 
                 label = "synthesis"
             else:
 
                 def action() -> ReviewRound:
-                    return self.chat.retry_review(review, name, self._on_state, reset_cancel=True)
+                    return self.chat.retry_review(review, name, self._on_state, reset_cancel=False)
 
                 label = f"@{name}"
             self._launch(action, review)
