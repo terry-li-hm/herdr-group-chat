@@ -148,9 +148,9 @@ rather than silently offline.
 
 Compact mode keeps the room alone in the initiating workspace and places the
 participant tabs in a secondary `agents · group-chat` workspace, with each
-participant tab labeled `<kind> · group-chat` (for example `pi · group-chat`
-or `sol · group-chat`). These labels are display-only; routing and reuse still key on the
-exact recorded workspace and pane identifiers. Enter `/agents` to
+participant tab labeled `<role> · group-chat` (for example `pi · group-chat` or
+`sol · group-chat`). These labels are display-only; routing and reuse still key
+on the exact recorded workspace and pane identifiers. Enter `/agents` to
 reveal that workspace or `/show pi`, `/show claude`, `/show codex`, or `/show
 grok` to focus one native agent directly. Use Herdr's workspace switcher or
 **Open group chat** to return.
