@@ -17,7 +17,7 @@ Curses remains the better production interface:
 
 Do not wire this prototype into `herdr-plugin.toml` or add a standing Node CI lane. Revisit it only if a concrete requirement such as rich Markdown or interactive terminal components cannot be met cleanly in curses. Any renewed candidate must first match curses on information density, room and participant status, actionable errors, sole-writer behavior, and operation without a Pi process.
 
-## Verify it
+## Reproduce the frozen build
 
 ```bash
 npm ci
@@ -26,9 +26,9 @@ npm run typecheck
 npm run smoke
 ```
 
-## Try it with a classic standalone room
+## Reproduce the standalone-room assay
 
-Start the named Pi, Claude, Codex, and Grok peers in Herdr first. Then run:
+Do not use this as the production room. To reproduce the evaluated path, start the named Pi, Claude, Codex, and Grok peers in Herdr first. Then run:
 
 ```bash
 npm run build
