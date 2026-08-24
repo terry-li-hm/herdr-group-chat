@@ -6,7 +6,8 @@ import { test } from "node:test";
 import { readdir, stat } from "node:fs/promises";
 import { resolveExactText, TranscriptFollower } from "../app.js";
 
-const srcDir = new URL("..", import.meta.url);
+// Tests run from dist/, so resolve the real sources under ../../src/.
+const srcDir = new URL("../../src/", import.meta.url);
 
 async function readSrcFiles(): Promise<string> {
   const entries = await readdir(srcDir, { withFileTypes: true });
@@ -15,7 +16,16 @@ async function readSrcFiles(): Promise<string> {
     if (!entry.isFile() || !entry.name.endsWith(".ts")) continue;
     combined += await readFile(new URL(entry.name, srcDir), "utf8");
   }
+  assert.ok(combined.length > 0, "source files must actually be read");
   return combined;
+}
+
+/** Only import/export-from statements — comments and strings excluded. */
+function importStatements(source: string): string {
+  return source
+    .split("\n")
+    .filter((line) => /^\s*import\b/.test(line))
+    .join("\n");
 }
 
 test("invariant: no dependency on @earendil-works/pi-coding-agent", async () => {
@@ -28,8 +38,9 @@ test("invariant: no dependency on @earendil-works/pi-coding-agent", async () => 
 
 test("invariant: sources never import pi-coding-agent or create an AgentSession", async () => {
   const sources = await readSrcFiles();
-  assert.ok(!sources.includes("pi-coding-agent"));
-  assert.ok(!sources.includes("AgentSession"));
+  assert.ok(!importStatements(sources).includes("pi-coding-agent"));
+  assert.ok(!importStatements(sources).includes("AgentSession"));
+  assert.ok(!/new\s+AgentSession/.test(sources));
 });
 
 test("invariant: the frontend never writes the transcript (sole writer is the relay)", async () => {

@@ -16,7 +16,6 @@ import {
   Editor,
   type EditorTheme,
   Markdown,
-  ProcessTerminal,
   ScrollView,
   Text,
   TuiAltScreen,
@@ -145,7 +144,8 @@ export class ChatApp {
     terminal: import("@earendil-works/pi-tui").Terminal,
     private readonly options: AppOptions,
     follower: TranscriptFollower,
-    spawnBackend: SpawnFn = (command, args) => spawn(command, args),
+    spawnBackend: SpawnFn = (command, args) =>
+      spawn(command, args, { shell: false, stdio: ["ignore", "ignore", "ignore"] }),
   ) {
     this.spawnBackend = spawnBackend;
     this.follower = follower;
@@ -175,6 +175,8 @@ export class ChatApp {
             follow: "end",
           }),
           grow: 1,
+          basis: 0,
+          minSize: 1,
         },
         this.status,
         this.editor,
