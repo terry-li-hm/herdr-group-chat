@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-24
+
 - Make the `sol-fable-grok` three-role room the default composition: action
   id `new` (`New group chat`) now runs `./new-room --launch --profile
   sol-fable-grok` instead of the classic four-agent launch, while the direct
