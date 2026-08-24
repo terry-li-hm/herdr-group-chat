@@ -186,18 +186,19 @@ class Transcript:
             )
         except OSError as error:
             raise ChatError(f"invalid state directory: {error}") from error
-        try:
-            directory_stat = os.fstat(directory_descriptor)
-            if (
-                not stat.S_ISDIR(directory_stat.st_mode)
-                or directory_stat.st_uid != os.geteuid()
-                or (not directory_created and stat.S_IMODE(directory_stat.st_mode) != 0o700)
-            ):
-                raise ChatError("invalid state directory authority")
-            if directory_created:
-                os.fchmod(directory_descriptor, 0o700)
-        finally:
+        directory_stat = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != os.geteuid()
+            or (not directory_created and stat.S_IMODE(directory_stat.st_mode) != 0o700)
+        ):
             os.close(directory_descriptor)
+            raise ChatError("invalid state directory authority")
+        if directory_created:
+            os.fchmod(directory_descriptor, 0o700)
+        # This descriptor is the authority for the object's whole lifetime.  Do
+        # not reopen the path: its parent may be replaced after validation.
+        self._state_directory_descriptor = directory_descriptor
         self.path = self.state_dir / f"{room}.jsonl"
         self.lock_path = self.state_dir / f"{room}.lock"
         self.cursor_path = self.state_dir / f"{room}.state.json"
@@ -216,6 +217,13 @@ class Transcript:
         ):
             raise ChatError("invalid room state authority")
 
+    @staticmethod
+    def _name(path: Path) -> str:
+        name = Path(path).name
+        if not name or name in {".", ".."}:
+            raise ChatError("invalid room state authority")
+        return name
+
     def _open_regular(
         self,
         path: Path,
@@ -223,24 +231,39 @@ class Transcript:
         *,
         missing_ok: bool = False,
     ) -> int | None:
+        name = self._name(path)
         secure_flags = os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW
         created = False
         try:
             if flags & os.O_CREAT and not flags & os.O_EXCL:
                 try:
-                    descriptor = os.open(path, (flags & ~os.O_CREAT) | secure_flags)
+                    descriptor = os.open(
+                        name,
+                        (flags & ~os.O_CREAT) | secure_flags,
+                        dir_fd=self._state_directory_descriptor,
+                    )
                 except FileNotFoundError:
                     try:
                         descriptor = os.open(
-                            path,
+                            name,
                             flags | os.O_EXCL | secure_flags,
                             0o600,
+                            dir_fd=self._state_directory_descriptor,
                         )
                         created = True
                     except FileExistsError:
-                        descriptor = os.open(path, (flags & ~os.O_CREAT) | secure_flags)
+                        descriptor = os.open(
+                            name,
+                            (flags & ~os.O_CREAT) | secure_flags,
+                            dir_fd=self._state_directory_descriptor,
+                        )
             else:
-                descriptor = os.open(path, flags | secure_flags, 0o600)
+                descriptor = os.open(
+                    name,
+                    flags | secure_flags,
+                    0o600,
+                    dir_fd=self._state_directory_descriptor,
+                )
                 created = bool(flags & os.O_CREAT)
         except FileNotFoundError:
             if missing_ok:
@@ -292,23 +315,9 @@ class Transcript:
 
     def _fsync_state_dir(self) -> None:
         try:
-            descriptor = os.open(
-                self.state_dir,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
-            )
+            os.fsync(self._state_directory_descriptor)
         except OSError as error:
             raise ChatError(f"invalid state directory: {error}") from error
-        try:
-            directory_stat = os.fstat(descriptor)
-            if (
-                not stat.S_ISDIR(directory_stat.st_mode)
-                or directory_stat.st_uid != os.geteuid()
-                or stat.S_IMODE(directory_stat.st_mode) != 0o700
-            ):
-                raise ChatError("invalid state directory authority")
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
 
     def read(self) -> list[dict[str, Any]]:
         with self._lock, self._process_lock():
@@ -337,6 +346,45 @@ class Transcript:
             raise ChatError(f"invalid room state: {error}") from error
         return messages
 
+    def _append_unlocked(
+        self,
+        sender: str,
+        recipients: Iterable[str],
+        body: str,
+        *,
+        kind: str = "message",
+        round_id: str | None = None,
+        provisional: bool = False,
+        meta: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        messages = self._read_unlocked()
+        item = {
+            "seq": (messages[-1]["seq"] + 1) if messages else 1,
+            "at": utc_now(),
+            "sender": sender,
+            "recipients": list(recipients),
+            "body": body.strip(),
+            "kind": kind,
+        }
+        if round_id is not None:
+            item["round_id"] = round_id
+        if provisional:
+            item["provisional"] = True
+        if meta is not None:
+            item["meta"] = dict(meta)
+        descriptor = self._open_regular(
+            self.path,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+        )
+        if descriptor is None:  # pragma: no cover - O_CREAT makes this unreachable
+            raise ChatError("invalid transcript")
+        with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._render_cache.clear()
+        return item
+
     def append(
         self,
         sender: str,
@@ -349,33 +397,35 @@ class Transcript:
         meta: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self._lock, self._process_lock():
-            messages = self._read_unlocked()
-            item = {
-                "seq": (messages[-1]["seq"] + 1) if messages else 1,
-                "at": utc_now(),
-                "sender": sender,
-                "recipients": list(recipients),
-                "body": body.strip(),
-                "kind": kind,
-            }
-            if round_id is not None:
-                item["round_id"] = round_id
-            if provisional:
-                item["provisional"] = True
-            if meta is not None:
-                item["meta"] = dict(meta)
-            descriptor = self._open_regular(
-                self.path,
-                os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+            return self._append_unlocked(
+                sender,
+                recipients,
+                body,
+                kind=kind,
+                round_id=round_id,
+                provisional=provisional,
+                meta=meta,
             )
-            if descriptor is None:  # pragma: no cover - O_CREAT makes this unreachable
-                raise ChatError("invalid transcript")
-            with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
-                stream.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            self._render_cache.clear()
-            return item
+
+    def append_if_structured_payload_absent(
+        self,
+        sender: str,
+        recipients: Iterable[str],
+        body: str,
+        *,
+        kind: str,
+        payload: Mapping[str, Any],
+    ) -> bool:
+        """Append once when the exact structured metadata is not already present."""
+        expected = dict(payload)
+        with self._lock, self._process_lock():
+            if any(
+                item.get("kind") == kind and item.get("meta") == expected
+                for item in self._read_unlocked()
+            ):
+                return False
+            self._append_unlocked(sender, recipients, body, kind=kind, meta=expected)
+            return True
 
     def rendered_lines(self, width: int) -> list[str]:
         with self._lock, self._process_lock():
@@ -413,28 +463,43 @@ class Transcript:
             if seq <= cursors.get(agent, 0):
                 return
             cursors[agent] = seq
-            temporary = self.state_dir / f".{self.cursor_path.name}.{uuid.uuid4().hex}.tmp"
+            temporary_name = f".{self.cursor_path.name}.{uuid.uuid4().hex}.tmp"
             descriptor = -1
             try:
-                opened = self._open_regular(
-                    temporary,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                descriptor = os.open(
+                    temporary_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NONBLOCK
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=self._state_directory_descriptor,
                 )
-                if opened is None:  # pragma: no cover - O_CREAT makes this unreachable
-                    raise ChatError("invalid cursor temporary file")
-                descriptor = opened
+                os.fchmod(descriptor, 0o600)
+                self._validate_regular(descriptor)
                 with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                     descriptor = -1
                     stream.write(json.dumps(cursors, sort_keys=True, separators=(",", ":")) + "\n")
                     stream.flush()
                     os.fsync(stream.fileno())
-                os.replace(temporary, self.cursor_path)
+                os.replace(
+                    temporary_name,
+                    self.cursor_path.name,
+                    src_dir_fd=self._state_directory_descriptor,
+                    dst_dir_fd=self._state_directory_descriptor,
+                )
                 self._fsync_state_dir()
+            except FileExistsError as error:
+                raise ChatError("invalid cursor temporary file") from error
+            except OSError as error:
+                raise ChatError(f"invalid room state: {error}") from error
             finally:
                 if descriptor >= 0:
                     os.close(descriptor)
                 with suppress(FileNotFoundError):
-                    temporary.unlink()
+                    os.unlink(temporary_name, dir_fd=self._state_directory_descriptor)
 
 
 class HerdrClient:
@@ -1084,12 +1149,16 @@ class GroupChat:
         future: Future[tuple[str, str]],
         on_state: Callable[[str, str], None] | None,
     ) -> None:
-        if review.cancel_event.is_set() and future.exception() is not None:
-            self._set_review_state(review, agent, "cancelled", on_state)
-            return
         try:
             status, reply = future.result()
         except ChatError as error:
+            with review.lock:
+                cancelled = review.cancel_event.is_set()
+                if cancelled:
+                    review.states[agent] = "cancelled"
+            if cancelled:
+                self._set_review_state(review, agent, "cancelled", on_state)
+                return
             state = failure_state(error)
             self._set_review_state(review, agent, state, on_state)
             self.transcript.append(
@@ -1106,6 +1175,13 @@ class GroupChat:
             # synthesis still runs, and only this reviewer is marked failed.
             # BaseException subclasses (KeyboardInterrupt, SystemExit) still
             # propagate untouched.
+            with review.lock:
+                cancelled = review.cancel_event.is_set()
+                if cancelled:
+                    review.states[agent] = "cancelled"
+            if cancelled:
+                self._set_review_state(review, agent, "cancelled", on_state)
+                return
             self._set_review_state(review, agent, "failed", on_state)
             self.transcript.append(
                 "system",
@@ -1116,7 +1192,13 @@ class GroupChat:
             )
             return
         if status == "blocked":
-            self._set_review_state(review, agent, "blocked", on_state)
+            with review.lock:
+                cancelled = review.cancel_event.is_set()
+                if not cancelled:
+                    review.states[agent] = "blocked"
+            if cancelled:
+                self._set_review_state(review, agent, "cancelled", on_state)
+                return
             self.transcript.append(
                 "system",
                 ("human",),
@@ -1124,17 +1206,27 @@ class GroupChat:
                 kind="review_status",
                 round_id=review.id,
             )
+            self._set_review_state(review, agent, "blocked", on_state)
             return
-        self.transcript.append(
-            agent,
-            ("human", "all"),
-            reply,
-            kind="review_response",
-            round_id=review.id,
-        )
+        # Hold the round lock across the cancellation check, transcript append,
+        # and response mutation. Cancellation cannot commit between the check
+        # and a late successful reply.
         with review.lock:
-            review.responses[agent] = reply
-        self._set_review_state(review, agent, "done", on_state)
+            if review.cancel_event.is_set():
+                review.states[agent] = "cancelled"
+                cancelled = True
+            else:
+                self.transcript.append(
+                    agent,
+                    ("human", "all"),
+                    reply,
+                    kind="review_response",
+                    round_id=review.id,
+                )
+                review.responses[agent] = reply
+                review.states[agent] = "done"
+                cancelled = False
+        self._set_review_state(review, agent, "cancelled" if cancelled else "done", on_state)
 
     def _synthesize_review(
         self,
@@ -1203,7 +1295,11 @@ class GroupChat:
                 self.agents[agent], prompt, self._timeout_for(agent), review.cancel_event
             )
         except ChatError as error:
-            if review.cancel_event.is_set():
+            with review.lock:
+                cancelled = review.cancel_event.is_set()
+                if cancelled:
+                    review.states[agent] = "cancelled"
+            if cancelled:
                 self._set_review_state(review, agent, "cancelled", on_state)
                 return None
             failure = failure_state(error)
@@ -1216,11 +1312,30 @@ class GroupChat:
                 round_id=review.id,
             )
             return None
-        if review.cancel_event.is_set():
+        with review.lock:
+            if review.cancel_event.is_set():
+                review.states[agent] = "cancelled"
+                cancelled = True
+            elif status == "blocked":
+                review.states[agent] = "blocked"
+                cancelled = False
+            else:
+                # This is the single cancellation check that guards a
+                # successful late reply before its append and state mutation.
+                self.transcript.append(
+                    agent,
+                    ("human", "all"),
+                    reply,
+                    kind=kind,
+                    round_id=review.id,
+                    provisional=provisional,
+                )
+                review.states[agent] = "done"
+                cancelled = False
+        if cancelled:
             self._set_review_state(review, agent, "cancelled", on_state)
             return None
         if status == "blocked":
-            self._set_review_state(review, agent, "blocked", on_state)
             self.transcript.append(
                 "system",
                 ("human",),
@@ -1228,10 +1343,8 @@ class GroupChat:
                 kind="review_status",
                 round_id=review.id,
             )
+            self._set_review_state(review, agent, "blocked", on_state)
             return None
-        self.transcript.append(
-            agent, ("human", "all"), reply, kind=kind, round_id=review.id, provisional=provisional
-        )
         self._set_review_state(review, agent, "done", on_state)
         return reply
 
@@ -1525,21 +1638,13 @@ def profile_receipt_body(payload: Mapping[str, Any]) -> str:
 
 
 def record_profile_receipt(transcript: Transcript, payload: Mapping[str, Any]) -> None:
-    """Append the verified receipt once, deduped on its exact structured metadata.
-
-    The transcript is append-only, so reopening or restarting a profile room
-    re-passes the same deterministic payload and never duplicates the entry;
-    default rooms record nothing.
-    """
-    for item in transcript.read():
-        if item.get("kind") == PROFILE_RECEIPT_KIND and item.get("meta") == dict(payload):
-            return
-    transcript.append(
+    """Append the verified receipt once under one transcript process lock."""
+    transcript.append_if_structured_payload_absent(
         "system",
         ("human", "all"),
         profile_receipt_body(payload),
         kind=PROFILE_RECEIPT_KIND,
-        meta=dict(payload),
+        payload=payload,
     )
 
 
@@ -1760,6 +1865,7 @@ class ReviewController:
         self._thread: threading.Thread | None = None
         self._states: dict[str, str] = {}
         self._notice = ""
+        self._cancel_pending = False
 
     def _on_state(self, agent: str, state: str) -> None:
         with self._lock:
@@ -1780,9 +1886,16 @@ class ReviewController:
                 else f"{label} complete."
             )
         with self._lock:
+            # Completion and local cancellation serialize on this same lock.
+            # If cancel already committed the terminal outcome, this worker may
+            # finish quietly but must not replace the cancelled notice.
+            if self._active is not review:
+                self._cancel_pending = False
+                return
             self._last = review
             self._active = None
             self._notice = notice
+            self._cancel_pending = False
 
     def _launch(self, action: Callable[[], ReviewRound], review: ReviewRound) -> None:
         self._active = review
@@ -1853,9 +1966,16 @@ class ReviewController:
             if self._active is None:
                 raise ChatError("there is no active review to cancel")
             review = self._active
-        self.chat.cancel_review(review)
-        with review.lock, self._lock:
+            # Commit cancellation before releasing the controller lock.  The
+            # completion path cannot win after this point, and late replies see
+            # the round event while holding review.lock.
+            self.chat.cancel_review(review)
             self._states = dict(review.states)
+            self._last = review
+            self._active = None
+            self._cancel_pending = True
+            label = "Anneal" if review.mode == "anneal" else "Review"
+            self._notice = f"{label} cancelled locally; participants may continue working."
         return "Local cancellation requested; participants may continue working."
 
     def is_active(self) -> bool:
@@ -1865,6 +1985,11 @@ class ReviewController:
     def status(self) -> str:
         with self._lock:
             if self._active is None:
+                if self._cancel_pending and self._thread is not None and self._thread.is_alive():
+                    order = tuple(dict.fromkeys((*self._last.reviewers, self._last.synthesizer)))
+                    prefix = "Anneal" if self._last.mode == "anneal" else "Review"
+                    labels = [f"@{name} {self._states.get(name, 'queued')}" for name in order]
+                    return f"{prefix}: " + " · ".join(labels)
                 return self._notice
             review = self._active
             order = tuple(dict.fromkeys((*review.reviewers, review.synthesizer)))

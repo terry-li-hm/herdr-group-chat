@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Bind transcript and launcher transactions to validated directory descriptors,
+  deduplicate profile receipts atomically, and discard late review replies after
+  local cancellation while committing one completion or cancellation outcome.
+
 ## [0.5.2] - 2026-08-24
 
 - Stop local review/anneal orchestration without sending terminal keys; retain

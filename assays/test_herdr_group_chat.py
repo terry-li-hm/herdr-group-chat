@@ -151,6 +151,15 @@ def append_one_message(state_dir: str, room: str, body: str, recipient: str = "p
     Transcript(Path(state_dir), room).append("human", (recipient,), body)
 
 
+def concurrent_record_profile_receipt(
+    state_dir: str, room: str, payload: dict, start: object, barrier: object
+) -> None:
+    transcript = Transcript(Path(state_dir), room)
+    assert start.wait(5)
+    barrier.wait(timeout=5)
+    namespace["record_profile_receipt"](transcript, payload)
+
+
 def concurrent_dispatch(
     state_dir: str,
     room: str,
@@ -386,6 +395,42 @@ def test_independent_cursor_advances_merge_without_lost_updates(tmp_path: Path) 
     assert transcript.cursors() == {"claude": 23, "pi": 17}
     assert transcript.cursor_path.stat().st_mode & 0o777 == 0o600
     assert not list(tmp_path.glob(".cursor-room.state.json.*.tmp"))
+
+
+def test_transcript_descriptor_survives_parent_replacement_for_all_authorities(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "bound-state"
+    decoy_dir = tmp_path / "decoy-state"
+    transcript = Transcript(state_dir, "bound-room")
+    transcript.append("human", ("pi",), "before replacement")
+    with transcript.delivery_lock():
+        pass
+    original_lock_inode = transcript.lock_path.stat().st_ino
+    original_delivery_inode = transcript.delivery_lock_path.stat().st_ino
+
+    state_dir.rename(decoy_dir)
+    state_dir.mkdir(mode=0o700)
+    (state_dir / transcript.path.name).write_text('{"seq":999}\n', encoding="utf-8")
+    (state_dir / transcript.path.name).chmod(0o600)
+
+    transcript.append("human", ("pi",), "after replacement")
+    transcript.advance_cursor("pi", 2)
+    with transcript._process_lock():
+        pass
+    with transcript.delivery_lock():
+        pass
+
+    assert [item["body"] for item in transcript.read()] == [
+        "before replacement",
+        "after replacement",
+    ]
+    assert transcript.cursors() == {"pi": 2}
+    assert (state_dir / transcript.path.name).read_text(encoding="utf-8").count("999") == 1
+    assert (decoy_dir / transcript.lock_path.name).stat().st_ino == original_lock_inode
+    assert (decoy_dir / transcript.delivery_lock_path.name).stat().st_ino == original_delivery_inode
+    assert not (state_dir / transcript.lock_path.name).exists()
+    assert not (state_dir / transcript.delivery_lock_path.name).exists()
 
 
 def test_existing_state_directory_with_wrong_mode_is_rejected_without_mutation(
@@ -1163,6 +1208,26 @@ def test_review_interleaving_cannot_hide_an_unrelated_ordinary_message(
     assert "[human] ordinary follow-up" in ordinary_prompt
 
 
+def test_late_success_after_cancellation_is_discarded_before_review_append(
+    tmp_path: Path,
+) -> None:
+    transcript = Transcript(tmp_path, "late-success-room")
+    chat = GroupChat(transcript, {"claude": "claude-peer"}, FakeClient(), synthesizer="claude")
+    review = chat.plan_review("@claude Check the late reply")
+    assert chat._activate_review(review)
+
+    class LateSuccess:
+        def result(self) -> tuple[str, str]:
+            chat.cancel_review(review)
+            return "done", "late reply that must be discarded"
+
+    chat._record_reviewer_result(review, "claude", LateSuccess(), None)
+
+    assert review.states["claude"] == "cancelled"
+    assert review.responses == {}
+    assert not any(item["kind"] == "review_response" for item in transcript.read())
+
+
 def test_review_timeout_is_visible_and_does_not_block_other_agents(tmp_path: Path) -> None:
     class TimeoutClient(FakeClient):
         def turn(
@@ -1273,6 +1338,79 @@ def test_review_controller_cancel_stops_only_local_orchestration(tmp_path: Path)
     assert client.cancelled == []
     assert controller.status() == "Review cancelled locally; participants may continue working."
     assert not any(item["kind"] == "review_synthesis" for item in transcript.read())
+
+
+def test_review_completion_wins_and_cancel_rejects_after_terminal_commit(
+    tmp_path: Path,
+) -> None:
+    class CompletingClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            self.started.set()
+            assert self.release.wait(timeout=2)
+            return super().turn(target, prompt, timeout_ms, cancel_event)
+
+    transcript = Transcript(tmp_path, "completion-wins-room")
+    client = CompletingClient()
+    controller = ReviewController(
+        GroupChat(transcript, {"claude": "claude-peer"}, client, synthesizer="claude")
+    )
+    controller.start("@claude Complete this")
+    assert client.started.wait(timeout=1)
+    client.release.set()
+    assert controller.wait(timeout=2)
+
+    assert controller.status() == "Review complete."
+    with pytest.raises(ChatError, match="no active review"):
+        controller.cancel()
+    assert any(item["kind"] == "review_response" for item in transcript.read())
+
+
+def test_review_cancellation_wins_and_discards_late_success(
+    tmp_path: Path,
+) -> None:
+    class LateClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            self.started.set()
+            assert self.release.wait(timeout=2)
+            return "done", "late successful reply"
+
+    transcript = Transcript(tmp_path, "cancellation-wins-room")
+    client = LateClient()
+    controller = ReviewController(
+        GroupChat(transcript, {"claude": "claude-peer"}, client, synthesizer="claude")
+    )
+    controller.start("@claude Cancel this")
+    assert client.started.wait(timeout=1)
+    assert controller.cancel() == "Local cancellation requested; participants may continue working."
+    client.release.set()
+    assert controller.wait(timeout=2)
+
+    assert controller.status() == "Review cancelled locally; participants may continue working."
+    assert not any(item["kind"] == "review_response" for item in transcript.read())
+    with pytest.raises(ChatError, match="no active review"):
+        controller.cancel()
 
 
 def test_review_start_does_not_block_on_liveness_and_immediate_cancel_writes_nothing(
@@ -2510,6 +2648,41 @@ def test_profile_requires_exactly_both_explicit_agent_roles_through_main(
         == 2
     )
     assert Transcript(tmp_path, "strict-room").read() == []
+
+
+def test_multiprocess_profile_receipt_append_is_atomic(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("fork")
+    start = context.Event()
+    barrier = context.Barrier(2)
+    payload = json.loads(valid_receipt_json)
+    processes = [
+        context.Process(
+            target=concurrent_record_profile_receipt,
+            args=(str(tmp_path), "receipt-race-room", payload, start, barrier),
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    try:
+        for process in processes:
+            process.join(timeout=10)
+        assert all(not process.is_alive() for process in processes)
+        assert [process.exitcode for process in processes] == [0, 0]
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2)
+
+    receipts = [
+        item
+        for item in Transcript(tmp_path, "receipt-race-room").read()
+        if item["kind"] == namespace["PROFILE_RECEIPT_KIND"]
+    ]
+    assert len(receipts) == 1
+    assert receipts[0]["meta"] == payload
 
 
 def test_exact_two_role_mapping_runs_and_receipt_is_recorded_once(

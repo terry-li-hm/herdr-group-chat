@@ -60,7 +60,9 @@ def test_launcher_state_is_atomic_private_and_versioned(tmp_path: Path) -> None:
 
 
 def test_invalid_launcher_state_fails_closed(tmp_path: Path) -> None:
-    launcher_state_path(tmp_path).write_text('{"schema_version":99}\n', encoding="utf-8")
+    path = launcher_state_path(tmp_path)
+    path.write_text('{"schema_version":99}\n', encoding="utf-8")
+    path.chmod(0o600)
 
     with pytest.raises(BootstrapError, match="invalid launcher state schema"):
         load_launcher_state(tmp_path)
@@ -131,6 +133,33 @@ def test_launcher_lock_serializes_competing_transactions(tmp_path: Path) -> None
     second_thread.join(2)
     assert not first_thread.is_alive()
     assert not second_thread.is_alive()
+
+
+def test_launcher_transaction_descriptor_survives_parent_replacement(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "bound-state"
+    decoy_dir = tmp_path / "decoy-state"
+    save_launcher_state(state_dir, {"chat_workspace_id": "bound-before"})
+    state_path = launcher_state_path(state_dir)
+
+    with launcher_state_lock(state_dir) as locked_path:
+        assert locked_path == state_path
+        state_dir.rename(decoy_dir)
+        state_dir.mkdir(mode=0o700)
+        decoy_path = state_dir / state_path.name
+        decoy_path.write_text(
+            '{"schema_version":1,"chat_workspace_id":"decoy"}\n', encoding="utf-8"
+        )
+        decoy_path.chmod(0o600)
+
+        assert load_launcher_state(state_dir, state_path)["chat_workspace_id"] == "bound-before"
+        save_launcher_state(state_dir, {"chat_workspace_id": "bound-after"}, state_path)
+        assert load_launcher_state(state_dir, state_path)["chat_workspace_id"] == "bound-after"
+
+    assert load_launcher_state(decoy_dir, state_path)["chat_workspace_id"] == "bound-after"
+    assert decoy_path.read_text(encoding="utf-8").count("decoy") == 1
+    assert load_launcher_state(state_dir, state_path)["chat_workspace_id"] == "decoy"
 
 
 def test_transaction_refuses_to_write_after_server_socket_replacement(
