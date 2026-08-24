@@ -3109,6 +3109,185 @@ def test_failed_new_grok_tab_is_closed_while_verified_peers_remain(
     assert state["participant_pane_ids"]["fable"] == "w-agents:p-fable"
 
 
+def install_role_replacement_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    live_agents: list[dict],
+    pane_screens: dict[str, str],
+) -> list[list[str]]:
+    """Fake Herdr whose created tabs always get fresh, never-reused pane ids."""
+    calls: list[list[str]] = []
+    created = 0
+    for agent in live_agents:
+        agent["cwd"] = str(tmp_path)
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        nonlocal created
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {"result": {"agents": live_agents}}
+        if arguments[:2] == ["pane", "process-info"]:
+            return {"result": {"process_info": {"foreground_processes": [{"name": "zsh"}]}}}
+        if arguments[:2] == ["tab", "create"]:
+            created += 1
+            return {
+                "result": {
+                    "tab": {"tab_id": f"w-agents:t-fresh{created}"},
+                    "root_pane": {"pane_id": f"w-agents:p-fresh{created}"},
+                }
+            }
+        return {"result": {"type": "ok"}}
+
+    def fake_run_text(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
+        del timeout
+        calls.append(arguments)
+        return pane_screens.get(arguments[2], "")
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    monkeypatch.setattr(module, "run_text", fake_run_text)
+    monkeypatch.setattr(module, "native_catalog_row_present", lambda *_arguments: True)
+    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+    return calls
+
+
+def test_classic_room_replaces_only_the_recorded_grok_role_and_keeps_profile_peers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(module, "HOOK_DISMISS_TIMEOUT_S", 0)
+    calls = install_role_replacement_host(
+        monkeypatch,
+        tmp_path,
+        [dict(agent) for agent in SFG_LIVE_AGENTS],
+        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+    )
+    state = sfg_room_state(tmp_path)
+    for field in (
+        "pending_room_id",
+        "pending_room_operation_id",
+        "pending_room_profile",
+        "pending_room_started_unix_ms",
+    ):
+        state.pop(field)
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+    )
+
+    assert failures == []
+    assert [call for call in calls if call[:2] == ["tab", "close"]] == [
+        ["tab", "close", "w-agents:t-grok"]
+    ]
+    starts = {call[2]: call for call in calls if call[:2] == ["agent", "start"]}
+    assert set(starts) == {"pi-peer", "claude-peer", "codex-peer", "grok-peer"}
+    recorded_grok_pane = state["participant_pane_ids"]["grok"]
+    assert recorded_grok_pane != "w-agents:p-grok"
+    assert starts["grok-peer"][starts["grok-peer"].index("--kind") + 1] == "grok"
+    assert starts["grok-peer"][starts["grok-peer"].index("--pane") + 1] == recorded_grok_pane
+    assert state["participant_pane_ids"]["sol"] == "w-agents:p-sol"
+    assert state["participant_pane_ids"]["fable"] == "w-agents:p-fable"
+    assert state["participant_tab_ids"]["sol"] == "w-agents:t-sol"
+    assert state["participant_tab_ids"]["fable"] == "w-agents:t-fable"
+    assert state["participant_tab_ids"]["grok"] != "w-agents:t-grok"
+    assert "replace @grok" in capsys.readouterr().out.splitlines()
+
+
+def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    live_agents = [
+        {
+            "name": "sol-peer",
+            "kind": "pi",
+            "workspace_id": "w-agents",
+            "cwd": None,
+            "pane_id": "w-agents:p-sol",
+            "tab_id": "w-agents:t-sol",
+        },
+        {
+            "name": "fable-peer",
+            "kind": "claude",
+            "workspace_id": "w-agents",
+            "cwd": None,
+            "pane_id": "w-agents:p-fable",
+            "tab_id": "w-agents:t-fable",
+        },
+        {
+            "name": "grok-peer",
+            "kind": "grok",
+            "workspace_id": "w-agents",
+            "cwd": None,
+            "pane_id": "w-agents:p-grok-peer",
+            "tab_id": "w-agents:t-grok-peer",
+        },
+    ]
+    calls = install_role_replacement_host(
+        monkeypatch,
+        tmp_path,
+        live_agents,
+        {
+            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-fable": FABLE_SCREEN,
+            "w-agents:p-fresh1": GROK_SCREEN,
+        },
+    )
+    state = {
+        "schema_version": 1,
+        "agents_workspace_id": "w-agents",
+        "agents_cwd": str(tmp_path),
+        "participant_pane_ids": {
+            "sol": "w-agents:p-sol",
+            "fable": "w-agents:p-fable",
+            "grok": "w-agents:p-grok-peer",
+        },
+        "participant_tab_ids": {
+            "sol": "w-agents:t-sol",
+            "fable": "w-agents:t-fable",
+            "grok": "w-agents:t-grok-peer",
+        },
+    }
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=module.resolve_profile("sol-fable-grok"),
+    )
+
+    assert failures == []
+    assert [call for call in calls if call[:2] == ["tab", "close"]] == [
+        ["tab", "close", "w-agents:t-grok-peer"]
+    ]
+    starts = {call[2]: call for call in calls if call[:2] == ["agent", "start"]}
+    assert set(starts) == {"grok46-peer"}
+    grok46 = starts["grok46-peer"]
+    assert grok46[grok46.index("--kind") + 1] == "grok"
+    assert grok46[grok46.index("--pane") + 1] == "w-agents:p-fresh1"
+    assert grok46[grok46.index("--") + 1 :] == list(module.GROK_START_ARGS)
+    assert state["participant_pane_ids"] == {
+        "sol": "w-agents:p-sol",
+        "fable": "w-agents:p-fable",
+        "grok": "w-agents:p-fresh1",
+    }
+    assert state["participant_tab_ids"] == {
+        "sol": "w-agents:t-sol",
+        "fable": "w-agents:t-fable",
+        "grok": "w-agents:t-fresh1",
+    }
+    output = capsys.readouterr().out.splitlines()
+    assert "replace @grok" in output
+    assert "ready  @sol (existing sol-peer)" in output
+    assert "ready  @fable (existing fable-peer)" in output
+
+
 def test_room_reopen_reverifies_sol_fable_grok_and_execs_with_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

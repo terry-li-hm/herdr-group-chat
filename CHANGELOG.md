@@ -7,6 +7,11 @@ All notable changes to this project are documented here.
 - Bind transcript and launcher transactions to validated directory descriptors,
   deduplicate profile receipts atomically, and discard late review replies after
   local cancellation while committing one completion or cancellation outcome.
+- Make the one-recorded-participant-per-role contract explicit: the same named
+  participant is reused across profiles, a different requested name for a recorded
+  role intentionally closes the plugin-recorded tab before starting its replacement
+  (visible as `replace @role` in setup output), with symmetric regression coverage
+  for `sol-fable-grok` → classic and classic → `sol-fable-grok` switches.
 
 ## [0.5.2] - 2026-08-24
 

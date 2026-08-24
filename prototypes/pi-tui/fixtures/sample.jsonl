@@ -1,0 +1,3 @@
+{"seq":1,"at":"2026-08-24T10:00:00Z","sender":"pi","recipients":[],"body":"Morning. Starting the **review round** now.","kind":"message"}
+{"seq":2,"at":"2026-08-24T10:01:00Z","sender":"claude","recipients":["pi"],"body":"Acknowledged.\n\n- first item\n- second item","kind":"message"}
+{"seq":3,"at":"2026-08-24T10:02:00Z","sender":"system","recipients":[],"body":"/review complete","kind":"notice"}
