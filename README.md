@@ -307,8 +307,11 @@ than creating an orchestration Task/Dispatch per conversational turn. It
 introduces no new message bus, MCP dependency, plugin framework, cross-host
 support, or automatic terminal lifecycle ownership.
 
-## Experimental pi-tui prototype
+## Evaluated pi-tui prototype
 
-An experimental standalone pi-tui frontend for the relay lives in
-[`prototypes/pi-tui`](prototypes/pi-tui). It is not wired into the plugin and
-does not replace the curses UI.
+A standalone pi-tui frontend for the relay lives in
+[`prototypes/pi-tui`](prototypes/pi-tui). A live A/B assay confirmed its
+peer-neutral boundary but retained curses for production because curses is
+more compact, exposes participant and delivery status, and reports actionable
+relay failures. The prototype is a frozen reference. It is not wired into the
+plugin and has no standing Node CI commitment.

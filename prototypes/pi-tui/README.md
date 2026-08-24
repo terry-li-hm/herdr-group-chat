@@ -2,6 +2,21 @@
 
 This prototype tests `@earendil-works/pi-tui` as a peer-neutral interface for Herdr Group Chat. It does not run a Pi agent session, replace the Python relay, or write the room transcript.
 
+**Status:** evaluated on 24 August 2026 and retained as a frozen reference. The production room keeps the curses UI.
+
+## Evaluation outcome
+
+A live A/B assay ran both interfaces against the same relay and append-only transcript. Four Claude Haiku processes filled every participant role, including `@pi`, so the successful round proved that this frontend does not require a Pi runtime. A turn submitted through curses appeared automatically in the pi-tui view, confirming that the relay remained the sole writer.
+
+Curses remains the better production interface:
+
+- it shows the room, participant readiness, delivery state, and input prompt more compactly;
+- it preserves substantially more transcript context in the same viewport;
+- it reports an actionable failure such as `participant not live in Herdr: @pi`, while this prototype reports only the child exit code;
+- it avoids a second language toolchain and 683 lines of TypeScript UI source.
+
+Do not wire this prototype into `herdr-plugin.toml` or add a standing Node CI lane. Revisit it only if a concrete requirement such as rich Markdown or interactive terminal components cannot be met cleanly in curses. Any renewed candidate must first match curses on information density, room and participant status, actionable errors, sole-writer behavior, and operation without a Pi process.
+
 ## Verify it
 
 ```bash
