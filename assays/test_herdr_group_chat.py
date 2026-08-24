@@ -433,6 +433,18 @@ def test_transcript_descriptor_survives_parent_replacement_for_all_authorities(
     assert not (state_dir / transcript.delivery_lock_path.name).exists()
 
 
+def test_transcript_close_is_idempotent_and_context_managed(tmp_path: Path) -> None:
+    with Transcript(tmp_path, "close-room") as transcript:
+        descriptor = transcript._state_directory_descriptor
+        assert descriptor is not None
+        transcript.append("human", ("pi",), "closed after context")
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+    transcript.close()
+    with pytest.raises(ChatError, match="transcript is closed"):
+        transcript.read()
+
+
 def test_existing_state_directory_with_wrong_mode_is_rejected_without_mutation(
     tmp_path: Path,
 ) -> None:
@@ -1228,6 +1240,65 @@ def test_late_success_after_cancellation_is_discarded_before_review_append(
     assert not any(item["kind"] == "review_response" for item in transcript.read())
 
 
+@pytest.mark.parametrize(
+    "kind,outcome",
+    [
+        ("review_synthesis", "success"),
+        ("anneal_challenge", "blocked"),
+        ("anneal_final", "failure"),
+        ("review_synthesis", "unexpected"),
+    ],
+)
+def test_cancelled_terminal_phase_siblings_commit_no_late_artifact(
+    tmp_path: Path, kind: str, outcome: str
+) -> None:
+    transcript = Transcript(tmp_path, "phase-cancel-room")
+
+    class CancelBeforeOutcomeClient(FakeClient):
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            del target, prompt, timeout_ms
+            assert cancel_event is not None
+            cancel_event.set()
+            if outcome == "blocked":
+                return "blocked", ""
+            if outcome == "failure":
+                raise ChatError("late phase failure")
+            if outcome == "unexpected":
+                raise RuntimeError("late phase crash")
+            return "done", "late phase reply"
+
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer"},
+        CancelBeforeOutcomeClient(),
+    )
+    review = chat.plan_review("@claude Check phase cancellation")
+    assert chat._activate_review(review)
+
+    result = chat._execute_phase(
+        review,
+        "pi",
+        "phase prompt",
+        "synthesizing",
+        None,
+        kind=kind,
+        failure_prefix="@pi phase",
+        blocked_notice="@pi phase is blocked",
+    )
+
+    assert result is None
+    assert review.responses == {}
+    assert review.synthesis is None
+    assert review.states["pi"] == "cancelled"
+    assert not any(item["kind"] in {kind, "review_status"} for item in transcript.read())
+
+
 def test_review_timeout_is_visible_and_does_not_block_other_agents(tmp_path: Path) -> None:
     class TimeoutClient(FakeClient):
         def turn(
@@ -1411,6 +1482,61 @@ def test_review_cancellation_wins_and_discards_late_success(
     assert not any(item["kind"] == "review_response" for item in transcript.read())
     with pytest.raises(ChatError, match="no active review"):
         controller.cancel()
+
+
+def test_cancelled_review_keeps_occupancy_until_worker_drains_before_retry(
+    tmp_path: Path,
+) -> None:
+    class RetryAfterDrainClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_started = threading.Event()
+            self.release_first = threading.Event()
+            self.review_calls = 0
+
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            self.calls.append((target, prompt))
+            self.timeouts.append(timeout_ms)
+            if "Question for independent review" in prompt:
+                self.review_calls += 1
+                if self.review_calls == 1:
+                    self.first_started.set()
+                    assert self.release_first.wait(timeout=2)
+                    return "done", "late first reply"
+                return "done", "retry reply"
+            return "done", "one synthesis"
+
+    transcript = Transcript(tmp_path, "retry-occupancy-room")
+    client = RetryAfterDrainClient()
+    chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client)
+    controller = ReviewController(chat)
+    controller.start("@claude Check overlap")
+    assert client.first_started.wait(timeout=1)
+
+    assert controller.cancel() == "Local cancellation requested; participants may continue working."
+    assert controller.is_active()
+    with pytest.raises(ChatError, match="already running"):
+        controller.start("@claude Must not overlap")
+    with pytest.raises(ChatError, match="active review"):
+        controller.retry("claude")
+
+    client.release_first.set()
+    assert controller.wait(timeout=2)
+    assert not controller.is_active()
+    assert controller.retry("claude") == "Retrying @claude."
+    assert controller.wait(timeout=2)
+
+    items = transcript.read()
+    assert [item["kind"] for item in items].count("review_response") == 1
+    assert [item["kind"] for item in items].count("review_synthesis") == 1
+    assert not any(item["body"] == "late first reply" for item in items)
+    assert client.review_calls == 2
 
 
 def test_review_start_does_not_block_on_liveness_and_immediate_cancel_writes_nothing(

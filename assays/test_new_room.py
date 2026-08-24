@@ -6,6 +6,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
@@ -39,6 +40,11 @@ def herdr_socket_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     socket_path = tmp_path / "herdr.sock"
     socket_path.touch()
     monkeypatch.setenv("HERDR_SOCKET_PATH", str(socket_path))
+
+
+def _run_launcher_lock(state_dir: Path) -> None:
+    with launcher_state_lock(state_dir):
+        pass
 
 
 def test_launcher_state_is_atomic_private_and_versioned(tmp_path: Path) -> None:
@@ -160,6 +166,44 @@ def test_launcher_transaction_descriptor_survives_parent_replacement(
     assert load_launcher_state(decoy_dir, state_path)["chat_workspace_id"] == "bound-after"
     assert decoy_path.read_text(encoding="utf-8").count("decoy") == 1
     assert load_launcher_state(state_dir, state_path)["chat_workspace_id"] == "decoy"
+
+
+def test_launcher_symlink_authority_never_mutates_target(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target-state"
+    target.mkdir(mode=0o700)
+    target.chmod(0o750)
+    sentinel = target / "sentinel"
+    sentinel.write_text("do not touch\n", encoding="utf-8")
+    sentinel.chmod(0o640)
+    state_dir = tmp_path / "state-link"
+    state_dir.symlink_to(target, target_is_directory=True)
+
+    for operation in (
+        lambda: load_launcher_state(state_dir),
+        lambda: _run_launcher_lock(state_dir),
+        lambda: save_launcher_state(state_dir, {"chat_workspace_id": "must-not-write"}),
+    ):
+        with pytest.raises(BootstrapError):
+            operation()
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o750
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sentinel.read_text(encoding="utf-8") == "do not touch\n"
+
+
+def test_nested_launcher_transaction_fails_without_waiting_for_second_lock(
+    tmp_path: Path,
+) -> None:
+    with (
+        launcher_state_lock(tmp_path),
+        pytest.raises(BootstrapError, match="nested launcher state transaction"),
+    ):
+        started = time.monotonic()
+        with launcher_state_lock(tmp_path):
+            pass
+        assert time.monotonic() - started < 0.5
 
 
 def test_transaction_refuses_to_write_after_server_socket_replacement(
