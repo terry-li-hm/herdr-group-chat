@@ -1095,8 +1095,12 @@ def start_participants(
 ) -> tuple[list[str], list[Participant]]:
     """Start (or re-verify) the requested participants, returning setup failures.
 
-    Only participants whose native host evidence verified become routable; an
-    existing mismatched session is excluded without being closed.
+    Exactly one participant is recorded per role: the same exact named
+    participant is reused, while a different requested name for a recorded role
+    intentionally closes the plugin-recorded tab before starting its
+    replacement. Only participants whose native host evidence verified become
+    routable; a live session under the requested name that mismatches its kind,
+    ownership, or native evidence is excluded without being closed.
     """
     if participants is None:
         participants = resolve_profile(None)
@@ -1164,6 +1168,10 @@ def start_participants(
         print(f"start  @{role}", flush=True)
         recorded_pane_id = participant_panes.get(role)
         if recorded_pane_id:
+            # One recorded participant per role: a different requested name
+            # replaces the recorded occupant. The replacement is announced only
+            # once its plugin-recorded tab has actually closed, so a failed
+            # close reports `cleanup @role previous` instead.
             try:
                 close_recorded_participant(
                     herdr_bin,
@@ -1176,6 +1184,7 @@ def start_participants(
                 failures.append(f"@{role}: previous-tab cleanup failed: {error}")
                 print(f"cleanup @{role} previous", flush=True)
                 continue
+            print(f"replace @{role}", flush=True)
             participant_panes.pop(role, None)
             participant_tabs.pop(role, None)
             save_launcher_state(state_dir, state, state_path)
