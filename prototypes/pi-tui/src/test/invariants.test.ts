@@ -102,3 +102,47 @@ test("exact typed text is preserved on submit despite editor trimming", () => {
   // Mismatch falls back to the submitted value.
   assert.equal(resolveExactText("different", "plain"), "plain");
 });
+
+test("fresh room: absent transcript starts empty and the path stays absent", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-tui-fresh-"));
+  const path = join(dir, "room.jsonl");
+  const follower = new TranscriptFollower(path);
+  await follower.start(); // must not throw ENOENT
+  assert.equal(follower.records.length, 0);
+  assert.equal(await follower.poll(), false); // still absent, still quiet
+  assert.equal(
+    (await readdir(dir)).includes("room.jsonl"),
+    false,
+    "follower must never create the transcript",
+  );
+  // A non-ENOENT error still surfaces clearly.
+  await writeFile(join(dir, "blocker"), "x");
+  const blocked = new TranscriptFollower(join(dir, "blocker", "room.jsonl"));
+  // ENOTDIR on the path component, not ENOENT:
+  await assert.rejects(blocked.start(), (error: unknown) => {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code !== undefined && code !== "ENOENT";
+  });
+});
+
+test("fresh room: first record is followed after the relay creates the transcript", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-tui-fresh-"));
+  const path = join(dir, "room.jsonl");
+  const follower = new TranscriptFollower(path);
+  await follower.start();
+  assert.equal(await follower.poll(), false);
+  // Simulate the relay creating and appending the first record (sole writer).
+  await writeFile(
+    path,
+    '{"seq":1,"at":"","sender":"system","recipients":[],"body":"room opened","kind":"message"}\n',
+  );
+  assert.equal(await follower.poll(), true);
+  assert.equal(follower.records.length, 1);
+  assert.equal(follower.records[0]?.body, "room opened");
+  await follower.stop();
+  // The follower's read handle must not have truncated or rewritten anything.
+  assert.equal(
+    (await readFile(path, "utf8")).endsWith("\n"),
+    true,
+  );
+});

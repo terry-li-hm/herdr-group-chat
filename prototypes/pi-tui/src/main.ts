@@ -91,7 +91,7 @@ export async function main(argv: string[]): Promise<void> {
     process.stderr.write(
       `error: cannot read transcript ${args.transcript}: ${(error as Error).message}\n`,
     );
-    process.exit(1);
+    process.exit(1); // ENOENT is already tolerated by follower.start(); other errors are fatal
   }
 
   const app = new ChatApp(new ProcessTerminal(), {

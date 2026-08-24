@@ -93,12 +93,26 @@ export class TranscriptFollower {
   constructor(private readonly path: string) {}
 
   async start(): Promise<void> {
-    this.handle = await open(this.path, "r");
+    await this.openIfPresent();
     await this.poll();
+  }
+
+  /** Open the transcript read-only if it exists; never create it. */
+  private async openIfPresent(): Promise<void> {
+    if (this.handle !== null) return;
+    try {
+      this.handle = await open(this.path, "r");
+    } catch (error) {
+      // A fresh room has no transcript until the relay writes its first
+      // record. The frontend is never the writer, so ENOENT is tolerated and
+      // retried on poll; every other error surfaces.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
   }
 
   /** Poll for appended bytes; return true when new records appeared. */
   async poll(): Promise<boolean> {
+    await this.openIfPresent();
     const handle = this.handle;
     if (handle === null) return false;
     const { size } = await handle.stat();
