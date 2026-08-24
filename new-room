@@ -57,6 +57,12 @@ class Participant:
     name: str
     start_args: tuple[str, ...] = ()
     pane_proofs: tuple[tuple[tuple[str, ...], ...], ...] = ()
+    # Reopen (re-verification) proofs: weaker bounded pane evidence plus exact
+    # native foreground-process argv, for status lines that stop repeating
+    # startup-only banners after the first turn. Empty means fresh proofs apply.
+    reopen_pane_proofs: tuple[tuple[tuple[str, ...], ...], ...] = ()
+    reopen_process_argv0: str = ""
+    reopen_process_args: tuple[str, ...] = ()
     catalog_command: tuple[str, ...] = ()
     provider: str | None = None
     model: str = ""
@@ -91,6 +97,9 @@ PROFILE_PARTICIPANTS: dict[str, tuple[Participant, ...]] = {
             name="fable-peer",
             start_args=("--model", "fable", "--effort", "high"),
             pane_proofs=FABLE_PANE_PROOFS,
+            reopen_pane_proofs=((("fable",), ("5",)),),
+            reopen_process_argv0="claude",
+            reopen_process_args=("--model", "fable", "--effort", "high"),
             model="fable",
             effort="high",
         ),
@@ -497,6 +506,54 @@ def catalog_proof(participant: Participant) -> bool:
 def pane_proof(herdr_bin: str, participant: Participant, pane_id: str) -> bool:
     return not participant.pane_proofs or native_pane_proves(
         herdr_bin, pane_id, participant.pane_proofs
+    )
+
+
+def native_pane_process_proves(
+    herdr_bin: str, pane_id: str, argv0: str, expected_args: Sequence[str]
+) -> bool:
+    """Exact native foreground-process evidence from `pane process-info`.
+
+    A process matches only when its argv0 is exactly the expected executable
+    identity and its argv contains the expected arguments as one contiguous
+    sequence; an MCP child process, a lookalike model string, or reordered
+    arguments never satisfy the proof.
+    """
+    expected = list(expected_args)
+
+    def matches(process: object) -> bool:
+        if not isinstance(process, dict) or str(process.get("argv0") or "") != argv0:
+            return False
+        argv = [str(argument) for argument in process.get("argv", [])]
+        return any(
+            list(argv[position : position + len(expected)]) == expected
+            for position in range(len(argv) - len(expected) + 1)
+        )
+
+    for attempt in range(VERIFY_PANE_ATTEMPTS):
+        payload = run_json(herdr_bin, ["pane", "process-info", "--pane", pane_id])
+        processes = (
+            payload.get("result", {}).get("process_info", {}).get("foreground_processes", [])
+        )
+        if any(matches(process) for process in processes):
+            return True
+        if attempt + 1 < VERIFY_PANE_ATTEMPTS:
+            time.sleep(VERIFY_PANE_INTERVAL_S)
+    return False
+
+
+def reopen_pane_proof(herdr_bin: str, participant: Participant, pane_id: str) -> bool:
+    """Reopen proof: profile-driven; fresh proofs when no reopen fields exist."""
+    if not participant.reopen_pane_proofs and not participant.reopen_process_argv0:
+        return pane_proof(herdr_bin, participant, pane_id)
+    if participant.reopen_pane_proofs and not native_pane_proves(
+        herdr_bin, pane_id, participant.reopen_pane_proofs
+    ):
+        return False
+    if not participant.reopen_process_argv0:
+        return True
+    return native_pane_process_proves(
+        herdr_bin, pane_id, participant.reopen_process_argv0, participant.reopen_process_args
     )
 
 
@@ -1341,7 +1398,7 @@ def reverify_profile_participants(
             or not live_cwd
             or not same_cwd(live_cwd, agents_cwd)
             or not catalog_proof(participant)
-            or not pane_proof(herdr_bin, participant, recorded_pane)
+            or not reopen_pane_proof(herdr_bin, participant, recorded_pane)
         ):
             raise BootstrapError(
                 f"@{participant.role}: {participant.name} failed room profile re-verification; "

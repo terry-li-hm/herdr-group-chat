@@ -1344,6 +1344,14 @@ def test_agent_start_does_not_retry_other_error_codes(
 
 SOL_SCREEN = "Pi\nprovider openai-codex\nmodel gpt-5.6-sol • high\n"
 FABLE_SCREEN = "Claude Code\nFable 5\nreasoning: high effort\n"
+FABLE_POST_TURN_SCREEN = "Claude Code\nFable 5\nwaiting for input\n"
+CLAUDE_FABLE_PROCESS = [
+    {
+        "argv0": "claude",
+        "name": "claude.exe",
+        "argv": ["claude", "--model", "fable", "--effort", "high"],
+    }
+]
 
 
 def install_profile_host(
@@ -1352,6 +1360,7 @@ def install_profile_host(
     pane_screens: dict[str, str],
     catalog_rows: dict[tuple[str, str], bool] | None = None,
     live_agents: list[dict] | None = None,
+    process_infos: dict[str, list[dict]] | None = None,
 ) -> None:
     """Fake Herdr plus the native Pi catalog for profile participant flows."""
     catalog_rows = catalog_rows if catalog_rows is not None else {}
@@ -1378,6 +1387,10 @@ def install_profile_host(
                 }
             }
         if arguments[:2] == ["pane", "process-info"]:
+            pane = arguments[arguments.index("--pane") + 1]
+            processes = (process_infos or {}).get(pane)
+            if processes is not None:
+                return {"result": {"process_info": {"foreground_processes": processes}}}
             return {"result": {"process_info": {"foreground_processes": [{"name": "zsh"}]}}}
         return {"result": {"type": "ok"}}
 
@@ -1750,7 +1763,12 @@ def install_launch_host(
         },
     ]
     install_profile_host(
-        monkeypatch, calls, pane_screens, catalog_rows=catalog_rows, live_agents=live
+        monkeypatch,
+        calls,
+        pane_screens,
+        catalog_rows=catalog_rows,
+        live_agents=live,
+        process_infos={"w-agents:p-fable": CLAUDE_FABLE_PROCESS},
     )
     return calls
 
@@ -1977,6 +1995,159 @@ def test_room_reopen_fails_closed_when_native_evidence_lapsed(
         module.room_entrypoint()
 
     assert "argv" not in captured
+
+
+def test_fresh_fable_proof_still_requires_the_high_effort_banner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh launch keeps the strict two-sequence pane proof."""
+    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+    monkeypatch.setattr(
+        module, "run_text", lambda _herdr_bin, arguments, timeout=30: FABLE_POST_TURN_SCREEN
+    )
+    fable = module.resolve_profile("sol-fable")[1]
+
+    assert not module.pane_proof("herdr", fable, "w-agents:p-fable")
+    # The bounded reopen pane sequence alone must not satisfy the fresh proof.
+    assert not module.native_pane_proves("herdr", "w-agents:p-fable", module.FABLE_PANE_PROOFS)
+
+
+def test_reopen_accepts_post_turn_fable_status_with_exact_process_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real reopen contract: bounded `Fable 5` status plus native claude argv."""
+    captured: dict[str, object] = {}
+    room_reopen_env(tmp_path, monkeypatch, captured, "chat-profile")
+    calls = install_launch_host(
+        tmp_path,
+        monkeypatch,
+        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_POST_TURN_SCREEN},
+    )
+    state = profile_room_state(tmp_path)
+    state.pop("pending_room_id")
+    state.pop("pending_room_operation_id")
+    state.pop("pending_room_profile")
+    state.pop("pending_room_started_unix_ms")
+    state["selected_profile"] = "sol-fable"
+    state["last_room_id"] = "chat-profile"
+    save_launcher_state(tmp_path, state)
+
+    module.room_entrypoint()
+
+    receipt = json.loads(os.environ[module.PROFILE_RECEIPT_ENV])
+    assert receipt["profile"] == "sol-fable"
+    # Only Fable is process-verified; Sol keeps catalog + pane proof alone.
+    process_panes = {
+        call[call.index("--pane") + 1] for call in calls if call[:2] == ["pane", "process-info"]
+    }
+    assert process_panes == {"w-agents:p-fable"}
+
+
+@pytest.mark.parametrize(
+    "processes",
+    [
+        pytest.param([], id="missing-process"),
+        pytest.param(
+            [{"argv0": "claude", "argv": ["claude", "--model", "fable"]}],
+            id="missing-effort",
+        ),
+        pytest.param(
+            [{"argv0": "claude", "argv": ["claude", "--model", "fable", "--effort", "medium"]}],
+            id="wrong-effort",
+        ),
+        pytest.param(
+            [{"argv0": "claude", "argv": ["claude", "--effort", "high", "--model", "fable"]}],
+            id="reordered-args",
+        ),
+        pytest.param(
+            [
+                {
+                    "argv0": "claude",
+                    "argv": ["claude", "--model", "fable", "--session", "x", "--effort", "high"],
+                }
+            ],
+            id="non-contiguous-args",
+        ),
+        pytest.param(
+            [{"argv0": "claude-code", "argv": ["claude", "--model", "fable", "--effort", "high"]}],
+            id="wrong-argv0",
+        ),
+        pytest.param(
+            [{"argv0": "claude", "argv": ["claude", "--model", "fable-5", "--effort", "high"]}],
+            id="model-lookalike",
+        ),
+        pytest.param(
+            [
+                {
+                    "argv0": "node",
+                    "argv": ["node", "mcp", "--model", "fable", "--effort", "high"],
+                }
+            ],
+            id="mcp-child",
+        ),
+    ],
+)
+def test_reopen_fable_process_proof_fails_closed_on_inexact_evidence(
+    monkeypatch: pytest.MonkeyPatch, processes: list[dict]
+) -> None:
+    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        lambda _herdr_bin, arguments, timeout=30: (
+            {"result": {"process_info": {"foreground_processes": processes}}}
+            if arguments[:2] == ["pane", "process-info"]
+            else (_ for _ in ()).throw(AssertionError(arguments))
+        ),
+    )
+    monkeypatch.setattr(
+        module, "run_text", lambda _herdr_bin, arguments, timeout=30: FABLE_POST_TURN_SCREEN
+    )
+    fable = module.resolve_profile("sol-fable")[1]
+
+    assert not module.reopen_pane_proof("herdr", fable, "w-agents:p-fable")
+
+
+def test_reopen_rejects_a_fable_pane_without_bounded_model_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        lambda _herdr_bin, arguments, timeout=30: (
+            {"result": {"process_info": {"foreground_processes": CLAUDE_FABLE_PROCESS}}}
+            if arguments[:2] == ["pane", "process-info"]
+            else (_ for _ in ()).throw(AssertionError(arguments))
+        ),
+    )
+    monkeypatch.setattr(
+        module, "run_text", lambda _herdr_bin, arguments, timeout=30: "Claude Code\nwaiting\n"
+    )
+    fable = module.resolve_profile("sol-fable")[1]
+
+    assert not module.reopen_pane_proof("herdr", fable, "w-agents:p-fable")
+
+
+def test_sol_reopen_proof_never_requires_process_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        lambda _herdr_bin, arguments, timeout=30: (
+            (_ for _ in ()).throw(AssertionError("Sol reopen must not read process info"))
+            if arguments[:2] == ["pane", "process-info"]
+            else {"result": {"type": "ok"}}
+        ),
+    )
+    monkeypatch.setattr(module, "run_text", lambda _herdr_bin, arguments, timeout=30: SOL_SCREEN)
+    monkeypatch.setattr(
+        module,
+        "native_catalog_row_present",
+        lambda command, provider, model: True,
+    )
+    sol = module.resolve_profile("sol-fable")[0]
+
+    assert module.reopen_pane_proof("herdr", sol, "w-agents:p-sol")
 
 
 def test_room_reopen_rejects_stale_cross_room_profile_binding(
