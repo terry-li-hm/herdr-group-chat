@@ -5,10 +5,13 @@
 1. Align the versions in `pyproject.toml` and `herdr-plugin.toml`.
 2. Run `uv lock --check`, the test suite, Ruff over both executables and all
    assays, and Chaperone.
-3. Export the tracked tree into a temporary directory, link that copy as a
-   Herdr plugin, and verify the manifest has no warnings, both actions, both
-   pane entrypoints, exact workspace ownership, reopen behavior, named-session
-   isolation, partial-failure retry behavior, and a four-agent room round.
+3. Export the tracked tree into a temporary directory and link that copy as
+   a Herdr plugin. Verify the manifest has no warnings. Confirm all four
+   actions are present: `new`, `new-sol-fable`, `new-classic`, and `open`.
+   Check both pane entrypoints, exact workspace ownership, and reopen
+   behavior. Also check named-session isolation and partial-failure retry
+   behavior. Run a verified three-agent default (sol-fable-grok) room round
+   and a classic four-agent room round.
 4. Commit the release candidate and create the annotated release tag.
 
 ## Publication gate
