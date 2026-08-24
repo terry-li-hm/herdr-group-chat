@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Stop local review/anneal orchestration without sending terminal keys; retain
+  interleaved transcript messages for later delivery, and reject unsafe or
+  non-private transcript, cursor, and lock authorities without blocking.
+
 ## [0.5.1] - 2026-08-24
 
 - Make the `sol-fable-grok` three-role room the default composition: action

@@ -547,6 +547,7 @@ def test_participant_start_does_not_move_a_globally_named_external_agent(
                 "agents": [
                     {
                         "name": "pi-peer",
+                        "kind": "pi",
                         "pane_id": "w-agents:p-unrecorded",
                         "workspace_id": "w-agents",
                         "cwd": str(tmp_path),
@@ -563,6 +564,64 @@ def test_participant_start_does_not_move_a_globally_named_external_agent(
 
     assert failures and "outside this plugin-owned project" in failures[0]
     assert calls == [["agent", "list"]]
+
+
+@pytest.mark.parametrize(
+    ("reported_kind", "reported_agent"),
+    [("claude", "pi"), ("pi", "claude")],
+)
+def test_same_named_wrong_kind_agent_is_left_open_and_never_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reported_kind: str,
+    reported_agent: str,
+) -> None:
+    calls: list[list[str]] = []
+    participant = module.Participant(role="pi", kind="pi", name="pi-peer")
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        assert arguments == ["agent", "list"]
+        return {
+            "result": {
+                "agents": [
+                    {
+                        "name": "pi-peer",
+                        "kind": reported_kind,
+                        "agent": reported_agent,
+                        "workspace_id": "w-agents",
+                        "cwd": str(tmp_path),
+                        "pane_id": "w-agents:p-pi",
+                        "tab_id": "w-agents:t-pi",
+                    }
+                ]
+            }
+        }
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {
+        "schema_version": 1,
+        "participant_pane_ids": {"pi": "w-agents:p-pi"},
+        "participant_tab_ids": {"pi": "w-agents:t-pi"},
+    }
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=(participant,),
+    )
+
+    assert failures == [
+        "@pi: pi-peer is already running with a different agent kind; the session was left open"
+    ]
+    assert calls == [["agent", "list"]]
+    assert state["participant_pane_ids"] == {"pi": "w-agents:p-pi"}
+    assert state["participant_tab_ids"] == {"pi": "w-agents:t-pi"}
 
 
 def test_indeterminate_agent_start_is_recorded_and_not_duplicated(
@@ -1186,6 +1245,7 @@ def test_launch_hands_participant_failures_to_the_room_process(
                     "agents": [
                         {
                             "name": "pi-peer",
+                            "kind": "pi",
                             "workspace_id": "w-other",
                             "cwd": str(tmp_path),
                             "pane_id": "w-other:p1",
@@ -1239,6 +1299,7 @@ def test_launch_without_failures_clears_stale_setup_failures(
                     "agents": [
                         {
                             "name": "pi-peer",
+                            "kind": "pi",
                             "workspace_id": "w-agents",
                             "cwd": str(tmp_path),
                             "pane_id": "w-agents:p1",
@@ -1703,6 +1764,7 @@ def test_default_participants_stay_unverified_and_unchanged(
                     "agents": [
                         {
                             "name": "pi-peer",
+                            "kind": "pi",
                             "workspace_id": "w-agents",
                             "cwd": str(tmp_path),
                             "pane_id": "w-agents:p1",

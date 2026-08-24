@@ -12,6 +12,7 @@ import curses
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import textwrap
@@ -19,15 +20,16 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from fcntl import LOCK_EX, LOCK_UN, flock
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import quote
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
 DEFAULT_AGENTS = {
     "pi": "pi-peer",
@@ -172,40 +174,167 @@ class Transcript:
         if not ROOM_RE.fullmatch(room):
             raise ChatError("room must match [a-z0-9][a-z0-9_-]{0,31}")
         self.state_dir = state_dir.expanduser()
-        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.state_dir, 0o700)
+        try:
+            self.state_dir.mkdir(parents=True, mode=0o700)
+            directory_created = True
+        except FileExistsError:
+            directory_created = False
+        try:
+            directory_descriptor = os.open(
+                self.state_dir,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        except OSError as error:
+            raise ChatError(f"invalid state directory: {error}") from error
+        try:
+            directory_stat = os.fstat(directory_descriptor)
+            if (
+                not stat.S_ISDIR(directory_stat.st_mode)
+                or directory_stat.st_uid != os.geteuid()
+                or (not directory_created and stat.S_IMODE(directory_stat.st_mode) != 0o700)
+            ):
+                raise ChatError("invalid state directory authority")
+            if directory_created:
+                os.fchmod(directory_descriptor, 0o700)
+        finally:
+            os.close(directory_descriptor)
         self.path = self.state_dir / f"{room}.jsonl"
+        self.lock_path = self.state_dir / f"{room}.lock"
         self.cursor_path = self.state_dir / f"{room}.state.json"
+        self.delivery_lock_path = self.state_dir / f"{room}.delivery.lock"
         self._lock = threading.RLock()
+        self._delivery_lock = threading.RLock()
         self._render_cache: dict[int, tuple[tuple[int, int] | None, list[str]]] = {}
 
-    def _stamp_unlocked(self) -> tuple[int, int] | None:
+    @staticmethod
+    def _validate_regular(descriptor: int) -> None:
+        file_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(file_stat.st_mode) != 0o600
+        ):
+            raise ChatError("invalid room state authority")
+
+    def _open_regular(
+        self,
+        path: Path,
+        flags: int,
+        *,
+        missing_ok: bool = False,
+    ) -> int | None:
+        secure_flags = os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW
+        created = False
         try:
-            stat = self.path.stat()
+            if flags & os.O_CREAT and not flags & os.O_EXCL:
+                try:
+                    descriptor = os.open(path, (flags & ~os.O_CREAT) | secure_flags)
+                except FileNotFoundError:
+                    try:
+                        descriptor = os.open(
+                            path,
+                            flags | os.O_EXCL | secure_flags,
+                            0o600,
+                        )
+                        created = True
+                    except FileExistsError:
+                        descriptor = os.open(path, (flags & ~os.O_CREAT) | secure_flags)
+            else:
+                descriptor = os.open(path, flags | secure_flags, 0o600)
+                created = bool(flags & os.O_CREAT)
         except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        except OSError as error:
+            raise ChatError(f"invalid room state: {error}") from error
+        try:
+            if created:
+                os.fchmod(descriptor, 0o600)
+            self._validate_regular(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def _stamp_unlocked(self) -> tuple[int, int] | None:
+        descriptor = self._open_regular(self.path, os.O_RDONLY, missing_ok=True)
+        if descriptor is None:
             return None
-        return stat.st_mtime_ns, stat.st_size
+        try:
+            file_stat = os.fstat(descriptor)
+            return file_stat.st_mtime_ns, file_stat.st_size
+        finally:
+            os.close(descriptor)
+
+    @contextmanager
+    def _file_lock(self, path: Path) -> Iterator[None]:
+        descriptor = self._open_regular(path, os.O_RDWR | os.O_CREAT)
+        if descriptor is None:  # pragma: no cover - O_CREAT makes this unreachable
+            raise ChatError("invalid room lock")
+        with os.fdopen(descriptor, "a+b") as stream:
+            flock(stream.fileno(), LOCK_EX)
+            try:
+                yield
+            finally:
+                flock(stream.fileno(), LOCK_UN)
+
+    @contextmanager
+    def _process_lock(self) -> Iterator[None]:
+        with self._file_lock(self.lock_path):
+            yield
+
+    @contextmanager
+    def delivery_lock(self) -> Iterator[None]:
+        """Serialize ordinary room delivery across independent room processes."""
+        with self._delivery_lock, self._file_lock(self.delivery_lock_path):
+            yield
+
+    def _fsync_state_dir(self) -> None:
+        try:
+            descriptor = os.open(
+                self.state_dir,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        except OSError as error:
+            raise ChatError(f"invalid state directory: {error}") from error
+        try:
+            directory_stat = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(directory_stat.st_mode)
+                or directory_stat.st_uid != os.geteuid()
+                or stat.S_IMODE(directory_stat.st_mode) != 0o700
+            ):
+                raise ChatError("invalid state directory authority")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def read(self) -> list[dict[str, Any]]:
-        with self._lock:
+        with self._lock, self._process_lock():
             return self._read_unlocked()
 
     def _read_unlocked(self) -> list[dict[str, Any]]:
-        if not self.path.exists():
+        descriptor = self._open_regular(self.path, os.O_RDONLY, missing_ok=True)
+        if descriptor is None:
             return []
         messages: list[dict[str, Any]] = []
-        for line_number, line in enumerate(
-            self.path.read_text(encoding="utf-8").splitlines(), start=1
-        ):
-            if not line.strip():
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise ChatError(f"invalid transcript line {line_number}: {error}") from error
-            if not isinstance(item, dict) or not isinstance(item.get("seq"), int):
-                raise ChatError(f"invalid transcript line {line_number}")
-            messages.append(item)
+        try:
+            with os.fdopen(descriptor, encoding="utf-8") as stream:
+                for line_number, line in enumerate(stream, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError as error:
+                        raise ChatError(
+                            f"invalid transcript line {line_number}: {error}"
+                        ) from error
+                    if not isinstance(item, dict) or not isinstance(item.get("seq"), int):
+                        raise ChatError(f"invalid transcript line {line_number}")
+                    messages.append(item)
+        except (OSError, UnicodeError) as error:
+            raise ChatError(f"invalid room state: {error}") from error
         return messages
 
     def append(
@@ -219,7 +348,7 @@ class Transcript:
         provisional: bool = False,
         meta: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        with self._lock:
+        with self._lock, self._process_lock():
             messages = self._read_unlocked()
             item = {
                 "seq": (messages[-1]["seq"] + 1) if messages else 1,
@@ -235,16 +364,21 @@ class Transcript:
                 item["provisional"] = True
             if meta is not None:
                 item["meta"] = dict(meta)
-            with self.path.open("a", encoding="utf-8") as stream:
+            descriptor = self._open_regular(
+                self.path,
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+            )
+            if descriptor is None:  # pragma: no cover - O_CREAT makes this unreachable
+                raise ChatError("invalid transcript")
+            with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.chmod(self.path, 0o600)
             self._render_cache.clear()
             return item
 
     def rendered_lines(self, width: int) -> list[str]:
-        with self._lock:
+        with self._lock, self._process_lock():
             stamp = self._stamp_unlocked()
             cached = self._render_cache.get(width)
             if cached is not None and cached[0] == stamp:
@@ -253,29 +387,54 @@ class Transcript:
             self._render_cache[width] = (stamp, lines)
             return lines
 
-    def cursors(self) -> dict[str, int]:
-        with self._lock:
-            if not self.cursor_path.exists():
-                return {}
-            try:
-                data = json.loads(self.cursor_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError) as error:
-                raise ChatError(f"invalid room state: {error}") from error
-            if not isinstance(data, dict) or not all(
-                isinstance(key, str) and isinstance(value, int) for key, value in data.items()
-            ):
-                raise ChatError("invalid room state")
-            return data
+    def _cursors_unlocked(self) -> dict[str, int]:
+        descriptor = self._open_regular(self.cursor_path, os.O_RDONLY, missing_ok=True)
+        if descriptor is None:
+            return {}
+        try:
+            with os.fdopen(descriptor, encoding="utf-8") as stream:
+                data = json.load(stream)
+        except (json.JSONDecodeError, OSError, UnicodeError) as error:
+            raise ChatError(f"invalid room state: {error}") from error
+        if not isinstance(data, dict) or not all(
+            isinstance(key, str) and isinstance(value, int) for key, value in data.items()
+        ):
+            raise ChatError("invalid room state")
+        return data
 
-    def save_cursors(self, cursors: dict[str, int]) -> None:
-        with self._lock:
-            temporary = self.cursor_path.with_suffix(".tmp")
-            temporary.write_text(
-                json.dumps(cursors, sort_keys=True, separators=(",", ":")) + "\n",
-                encoding="utf-8",
-            )
-            os.chmod(temporary, 0o600)
-            temporary.replace(self.cursor_path)
+    def cursors(self) -> dict[str, int]:
+        with self._lock, self._process_lock():
+            return self._cursors_unlocked()
+
+    def advance_cursor(self, agent: str, seq: int) -> None:
+        """Atomically merge one monotonic cursor advance across room processes."""
+        with self._lock, self._process_lock():
+            cursors = self._cursors_unlocked()
+            if seq <= cursors.get(agent, 0):
+                return
+            cursors[agent] = seq
+            temporary = self.state_dir / f".{self.cursor_path.name}.{uuid.uuid4().hex}.tmp"
+            descriptor = -1
+            try:
+                opened = self._open_regular(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                )
+                if opened is None:  # pragma: no cover - O_CREAT makes this unreachable
+                    raise ChatError("invalid cursor temporary file")
+                descriptor = opened
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    descriptor = -1
+                    stream.write(json.dumps(cursors, sort_keys=True, separators=(",", ":")) + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, self.cursor_path)
+                self._fsync_state_dir()
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                with suppress(FileNotFoundError):
+                    temporary.unlink()
 
 
 class HerdrClient:
@@ -416,29 +575,19 @@ class HerdrClient:
 
         submitted_at = time.monotonic()
         deadline = submitted_at + (effective_timeout_ms / 1000)
-        try:
-            self._run_interruptible(
-                ["agent", "prompt", target, prompt],
-                cancel_event,
-                timeout=max(1, min(30, effective_timeout_ms / 1000)),
-            )
-        except ChatError as error:
-            if not isinstance(error, CommandLaunchError):
-                # The prompt may still have landed, but no status is known here,
-                # so this cancel stays best-effort.
-                self._cancel_if_working(target, None)
-            raise
+        self._run_interruptible(
+            ["agent", "prompt", target, prompt],
+            cancel_event,
+            timeout=max(1, min(30, effective_timeout_ms / 1000)),
+        )
         saw_working = False
         stable_unmarked = 0
         last_unmarked_read: str | None = None
-        last_status: str | None = None
         while True:
             if cancel_event is not None and cancel_event.is_set():
-                self._cancel_if_working(target, last_status)
                 raise ChatError("review cancelled")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                self._cancel_if_working(target, self._agent_status(target))
                 raise ChatError(f"Herdr command timed out after {effective_timeout_ms} ms")
             try:
                 result = self._run(
@@ -446,17 +595,15 @@ class HerdrClient:
                     timeout=max(0.1, min(5, remaining)),
                 )
             except ChatError:
-                # The status is unknown exactly because this read failed, so the
-                # cancel stays best-effort.
-                self._cancel_if_working(target, None)
+                # A failed status read supplies no positive working observation;
+                # preserve that original error and never interrupt the target.
                 raise
             try:
                 agent_info = json.loads(result.stdout)["result"]["agent"]
                 status = agent_info["agent_status"]
             except (json.JSONDecodeError, KeyError, TypeError) as error:
-                self._cancel_if_working(target, None)
+                # Malformed status is unknown, not evidence that the target is working.
                 raise ChatError(f"Herdr returned an invalid result for {target}") from error
-            last_status = status
             if status == "blocked":
                 return "blocked", ""
             if status == "working":
@@ -516,30 +663,6 @@ class HerdrClient:
             ).stdout
         except ChatError:
             return None
-
-    def cancel(self, target: str) -> None:
-        self._run(["agent", "send-keys", target, "ctrl+c"], timeout=5)
-
-    def _agent_status(self, target: str) -> str | None:
-        """Best-effort current agent status, or None when it cannot be determined."""
-        try:
-            result = self._run(["agent", "get", target], timeout=5)
-            return str(json.loads(result.stdout)["result"]["agent"]["agent_status"])
-        except (ChatError, json.JSONDecodeError, KeyError, TypeError):
-            return None
-
-    def _cancel_if_working(self, target: str, last_known_status: str | None) -> None:
-        """Send Ctrl-C only to an agent believed to be working.
-
-        An idle Codex TUI treats Ctrl-C as quit, which kills the participant
-        process, so an agent last seen idle or done is left alone. When the
-        status is genuinely unknown (the status read itself failed), the cancel
-        stays best-effort as before.
-        """
-        if last_known_status is not None and last_known_status != "working":
-            return
-        with suppress(ChatError):
-            self.cancel(target)
 
     def _local_claude_reply(
         self, target: str, token: str, agent: dict[str, Any] | None = None
@@ -830,37 +953,37 @@ class GroupChat:
     def dispatch(self, text: str) -> list[dict[str, Any]]:
         route = parse_route(text, tuple(self.agents))
         selected = route.recipients[: self.max_turns]
-        self._ensure_live(selected)
-
-        created = [self.transcript.append("human", selected, route.body)]
-        cursors = self.transcript.cursors()
-        for agent in selected:
-            messages = [
-                item
-                for item in self.transcript.read()
-                if item["seq"] > cursors.get(agent, 0) and item["sender"] != agent
-            ]
-            token = uuid.uuid4().hex
-            prompt = build_prompt(agent, messages, token, tuple(self.agents), self.host_label)
-            try:
-                status, reply = self.client.turn(
-                    self.agents[agent], prompt, self._timeout_for(agent)
-                )
-                if status == "blocked":
-                    item = self.transcript.append(
-                        "system",
-                        ("human",),
-                        f"@{agent} is blocked and needs attention in {self.host_label}.",
+        with self.transcript.delivery_lock():
+            self._ensure_live(selected)
+            created = [self.transcript.append("human", selected, route.body)]
+            cursors = self.transcript.cursors()
+            for agent in selected:
+                messages = [
+                    item
+                    for item in self.transcript.read()
+                    if item["seq"] > cursors.get(agent, 0) and item["sender"] != agent
+                ]
+                delivered_through = max(item["seq"] for item in messages)
+                token = uuid.uuid4().hex
+                prompt = build_prompt(agent, messages, token, tuple(self.agents), self.host_label)
+                try:
+                    status, reply = self.client.turn(
+                        self.agents[agent], prompt, self._timeout_for(agent)
                     )
-                else:
-                    item = self.transcript.append(agent, ("human", "all"), reply)
-            except ChatError as error:
-                item = self.transcript.append("system", ("human",), f"@{agent}: {error}")
-            created.append(item)
-            if item["sender"] == agent:
-                cursors[agent] = item["seq"]
-            self.transcript.save_cursors(cursors)
-        return created
+                    if status == "blocked":
+                        item = self.transcript.append(
+                            "system",
+                            ("human",),
+                            f"@{agent} is blocked and needs attention in {self.host_label}.",
+                        )
+                    else:
+                        item = self.transcript.append(agent, ("human", "all"), reply)
+                except ChatError as error:
+                    item = self.transcript.append("system", ("human",), f"@{agent}: {error}")
+                created.append(item)
+                if item["sender"] == agent:
+                    self.transcript.advance_cursor(agent, delivered_through)
+            return created
 
     def plan_review(self, text: str) -> ReviewRound:
         route = parse_route(text, tuple(self.agents))
@@ -1011,11 +1134,6 @@ class GroupChat:
         )
         with review.lock:
             review.responses[agent] = reply
-        cursors = self.transcript.cursors()
-        if review.question_seq is None:
-            raise ChatError("review question is not active")
-        cursors[agent] = review.question_seq
-        self.transcript.save_cursors(cursors)
         self._set_review_state(review, agent, "done", on_state)
 
     def _synthesize_review(
@@ -1111,12 +1229,9 @@ class GroupChat:
                 round_id=review.id,
             )
             return None
-        item = self.transcript.append(
+        self.transcript.append(
             agent, ("human", "all"), reply, kind=kind, round_id=review.id, provisional=provisional
         )
-        cursors = self.transcript.cursors()
-        cursors[agent] = item["seq"]
-        self.transcript.save_cursors(cursors)
         self._set_review_state(review, agent, "done", on_state)
         return reply
 
@@ -1226,7 +1341,8 @@ class GroupChat:
             self.transcript.append(
                 "system",
                 ("human",),
-                "Review cancelled; synthesis was not started.",
+                "Review cancelled locally; participants may continue working; "
+                "synthesis was not started.",
                 kind="review_status",
                 round_id=review.id,
             )
@@ -1658,7 +1774,11 @@ class ReviewController:
             notice = f"Review failed unexpectedly: {error}"
         else:
             label = "Anneal" if review.mode == "anneal" else "Review"
-            notice = f"{label} cancelled." if review.cancel_event.is_set() else f"{label} complete."
+            notice = (
+                f"{label} cancelled locally; participants may continue working."
+                if review.cancel_event.is_set()
+                else f"{label} complete."
+            )
         with self._lock:
             self._last = review
             self._active = None
@@ -1736,7 +1856,7 @@ class ReviewController:
         self.chat.cancel_review(review)
         with review.lock, self._lock:
             self._states = dict(review.states)
-        return "Cancellation requested."
+        return "Local cancellation requested; participants may continue working."
 
     def is_active(self) -> bool:
         with self._lock:
@@ -1934,8 +2054,8 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
             if reviews.is_active():
                 with suppress(ChatError):
                     reviews.cancel()
-                # The workers send Ctrl-C to their agents on their next poll tick; exiting
-                # before that kills the daemon threads and leaves the agents working.
+                # Let local workers observe cancellation; participant tabs are never interrupted
+                # and may continue working after this room exits.
                 reviews.wait(5)
             return
         if key == curses.KEY_PPAGE:

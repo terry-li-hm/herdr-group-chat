@@ -59,9 +59,11 @@ participants review. Pi synthesizes by default.
 
 The room stays responsive while a review runs and shows each participant as
 queued, working, blocked, done, failed, timed out, cancelled, synthesizing, or
-skipped. `/cancel` interrupts only active participant tabs. A failed, blocked,
-timed-out, or cancelled first pass can be retried without rerunning the other
-reviewers; a successful retry triggers a fresh synthesis. Use Page Up and Page
+skipped. `/cancel` stops only the room's local orchestration; it never sends
+Ctrl-C or other keys, so a participant may continue working and its later reply
+is not collected by the cancelled round. A failed, blocked, timed-out, or
+cancelled first pass can be retried without rerunning the other reviewers; a
+successful retry triggers a fresh synthesis. Use Page Up and Page
 Down to scroll the transcript while work continues.
 
 Typing `@` at the start of the recipient token — at the beginning of the line
@@ -79,8 +81,9 @@ over one question. Both answer blind and concurrently (a missing blind reply
 stops the round before synthesis), the author drafts a provisional synthesis,
 the critic challenges it once, and the author alone writes the `anneal_final`.
 Anneal runs through the same single review controller as `/review`, so
-`/cancel` works at every phase, ordinary messages wait, and `/retry` stays
-review-only until a later ordinary review replaces the last round.
+`/cancel` stops local orchestration at every phase without interrupting the
+participant tabs, ordinary messages wait, and `/retry` stays review-only until
+a later ordinary review replaces the last round.
 
 `/inbox` switches the transcript to a presentation-only inbox of final agent
 replies, review syntheses, system notices, and review statuses that need
@@ -239,11 +242,11 @@ Pi/Claude/Codex/Grok four-agent room.
   arbitrary participant selection is not configurable.
 - Retry state is kept in the running room process and does not survive a room
   restart. The transcript itself remains durable.
-- Cancellation sends Ctrl-C to the exact active Herdr agent tab, and only when
-  the agent was observed working: an idle Codex interprets Ctrl-C as quit,
-  which previously killed the participant process on a timeout whose prompt
-  never landed. It remains best-effort because the underlying CLI has no
-  stronger cancellation primitive.
+- Cancellation is local to the room orchestration. The relay never sends
+  Ctrl-C or other terminal keys on `/cancel`, timeout, prompt failure, or status
+  failure because Herdr has no atomic sequence-conditional interrupt. A
+  participant may therefore continue working after the room reports local
+  cancellation or timeout.
 - Rooms are local to one Herdr installation; this is not a network chat server.
 - An agent that finishes without emitting the `HGCHAT_REPLY_*` markers fails the
   turn fast with a clear error once its terminal output is observed stable,

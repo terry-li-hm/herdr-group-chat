@@ -591,6 +591,14 @@ def reopen_pane_proof(herdr_bin: str, participant: Participant, pane_id: str) ->
     )
 
 
+def live_agent_kind_matches(live_agent: Mapping[str, Any], expected_kind: str) -> bool:
+    """Require every reported native-agent identity to match the participant kind."""
+    reported = [
+        str(live_agent[field]) for field in ("kind", "agent") if live_agent.get(field) is not None
+    ]
+    return bool(reported) and all(kind == expected_kind for kind in reported)
+
+
 def needs_native_proof(participant: Participant) -> bool:
     return bool(participant.catalog_command or participant.pane_proofs)
 
@@ -1109,6 +1117,13 @@ def start_participants(
         if live_agent is not None:
             live_cwd = str(live_agent.get("cwd") or live_agent.get("foreground_cwd") or "")
             recorded_pane_id = participant_panes.get(role)
+            if not live_agent_kind_matches(live_agent, participant.kind):
+                failures.append(
+                    f"@{role}: {name} is already running with a different agent kind; "
+                    "the session was left open"
+                )
+                print(f"failed @{role}", flush=True)
+                continue
             if (
                 str(live_agent.get("workspace_id")) != agents_workspace_id
                 or not live_cwd
@@ -1437,7 +1452,7 @@ def reverify_profile_participants(
         recorded_pane = participant_panes.get(participant.role)
         if (
             live_agent is None
-            or str(live_agent.get("kind") or live_agent.get("agent")) != participant.kind
+            or not live_agent_kind_matches(live_agent, participant.kind)
             or str(live_agent.get("workspace_id")) != agents_workspace_id
             or str(live_agent.get("pane_id")) != recorded_pane
             or str(live_agent.get("tab_id")) != participant_tabs.get(participant.role)

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
 import re
+import stat
 import subprocess
 import sys
 import threading
@@ -115,6 +118,90 @@ def make_chat(tmp_path: Path, max_turns: int = 4) -> tuple[object, FakeClient, o
     return chat, client, transcript
 
 
+def concurrent_transcript_writer(
+    state_dir: str,
+    room: str,
+    writer: str,
+    count: int,
+    start: object,
+    barrier: object,
+) -> None:
+    transcript = Transcript(Path(state_dir), room)
+    assert start.wait(5)
+    for index in range(count):
+        barrier.wait(timeout=5)
+        transcript.append(writer, ("human",), f"{writer}-{index}")
+
+
+def concurrent_cursor_advance(
+    state_dir: str,
+    room: str,
+    agent: str,
+    seq: int,
+    start: object,
+    barrier: object,
+) -> None:
+    transcript = Transcript(Path(state_dir), room)
+    assert start.wait(5)
+    barrier.wait(timeout=5)
+    transcript.advance_cursor(agent, seq)
+
+
+def append_one_message(state_dir: str, room: str, body: str, recipient: str = "pi") -> None:
+    Transcript(Path(state_dir), room).append("human", (recipient,), body)
+
+
+def concurrent_dispatch(
+    state_dir: str,
+    room: str,
+    body: str,
+    start: object,
+    barrier: object,
+    prompts: object,
+) -> None:
+    class ProcessClient:
+        def live_targets(self) -> set[str]:
+            return {"pi-peer"}
+
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            prompts.put(prompt)
+            return "done", f"reply to {body}"
+
+    transcript = Transcript(Path(state_dir), room)
+    assert start.wait(5)
+    barrier.wait(timeout=5)
+    GroupChat(transcript, {"pi": "pi-peer"}, ProcessClient()).dispatch(f"@pi {body}")
+
+
+def probe_room_authority(
+    state_dir: str,
+    room: str,
+    authority: str,
+    results: object,
+) -> None:
+    try:
+        transcript = Transcript(Path(state_dir), room)
+        if authority == "cursor":
+            transcript.cursors()
+        elif authority == "delivery_lock":
+            with transcript.delivery_lock():
+                pass
+        else:
+            transcript.read()
+    except ChatError as error:
+        results.put(("rejected", str(error)))
+    except BaseException as error:
+        results.put(("unexpected", repr(error)))
+    else:
+        results.put(("accepted", ""))
+
+
 def test_plain_message_routes_to_all_in_stable_order() -> None:
     assert parse_route("hello", ("pi", "claude", "codex", "grok")) == Route(
         ("pi", "claude", "codex", "grok"), "hello"
@@ -219,6 +306,233 @@ def test_transcript_is_append_only_jsonl_with_monotonic_sequence(
     assert len(transcript.path.read_text(encoding="utf-8").splitlines()) == 2
 
 
+def test_independent_transcript_writers_have_unique_strict_sequences(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("fork")
+    writer_count = 4
+    messages_per_writer = 20
+    start = context.Event()
+    barrier = context.Barrier(writer_count)
+    processes = [
+        context.Process(
+            target=concurrent_transcript_writer,
+            args=(
+                str(tmp_path),
+                "concurrent-room",
+                f"writer-{index}",
+                messages_per_writer,
+                start,
+                barrier,
+            ),
+        )
+        for index in range(writer_count)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    try:
+        for process in processes:
+            process.join(timeout=10)
+        assert all(not process.is_alive() for process in processes)
+        assert [process.exitcode for process in processes] == [0] * writer_count
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2)
+
+    transcript = Transcript(tmp_path, "concurrent-room")
+    raw_lines = transcript.path.read_text(encoding="utf-8").splitlines()
+    messages = [json.loads(line) for line in raw_lines]
+    expected_count = writer_count * messages_per_writer
+    assert len(messages) == expected_count
+    assert [message["seq"] for message in messages] == list(range(1, expected_count + 1))
+    assert {message["body"] for message in messages} == {
+        f"writer-{writer}-{index}"
+        for writer in range(writer_count)
+        for index in range(messages_per_writer)
+    }
+    assert transcript.path.stat().st_mode & 0o777 == 0o600
+    assert transcript.lock_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_independent_cursor_advances_merge_without_lost_updates(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("fork")
+    start = context.Event()
+    barrier = context.Barrier(2)
+    processes = [
+        context.Process(
+            target=concurrent_cursor_advance,
+            args=(str(tmp_path), "cursor-room", agent, seq, start, barrier),
+        )
+        for agent, seq in (("pi", 17), ("claude", 23))
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    try:
+        for process in processes:
+            process.join(timeout=10)
+        assert all(not process.is_alive() for process in processes)
+        assert [process.exitcode for process in processes] == [0, 0]
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2)
+
+    transcript = Transcript(tmp_path, "cursor-room")
+    assert transcript.cursors() == {"claude": 23, "pi": 17}
+    assert transcript.cursor_path.stat().st_mode & 0o777 == 0o600
+    assert not list(tmp_path.glob(".cursor-room.state.json.*.tmp"))
+
+
+def test_existing_state_directory_with_wrong_mode_is_rejected_without_mutation(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "existing-state"
+    state_dir.mkdir(mode=0o700)
+    state_dir.chmod(0o750)
+
+    with pytest.raises(ChatError, match="invalid state directory authority"):
+        Transcript(state_dir, "mode-room")
+
+    assert stat.S_IMODE(state_dir.stat().st_mode) == 0o750
+
+
+def test_cursor_symlink_is_refused_without_touching_its_target(tmp_path: Path) -> None:
+    transcript = Transcript(tmp_path, "symlink-room")
+    target = tmp_path / "outside-cursors.json"
+    original = '{"outside":41}\n'
+    target.write_text(original, encoding="utf-8")
+    transcript.cursor_path.symlink_to(target)
+
+    with pytest.raises(ChatError, match="invalid room state"):
+        transcript.cursors()
+    with pytest.raises(ChatError, match="invalid room state"):
+        transcript.advance_cursor("pi", 42)
+
+    assert transcript.cursor_path.is_symlink()
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize("authority", ["transcript", "cursor", "lock", "delivery_lock"])
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "fifo", "directory"])
+def test_room_authority_rejects_unsafe_files_without_blocking_or_touching_targets(
+    tmp_path: Path,
+    authority: str,
+    unsafe_kind: str,
+) -> None:
+    state_dir = tmp_path / "state"
+    transcript = Transcript(state_dir, "unsafe-room")
+    authority_path = {
+        "transcript": transcript.path,
+        "cursor": transcript.cursor_path,
+        "lock": transcript.lock_path,
+        "delivery_lock": transcript.delivery_lock_path,
+    }[authority]
+    target = tmp_path / f"outside-{authority}.txt"
+    original = b"external authority target\n"
+    if unsafe_kind == "symlink":
+        target.write_bytes(original)
+        authority_path.symlink_to(target)
+    elif unsafe_kind == "fifo":
+        os.mkfifo(authority_path, 0o600)
+    else:
+        authority_path.mkdir(mode=0o700)
+
+    context = multiprocessing.get_context("fork")
+    results = context.Queue()
+    process = context.Process(
+        target=probe_room_authority,
+        args=(str(state_dir), "unsafe-room", authority, results),
+    )
+    process.start()
+    process.join(timeout=2)
+    try:
+        assert not process.is_alive(), f"{authority} {unsafe_kind} probe blocked"
+        assert process.exitcode == 0
+        outcome, detail = results.get(timeout=1)
+        assert outcome == "rejected", detail
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2)
+        results.close()
+        results.join_thread()
+
+    if unsafe_kind == "symlink":
+        assert authority_path.is_symlink()
+        assert target.read_bytes() == original
+    elif unsafe_kind == "fifo":
+        assert stat.S_ISFIFO(authority_path.lstat().st_mode)
+    else:
+        assert authority_path.is_dir()
+
+
+@pytest.mark.parametrize("authority", ["transcript", "cursor", "lock", "delivery_lock"])
+def test_room_authority_rejects_regular_files_without_exact_private_mode(
+    tmp_path: Path,
+    authority: str,
+) -> None:
+    transcript = Transcript(tmp_path, "mode-room")
+    authority_path = {
+        "transcript": transcript.path,
+        "cursor": transcript.cursor_path,
+        "lock": transcript.lock_path,
+        "delivery_lock": transcript.delivery_lock_path,
+    }[authority]
+    authority_path.write_text("{}\n" if authority == "cursor" else "", encoding="utf-8")
+    authority_path.chmod(0o640)
+
+    with pytest.raises(ChatError, match="invalid room state authority"):
+        if authority == "cursor":
+            transcript.cursors()
+        elif authority == "delivery_lock":
+            with transcript.delivery_lock():
+                pass
+        else:
+            transcript.read()
+
+    assert stat.S_IMODE(authority_path.stat().st_mode) == 0o640
+
+
+@pytest.mark.parametrize("path_name", ["path", "cursor_path", "lock_path", "delivery_lock_path"])
+def test_room_authority_requires_current_euid_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path_name: str,
+) -> None:
+    transcript = Transcript(tmp_path, "owner-room")
+    authority_path = getattr(transcript, path_name)
+    authority_path.write_text("", encoding="utf-8")
+    authority_path.chmod(0o600)
+    real_euid = os.geteuid()
+    monkeypatch.setattr(namespace["os"], "geteuid", lambda: real_euid + 1)
+
+    with pytest.raises(ChatError, match="invalid room state authority"):
+        transcript._open_regular(authority_path, os.O_RDONLY)
+
+
+def test_cursor_replace_fsyncs_file_and_parent_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcript = Transcript(tmp_path, "fsync-room")
+    real_fsync = os.fsync
+    synced_types: list[str] = []
+
+    def tracking_fsync(descriptor: int) -> None:
+        mode = os.fstat(descriptor).st_mode
+        synced_types.append("directory" if stat.S_ISDIR(mode) else "file")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(namespace["os"], "fsync", tracking_fsync)
+    transcript.advance_cursor("pi", 7)
+
+    assert synced_types == ["file", "directory"]
+
+
 def test_all_dispatch_is_serial_and_incremental(tmp_path: Path) -> None:
     chat, client, transcript = make_chat(tmp_path)
     created = chat.dispatch("@all choose a design")
@@ -246,6 +560,94 @@ def test_all_dispatch_is_serial_and_incremental(tmp_path: Path) -> None:
     second_pi_prompt = client.calls[-1][1]
     assert "[human] second question" in second_pi_prompt
     assert "[human] choose a design" not in second_pi_prompt
+
+
+def test_message_appended_by_another_process_during_turn_stays_eligible(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "interleaved-state"
+    transcript = Transcript(state_dir, "interleaved-room")
+
+    class InterleavingClient(FakeClient):
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            self.calls.append((target, prompt))
+            self.timeouts.append(timeout_ms)
+            if len(self.calls) == 1:
+                context = multiprocessing.get_context("fork")
+                process = context.Process(
+                    target=append_one_message,
+                    args=(str(state_dir), "interleaved-room", "arrived during turn"),
+                )
+                process.start()
+                process.join(timeout=2)
+                try:
+                    assert not process.is_alive()
+                    assert process.exitcode == 0
+                finally:
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(timeout=2)
+            return "done", f"reply from {target}"
+
+    client = InterleavingClient()
+    chat = GroupChat(transcript, {"pi": "pi-peer"}, client)
+
+    chat.dispatch("@pi first")
+    first_messages = transcript.read()
+    assert [item["body"] for item in first_messages] == [
+        "first",
+        "arrived during turn",
+        "reply from pi-peer",
+    ]
+    assert transcript.cursors()["pi"] == first_messages[0]["seq"]
+
+    chat.dispatch("@pi second")
+    second_prompt = client.calls[-1][1]
+    assert "[human] arrived during turn" in second_prompt
+    assert "[human] second" in second_prompt
+    assert "[human] first" not in second_prompt
+
+
+def test_independent_same_agent_dispatches_do_not_duplicate_delivery(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("fork")
+    start = context.Event()
+    barrier = context.Barrier(2)
+    prompts = context.Queue()
+    bodies = ("first concurrent", "second concurrent")
+    processes = [
+        context.Process(
+            target=concurrent_dispatch,
+            args=(str(tmp_path), "delivery-room", body, start, barrier, prompts),
+        )
+        for body in bodies
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    try:
+        for process in processes:
+            process.join(timeout=10)
+        assert all(not process.is_alive() for process in processes)
+        assert [process.exitcode for process in processes] == [0, 0]
+        observed_prompts = [prompts.get(timeout=1) for _ in processes]
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2)
+        prompts.close()
+        prompts.join_thread()
+
+    for body in bodies:
+        assert sum(f"[human] {body}" in prompt for prompt in observed_prompts) == 1
+    transcript = Transcript(tmp_path, "delivery-room")
+    assert transcript.delivery_lock_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_max_turns_caps_an_all_round(tmp_path: Path) -> None:
@@ -647,7 +1049,7 @@ def test_failed_turn_does_not_drop_context_and_later_agents_continue(tmp_path: P
     retry_prompt = client.calls[-1][1]
     assert "[human] preserve this" in retry_prompt
     assert "[human] retry" in retry_prompt
-    assert transcript.cursors()["pi"] == transcript.read()[-1]["seq"]
+    assert transcript.cursors()["pi"] == transcript.read()[-2]["seq"]
 
 
 class ParallelReviewClient(FakeClient):
@@ -718,6 +1120,47 @@ def test_review_runs_independent_phase_in_parallel_then_synthesizes(tmp_path: Pa
     ]
     assert messages[-1]["kind"] == "review_synthesis"
     assert len({item["round_id"] for item in messages}) == 1
+
+
+def test_review_interleaving_cannot_hide_an_unrelated_ordinary_message(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "review-interleaving-state"
+    transcript = Transcript(state_dir, "review-interleaving-room")
+
+    class InterleavingReviewClient(FakeClient):
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            if "Question for independent review" in prompt:
+                append_one_message(
+                    str(state_dir),
+                    "review-interleaving-room",
+                    "unrelated ordinary message",
+                    "claude",
+                )
+            return super().turn(target, prompt, timeout_ms, cancel_event)
+
+    client = InterleavingReviewClient()
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer"},
+        client,
+        synthesizer="pi",
+    )
+
+    chat.review("@claude Check review cursor safety")
+    assert transcript.cursors() == {}
+
+    chat.dispatch("@claude ordinary follow-up")
+    ordinary_prompt = client.calls[-1][1]
+    assert "[human] unrelated ordinary message" in ordinary_prompt
+    assert "[human] Check review cursor safety" in ordinary_prompt
+    assert "[human] ordinary follow-up" in ordinary_prompt
 
 
 def test_review_timeout_is_visible_and_does_not_block_other_agents(tmp_path: Path) -> None:
@@ -791,9 +1234,7 @@ def test_unexpected_reviewer_error_still_drains_peers_and_synthesizes(tmp_path: 
     assert review.synthesis == "reply from pi-peer"
 
 
-def test_review_controller_is_non_blocking_and_cancels_exact_active_target(
-    tmp_path: Path,
-) -> None:
+def test_review_controller_cancel_stops_only_local_orchestration(tmp_path: Path) -> None:
     class BlockingClient(FakeClient):
         def __init__(self) -> None:
             super().__init__()
@@ -813,13 +1254,8 @@ def test_review_controller_is_non_blocking_and_cancels_exact_active_target(
                 self.started.set()
                 while not self.release.wait(timeout=0.01):
                     if cancel_event is not None and cancel_event.is_set():
-                        self.cancel(target)
                         raise ChatError("review cancelled")
             return "done", f"reply from {target}"
-
-        def cancel(self, target: str) -> None:
-            super().cancel(target)
-            self.release.set()
 
     transcript = Transcript(tmp_path, "cancel-room")
     client = BlockingClient()
@@ -831,11 +1267,11 @@ def test_review_controller_is_non_blocking_and_cancels_exact_active_target(
     assert client.started.wait(timeout=1)
     assert controller.is_active()
     assert "@claude working" in controller.status()
-    assert controller.cancel() == "Cancellation requested."
+    assert controller.cancel() == "Local cancellation requested; participants may continue working."
     assert controller.wait(timeout=2)
 
-    assert client.cancelled == ["claude-peer"]
-    assert controller.status() == "Review cancelled."
+    assert client.cancelled == []
+    assert controller.status() == "Review cancelled locally; participants may continue working."
     assert not any(item["kind"] == "review_synthesis" for item in transcript.read())
 
 
@@ -860,7 +1296,7 @@ def test_review_start_does_not_block_on_liveness_and_immediate_cancel_writes_not
 
     assert controller.start("@claude Check this").startswith("Review started")
     assert client.check_started.wait(timeout=1)
-    assert controller.cancel() == "Cancellation requested."
+    assert controller.cancel() == "Local cancellation requested; participants may continue working."
     assert "@claude cancelled" in controller.status()
     client.release_check.set()
     assert controller.wait(timeout=2)
@@ -890,7 +1326,6 @@ def test_interrupted_synthesis_is_cancelled_without_failure_entry(tmp_path: Path
             self.synthesis_started.set()
             assert cancel_event is not None
             assert cancel_event.wait(timeout=2)
-            self.cancel(target)
             raise ChatError("review cancelled")
 
     transcript = Transcript(tmp_path, "synthesis-cancel-room")
@@ -900,11 +1335,11 @@ def test_interrupted_synthesis_is_cancelled_without_failure_entry(tmp_path: Path
 
     controller.start("@claude Check this")
     assert client.synthesis_started.wait(timeout=1)
-    assert controller.cancel() == "Cancellation requested."
+    assert controller.cancel() == "Local cancellation requested; participants may continue working."
     assert controller.wait(timeout=2)
 
-    assert client.cancelled == ["pi-peer"]
-    assert controller.status() == "Review cancelled."
+    assert client.cancelled == []
+    assert controller.status() == "Review cancelled locally; participants may continue working."
     assert not any("synthesis failed" in item["body"] for item in transcript.read())
     assert not any(item["kind"] == "review_synthesis" for item in transcript.read())
 
@@ -1000,12 +1435,12 @@ def test_cancel_during_retry_liveness_is_not_erased(tmp_path: Path) -> None:
 
     assert controller.retry("claude") == "Retrying @claude."
     assert client.retry_check_started.wait(timeout=1)
-    assert controller.cancel() == "Cancellation requested."
+    assert controller.cancel() == "Local cancellation requested; participants may continue working."
     client.release_retry_check.set()
     assert controller.wait(timeout=2)
 
     assert len(client.calls) == 1
-    assert controller.status() == "Review cancelled."
+    assert controller.status() == "Review cancelled locally; participants may continue working."
 
 
 def test_unstarted_review_cannot_append_retry_artifacts(tmp_path: Path) -> None:
@@ -1091,17 +1526,6 @@ def test_transcript_render_cache_is_reused_and_invalidated_on_append(tmp_path: P
     second = transcript.rendered_lines(80)
     assert second is not first
     assert "pi> second" in second
-
-
-def test_herdr_cancel_uses_exact_target_and_ctrl_c() -> None:
-    calls: list[list[str]] = []
-
-    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
-        calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
-
-    HerdrClient(herdr_bin="herdr-test", runner=runner).cancel("claude-peer")
-    assert calls == [["herdr-test", "agent", "send-keys", "claude-peer", "ctrl+c"]]
 
 
 def test_herdr_turn_submits_then_polls_for_token_bound_reply(
@@ -1222,34 +1646,7 @@ def test_herdr_turn_tolerates_refused_or_slow_terminal_reads(
     assert [call[1:3] for call in calls].count(["agent", "read"]) == 3
 
 
-def test_herdr_turn_cancels_after_submission_if_request_arrived_during_submit() -> None:
-    calls: list[list[str]] = []
-    cancel_event = threading.Event()
-    token = "b" * 32
-
-    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
-        calls.append(argv)
-        if argv[1:3] == ["agent", "prompt"]:
-            cancel_event.set()
-        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
-
-    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
-    with pytest.raises(ChatError, match="review cancelled"):
-        client.turn(
-            "claude-peer",
-            f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
-            12_000,
-            cancel_event,
-        )
-
-    assert [call[1:3] for call in calls] == [
-        ["agent", "prompt"],
-        ["agent", "send-keys"],
-    ]
-    assert calls[-1][-2:] == ["claude-peer", "ctrl+c"]
-
-
-def test_herdr_submission_process_is_terminated_on_immediate_cancel() -> None:
+def test_review_cancel_stops_the_local_prompt_process_without_sending_keys() -> None:
     calls: list[list[str]] = []
     cancel_event = threading.Event()
     token = "c" * 32
@@ -1295,10 +1692,7 @@ def test_herdr_submission_process_is_terminated_on_immediate_cancel() -> None:
         )
 
     assert process.terminated
-    assert [call[1:3] for call in calls] == [
-        ["agent", "prompt"],
-        ["agent", "send-keys"],
-    ]
+    assert [call[1:3] for call in calls] == [["agent", "prompt"]]
 
 
 def test_herdr_stop_process_returns_after_a_second_communicate_timeout() -> None:
@@ -1329,18 +1723,22 @@ def test_herdr_stop_process_returns_after_a_second_communicate_timeout() -> None
     assert all(timeout is not None and timeout > 0 for timeout in process.communicate_timeouts)
 
 
-def test_herdr_turn_timeout_interrupts_active_target(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_herdr_turn_timeout_never_sends_keys_to_observed_working_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[list[str]] = []
     token = "d" * 32
-    ticks = iter((0.0, 2.0))
+    ticks = iter((0.0, 0.0, 2.0))
     monkeypatch.setattr(namespace["time"], "monotonic", lambda: next(ticks))
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
 
     def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
-        if argv[1:3] == ["agent", "get"]:
-            stdout = '{"result":{"agent":{"agent_status":"working"}}}'
-        else:
-            stdout = "{}"
+        stdout = (
+            '{"result":{"agent":{"agent_status":"working"}}}'
+            if argv[1:3] == ["agent", "get"]
+            else "{}"
+        )
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
     client = HerdrClient(herdr_bin="herdr-test", runner=runner)
@@ -1351,80 +1749,23 @@ def test_herdr_turn_timeout_interrupts_active_target(monkeypatch: pytest.MonkeyP
             1_000,
         )
 
-    assert [call[1:3] for call in calls] == [
-        ["agent", "prompt"],
-        ["agent", "get"],
-        ["agent", "send-keys"],
-    ]
+    assert [call[1:3] for call in calls] == [["agent", "prompt"], ["agent", "get"]]
 
 
-def test_herdr_turn_timeout_does_not_ctrl_c_an_idle_agent(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("status", ["working", "idle"])
+def test_review_cancel_never_sends_keys_for_working_or_idle_status(
+    status: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An idle Codex treats Ctrl-C as quit; a timeout with no landed prompt must not kill it."""
     calls: list[list[str]] = []
+    cancel_event = threading.Event()
     token = "6" * 32
     monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
 
     def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
         if argv[1:3] == ["agent", "get"]:
-            stdout = '{"result":{"agent":{"agent_status":"idle"}}}'
-        else:
-            stdout = "{}"
-        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
-
-    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
-    with pytest.raises(ChatError, match="timed out after 50 ms"):
-        client.turn(
-            "codex-peer",
-            f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
-            50,
-        )
-
-    assert ["agent", "send-keys"] not in [call[1:3] for call in calls]
-
-
-def test_herdr_turn_timeout_ctrl_c_reaches_a_working_agent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[list[str]] = []
-    token = "7" * 32
-    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
-
-    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
-        calls.append(argv)
-        if argv[1:3] == ["agent", "get"]:
-            stdout = '{"result":{"agent":{"agent_status":"working"}}}'
-        else:
-            stdout = "{}"
-        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
-
-    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
-    with pytest.raises(ChatError, match="timed out after 50 ms"):
-        client.turn(
-            "claude-peer",
-            f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
-            50,
-        )
-
-    assert [call[1:3] for call in calls][-2:] == [["agent", "get"], ["agent", "send-keys"]]
-    assert calls[-1][-2:] == ["claude-peer", "ctrl+c"]
-
-
-def test_herdr_turn_review_cancel_skips_ctrl_c_for_an_idle_agent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[list[str]] = []
-    cancel_event = threading.Event()
-    token = "8" * 32
-    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
-
-    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
-        calls.append(argv)
-        if argv[1:3] == ["agent", "get"]:
             cancel_event.set()
-            stdout = '{"result":{"agent":{"agent_status":"idle"}}}'
+            stdout = f'{{"result":{{"agent":{{"agent_status":"{status}"}}}}}}'
         else:
             stdout = "{}"
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
@@ -1438,10 +1779,43 @@ def test_herdr_turn_review_cancel_skips_ctrl_c_for_an_idle_agent(
             cancel_event,
         )
 
-    assert ["agent", "send-keys"] not in [call[1:3] for call in calls]
+    assert [call[1:3] for call in calls] == [["agent", "prompt"], ["agent", "get"]]
 
 
-def test_invalid_post_submission_status_interrupts_active_target() -> None:
+def test_review_cancel_never_acts_on_a_stale_working_observation() -> None:
+    calls: list[list[str]] = []
+    cancel_event = threading.Event()
+    token = "0" * 32
+    gets = 0
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        nonlocal gets
+        calls.append(argv)
+        if argv[1:3] == ["agent", "get"]:
+            gets += 1
+            if gets == 1:
+                cancel_event.set()
+                stdout = '{"result":{"agent":{"agent_status":"working"}}}'
+            else:
+                stdout = '{"result":{"agent":{"agent_status":"idle"}}}'
+        else:
+            stdout = "{}"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    with pytest.raises(ChatError, match="review cancelled"):
+        client.turn(
+            "claude-peer",
+            f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+            12_000,
+            cancel_event,
+        )
+
+    assert gets == 1
+    assert [call[1:3] for call in calls] == [["agent", "prompt"], ["agent", "get"]]
+
+
+def test_invalid_post_submission_status_preserves_error_without_interrupting() -> None:
     calls: list[list[str]] = []
     token = "e" * 32
 
@@ -1461,19 +1835,38 @@ def test_invalid_post_submission_status_interrupts_active_target() -> None:
     assert [call[1:3] for call in calls] == [
         ["agent", "prompt"],
         ["agent", "get"],
-        ["agent", "send-keys"],
     ]
 
 
-def test_submission_command_failure_interrupts_possibly_active_target() -> None:
+def test_failed_post_submission_status_preserves_error_without_interrupting() -> None:
+    calls: list[list[str]] = []
+    token = "9" * 32
+
+    def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1:3] == ["agent", "get"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="status failed")
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    with pytest.raises(ChatError, match="status failed"):
+        client.turn(
+            "claude-peer",
+            f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+            12_000,
+        )
+
+    assert [call[1:3] for call in calls] == [["agent", "prompt"], ["agent", "get"]]
+
+
+def test_prompt_failure_preserves_error_and_never_interrupts() -> None:
     calls: list[list[str]] = []
     token = "f" * 32
 
     def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
-        if argv[1:3] == ["agent", "prompt"]:
-            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="submit failed")
-        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+        assert argv[1:3] == ["agent", "prompt"]
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="submit failed")
 
     client = HerdrClient(herdr_bin="herdr-test", runner=runner)
     with pytest.raises(ChatError, match="submit failed"):
@@ -1483,10 +1876,7 @@ def test_submission_command_failure_interrupts_possibly_active_target() -> None:
             12_000,
         )
 
-    assert [call[1:3] for call in calls] == [
-        ["agent", "prompt"],
-        ["agent", "send-keys"],
-    ]
+    assert [call[1:3] for call in calls] == [["agent", "prompt"]]
 
 
 def test_herdr_turn_detects_clipped_hooks_dialog_as_blocked(
@@ -1893,7 +2283,10 @@ def test_cancel_stops_anneal_at_each_phase(tmp_path: Path, phase: str, marker: s
     try:
         controller.start_anneal("@claude,@grok Harden this plan")
         assert client.phase_started.wait(timeout=2)
-        assert controller.cancel() == "Cancellation requested."
+        assert (
+            controller.cancel()
+            == "Local cancellation requested; participants may continue working."
+        )
         assert controller.wait(timeout=2)
     finally:
         client.phase_started.set()
@@ -1904,7 +2297,7 @@ def test_cancel_stops_anneal_at_each_phase(tmp_path: Path, phase: str, marker: s
         assert "anneal_challenge" not in kinds
     if phase == "blind":
         assert "review_synthesis" not in kinds
-    assert controller.status() == "Anneal cancelled."
+    assert controller.status() == "Anneal cancelled locally; participants may continue working."
 
 
 def test_retry_is_rejected_after_anneal_until_a_later_review(tmp_path: Path) -> None:
