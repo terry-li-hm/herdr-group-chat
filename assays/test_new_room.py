@@ -2420,3 +2420,543 @@ def test_launch_argument_parsing_is_exact() -> None:
         module.parse_launch_arguments(["--launch", "--profile", "sol-fable", "extra"])
     with pytest.raises(BootstrapError, match="unknown arguments"):
         module.parse_launch_arguments(["--frobnicate"])
+
+
+# --- default sol-fable-grok profile ---------------------------------------------------
+
+GROK_SCREEN = "Grok CLI\nmodel Grok 4.6\nreasoning effort: high\n"
+GROK_POST_TURN_SCREEN = "Grok CLI\nGrok 4.6 (high)\nwaiting for input\n"
+GROK_PROCESS = [
+    {
+        "argv0": "grok",
+        "name": "grok.exe",
+        "argv": [
+            "grok",
+            "--model",
+            "grok-4.6",
+            "--reasoning-effort",
+            "high",
+            "--no-memory",
+            "--disable-web-search",
+            "--no-subagents",
+            "--permission-mode",
+            "bypassPermissions",
+        ],
+    }
+]
+SFG_LIVE_AGENTS = [
+    {
+        "name": "sol-peer",
+        "kind": "pi",
+        "workspace_id": "w-agents",
+        "cwd": None,
+        "pane_id": "w-agents:p-sol",
+        "tab_id": "w-agents:t-sol",
+    },
+    {
+        "name": "fable-peer",
+        "kind": "claude",
+        "workspace_id": "w-agents",
+        "cwd": None,
+        "pane_id": "w-agents:p-fable",
+        "tab_id": "w-agents:t-fable",
+    },
+    {
+        "name": "grok46-peer",
+        "kind": "grok",
+        "workspace_id": "w-agents",
+        "cwd": None,
+        "pane_id": "w-agents:p-grok",
+        "tab_id": "w-agents:t-grok",
+    },
+]
+
+
+def sfg_room_state(tmp_path: Path, room: str = "chat-sfg") -> dict:
+    return {
+        "schema_version": 1,
+        "agents_workspace_id": "w-agents",
+        "agents_cwd": str(tmp_path),
+        "participant_pane_ids": {
+            "sol": "w-agents:p-sol",
+            "fable": "w-agents:p-fable",
+            "grok": "w-agents:p-grok",
+        },
+        "participant_tab_ids": {
+            "sol": "w-agents:t-sol",
+            "fable": "w-agents:t-fable",
+            "grok": "w-agents:t-grok",
+        },
+        "pending_room_id": room,
+        "pending_room_operation_id": "operation-test",
+        "pending_room_profile": "sol-fable-grok",
+        "pending_room_started_unix_ms": int(module.time.time() * 1000),
+    }
+
+
+def install_sfg_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pane_screens: dict[str, str],
+    live_agents: list[dict] | None = None,
+    process_infos: dict[str, list[dict]] | None = None,
+) -> list[list[str]]:
+    """Fake Herdr for the three-role profile with all live sessions pre-seeded."""
+    calls: list[list[str]] = []
+    live = live_agents if live_agents is not None else SFG_LIVE_AGENTS
+    for agent in live:
+        agent["cwd"] = str(tmp_path)
+    install_profile_host(
+        monkeypatch,
+        calls,
+        pane_screens,
+        live_agents=live,
+        process_infos=process_infos,
+    )
+    return calls
+
+
+def test_sol_fable_grok_composes_reused_participants_in_exact_order() -> None:
+    sol_fable = module.resolve_profile("sol-fable")
+    triple = module.resolve_profile("sol-fable-grok")
+
+    assert [(p.role, p.name, p.kind) for p in triple] == [
+        ("sol", "sol-peer", "pi"),
+        ("fable", "fable-peer", "claude"),
+        ("grok", "grok46-peer", "grok"),
+    ]
+    assert triple[0] is sol_fable[0]  # Sol and Fable are reused, not duplicated
+    assert triple[1] is sol_fable[1]
+    # The stored sol-fable tuple is exactly the same objects and no Grok.
+    assert sol_fable == (module.SOL_PARTICIPANT, module.FABLE_PARTICIPANT)
+    assert all(participant is not module.GROK_PARTICIPANT for participant in sol_fable)
+    arguments, receipt = module.profile_room_exec("sol-fable-grok", triple)
+    assert arguments[arguments.index("--synthesizer") + 1] == "sol"
+    grok_entry = json.loads(receipt)["verified"]
+    grok = next(entry for entry in grok_entry if entry["role"] == "grok")
+    assert grok == {
+        "role": "grok",
+        "target": "grok46-peer",
+        "harness": "grok",
+        "model": "grok-4.6",
+        "effort": "high",
+        "verification": "native-ui verified",
+    }
+    assert len(sol_fable) == 2  # the stored sol-fable profile is unchanged
+
+
+def test_reopen_grok_fails_when_pane_text_mismatches_despite_exact_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exact process argv alone is insufficient: the pane must still show 4.6."""
+    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        lambda _herdr_bin, arguments, timeout=30: (
+            {"result": {"process_info": {"foreground_processes": GROK_PROCESS}}}
+            if arguments[:2] == ["pane", "process-info"]
+            else (_ for _ in ()).throw(AssertionError(arguments))
+        ),
+    )
+    monkeypatch.setattr(
+        module, "run_text", lambda _herdr_bin, _arguments, timeout=30: "Grok CLI\nGrok 4.6.1\n"
+    )
+    grok = module.resolve_profile("sol-fable-grok")[2]
+
+    assert not module.reopen_pane_proof("herdr", grok, "w-agents:p-grok")
+
+
+def test_grok_participant_uses_exact_start_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    grok = module.resolve_profile("sol-fable-grok")[2]
+
+    assert grok.start_args == (
+        "--model",
+        "grok-4.6",
+        "--reasoning-effort",
+        "high",
+        "--no-memory",
+        "--disable-web-search",
+        "--no-subagents",
+        "--permission-mode",
+        "bypassPermissions",
+    )
+    assert grok.tab_path_prefix == "~/.grok/bin"
+    assert (grok.reopen_process_argv0, grok.reopen_process_args) == (
+        "grok",
+        grok.start_args,
+    )
+
+
+def test_grok_tab_gets_prepended_grok_bin_path_and_exact_start_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    calls = install_sfg_host(
+        monkeypatch,
+        tmp_path,
+        {
+            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-fable": FABLE_SCREEN,
+            "w-agents:p-grok": GROK_SCREEN,
+        },
+        live_agents=[],
+    )
+    state: dict = {"schema_version": 1}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=module.resolve_profile("sol-fable-grok"),
+    )
+
+    assert failures == []
+    creates = [call for call in calls if call[:2] == ["tab", "create"]]
+    expected_env = f"PATH={Path('~/.grok/bin').expanduser()}{os.pathsep}/usr/bin:/bin"
+    grok_create = next(
+        create
+        for create in creates
+        if create[create.index("--label") + 1].startswith("hgchat-grok-")
+    )
+    other_creates = [create for create in creates if create is not grok_create]
+    assert grok_create[grok_create.index("--env") : grok_create.index("--env") + 2] == [
+        "--env",
+        expected_env,
+    ]
+    for create in other_creates:
+        assert "--env" not in create  # only the Grok tab's PATH is touched
+    starts = {call[2]: call for call in calls if call[:2] == ["agent", "start"]}
+    assert starts["grok46-peer"] == [
+        "agent",
+        "start",
+        "grok46-peer",
+        "--kind",
+        "grok",
+        "--pane",
+        "w-agents:p-grok",
+        "--timeout",
+        "120000",
+        "--",
+        "--model",
+        "grok-4.6",
+        "--reasoning-effort",
+        "high",
+        "--no-memory",
+        "--disable-web-search",
+        "--no-subagents",
+        "--permission-mode",
+        "bypassPermissions",
+    ]
+    # The launcher's own environment is never mutated.
+    assert os.environ["PATH"] == "/usr/bin:/bin"
+
+
+def test_grok_tab_env_has_no_trailing_separator_without_parent_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty/unset parent PATH must not leave an empty component (cwd risk)."""
+    grok = module.GROK_PARTICIPANT
+    expected = f"PATH={Path('~/.grok/bin').expanduser()}"
+
+    monkeypatch.setenv("PATH", "")
+    assert module.participant_tab_env(grok) == ["--env", expected]
+    monkeypatch.delenv("PATH", raising=False)
+    assert module.participant_tab_env(grok) == ["--env", expected]
+    # Only a participant that declares a prefix gets any env at all.
+    assert module.participant_tab_env(module.SOL_PARTICIPANT) == []
+
+
+def test_grok_fresh_pane_proof_requires_exact_grok_46_and_high(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def proves(screen: str) -> bool:
+        monkeypatch.setattr(module, "run_text", lambda _herdr_bin, _arguments, timeout=30: screen)
+        monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+        grok = module.resolve_profile("sol-fable-grok")[2]
+        return module.pane_proof("herdr", grok, "w-agents:p-grok")
+
+    assert proves(GROK_SCREEN)
+    assert proves("Grok CLI\nmodel: Grok 4.6 (high)\nsession active\n")
+    assert not proves("Grok CLI\nmodel Grok 4.6.1\nreasoning effort: high\n")  # suffixed version
+    assert not proves("Grok CLI\nmodel groklette 4.6\nreasoning effort: high\n")  # prefix lookalike
+    assert not proves("Grok CLI\nmodel Grok 4.6\nreasoning effort: highest\n")  # suffixed effort
+    assert not proves("Grok CLI\nmodel Grok 4\nreasoning effort: high\n")  # version without 4.6
+    assert not proves("Grok CLI\nmodel Grok 4.6\nwaiting for input\n")  # high missing entirely
+    assert not proves("Grok CLI\nreasoning effort: high\nwaiting\n")  # model token missing
+    assert not proves("Grok CLI\nmodel Grok 4 (high)\nwaiting\n")  # version without 4.6
+    assert not proves("Grok CLI\nwaiting for input\n")  # no evidence at all
+
+
+@pytest.mark.parametrize(
+    "processes",
+    [
+        pytest.param([], id="missing-process"),
+        pytest.param(
+            [
+                {
+                    "argv0": "grok",
+                    "argv": ["grok", "--model", "grok-4.6", "--reasoning-effort", "high"],
+                }
+            ],
+            id="missing-flags",
+        ),
+        pytest.param(
+            [
+                {
+                    "argv0": "grok",
+                    "argv": [
+                        "grok",
+                        "--reasoning-effort",
+                        "high",
+                        "--model",
+                        "grok-4.6",
+                        "--no-memory",
+                        "--disable-web-search",
+                        "--no-subagents",
+                        "--permission-mode",
+                        "bypassPermissions",
+                    ],
+                }
+            ],
+            id="reordered-args",
+        ),
+        pytest.param(
+            [
+                {
+                    "argv0": "grok",
+                    "argv": [
+                        "grok",
+                        "--model",
+                        "grok-4.6-fast",
+                        "--reasoning-effort",
+                        "high",
+                        "--no-memory",
+                        "--disable-web-search",
+                        "--no-subagents",
+                        "--permission-mode",
+                        "bypassPermissions",
+                    ],
+                }
+            ],
+            id="model-lookalike",
+        ),
+        pytest.param(
+            [
+                {
+                    "argv0": "grok-cli",
+                    "argv": [
+                        "grok",
+                        "--model",
+                        "grok-4.6",
+                        "--reasoning-effort",
+                        "high",
+                        "--no-memory",
+                        "--disable-web-search",
+                        "--no-subagents",
+                        "--permission-mode",
+                        "bypassPermissions",
+                    ],
+                }
+            ],
+            id="wrong-argv0",
+        ),
+        pytest.param(
+            [
+                {
+                    "argv0": "node",
+                    "argv": [
+                        "node",
+                        "mcp",
+                        "--model",
+                        "grok-4.6",
+                        "--reasoning-effort",
+                        "high",
+                        "--no-memory",
+                        "--disable-web-search",
+                        "--no-subagents",
+                        "--permission-mode",
+                        "bypassPermissions",
+                    ],
+                }
+            ],
+            id="mcp-child",
+        ),
+        pytest.param(
+            [
+                {
+                    "argv0": "grok",
+                    "argv": [
+                        "grok",
+                        "--model",
+                        "grok-4.6",
+                        "--reasoning-effort",
+                        "low",
+                        "--no-memory",
+                        "--disable-web-search",
+                        "--no-subagents",
+                        "--permission-mode",
+                        "bypassPermissions",
+                    ],
+                }
+            ],
+            id="wrong-effort",
+        ),
+    ],
+)
+def test_reopen_grok_process_proof_fails_closed_on_inexact_evidence(
+    monkeypatch: pytest.MonkeyPatch, processes: list[dict]
+) -> None:
+    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        lambda _herdr_bin, arguments, timeout=30: (
+            {"result": {"process_info": {"foreground_processes": processes}}}
+            if arguments[:2] == ["pane", "process-info"]
+            else (_ for _ in ()).throw(AssertionError(arguments))
+        ),
+    )
+    monkeypatch.setattr(
+        module, "run_text", lambda _herdr_bin, _arguments, timeout=30: GROK_POST_TURN_SCREEN
+    )
+    grok = module.resolve_profile("sol-fable-grok")[2]
+
+    assert not module.reopen_pane_proof("herdr", grok, "w-agents:p-grok")
+
+
+def test_reopen_grok_accepts_stable_ui_and_exact_process_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        lambda _herdr_bin, arguments, timeout=30: (
+            {"result": {"process_info": {"foreground_processes": GROK_PROCESS}}}
+            if arguments[:2] == ["pane", "process-info"]
+            else (_ for _ in ()).throw(AssertionError(arguments))
+        ),
+    )
+    monkeypatch.setattr(
+        module, "run_text", lambda _herdr_bin, _arguments, timeout=30: GROK_POST_TURN_SCREEN
+    )
+    grok = module.resolve_profile("sol-fable-grok")[2]
+
+    assert module.reopen_pane_proof("herdr", grok, "w-agents:p-grok")
+
+
+def test_main_never_execs_sol_fable_grok_when_grok_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    profile_launch_env(tmp_path, monkeypatch, captured)
+    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable-grok")
+    monkeypatch.setenv(module.ROOM_ENV, "chat-sfg")
+    calls = install_sfg_host(
+        monkeypatch,
+        tmp_path,
+        # Grok's pane shows a suffixed version: the existing session mismatches.
+        {
+            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-fable": FABLE_SCREEN,
+            "w-agents:p-grok": "Grok CLI\nmodel Grok 4.6.1\n",
+        },
+    )
+    save_launcher_state(tmp_path, sfg_room_state(tmp_path))
+
+    with pytest.raises(BootstrapError, match="requires every participant"):
+        module.main()
+
+    assert "argv" not in captured
+    assert "selected_profile" not in load_launcher_state(tmp_path)
+    # The mismatched existing Grok session is left open, and nothing else closes.
+    mutations = (("tab", "close"), ("pane", "close"), ("agent", "send-keys"))
+    assert not any(tuple(call[:2]) in mutations for call in calls)
+    # Already-verified earlier peers remain recorded so a retry can reuse them.
+    state = load_launcher_state(tmp_path)
+    assert state["participant_pane_ids"]["sol"] == "w-agents:p-sol"
+    assert state["participant_pane_ids"]["fable"] == "w-agents:p-fable"
+
+
+def test_failed_new_grok_tab_is_closed_while_verified_peers_remain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    calls = install_sfg_host(
+        monkeypatch,
+        tmp_path,
+        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN, "w-agents:p-grok": ""},
+        live_agents=[],
+    )
+    state: dict = {"schema_version": 1}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=module.resolve_profile("sol-fable-grok"),
+    )
+
+    assert any("@grok" in failure and "the new tab was closed" in failure for failure in failures)
+    assert ["tab", "close", "w-agents:t-grok"] in calls
+    assert "grok" not in state.get("participant_pane_ids", {})
+    assert "grok" not in state.get("pending_participant_tabs", {})
+    assert state["participant_pane_ids"]["sol"] == "w-agents:p-sol"
+    assert state["participant_pane_ids"]["fable"] == "w-agents:p-fable"
+
+
+def test_room_reopen_reverifies_sol_fable_grok_and_execs_with_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    room_reopen_env(tmp_path, monkeypatch, captured, "chat-sfg")
+    calls = install_sfg_host(
+        monkeypatch,
+        tmp_path,
+        {
+            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-fable": FABLE_POST_TURN_SCREEN,
+            "w-agents:p-grok": GROK_POST_TURN_SCREEN,
+        },
+        process_infos={
+            "w-agents:p-fable": CLAUDE_FABLE_PROCESS,
+            "w-agents:p-grok": GROK_PROCESS,
+        },
+    )
+    state = sfg_room_state(tmp_path)
+    state.pop("pending_room_id")
+    state.pop("pending_room_operation_id")
+    state.pop("pending_room_profile")
+    state.pop("pending_room_started_unix_ms")
+    state["selected_profile"] = "sol-fable-grok"
+    state["last_room_id"] = "chat-sfg"
+    save_launcher_state(tmp_path, state)
+
+    module.room_entrypoint()
+
+    argv = captured["argv"]
+    assert argv[argv.index("--profile") + 1] == "sol-fable-grok"
+    mappings = [value for index, value in enumerate(argv) if argv[index - 1] == "--agent"]
+    assert mappings == ["sol=sol-peer", "fable=fable-peer", "grok=grok46-peer"]
+    assert argv[argv.index("--synthesizer") + 1] == "sol"
+    receipt = json.loads(os.environ[module.PROFILE_RECEIPT_ENV])
+    assert receipt == module.profile_receipt_payload(
+        "sol-fable-grok", module.resolve_profile("sol-fable-grok")
+    )
+    # Reopen only re-verifies: nothing is started or closed.
+    assert not any(
+        call[:2] in (["agent", "start"], ["tab", "close"], ["pane", "close"]) for call in calls
+    )
+    process_panes = {
+        call[call.index("--pane") + 1] for call in calls if call[:2] == ["pane", "process-info"]
+    }
+    assert process_panes == {"w-agents:p-fable", "w-agents:p-grok"}

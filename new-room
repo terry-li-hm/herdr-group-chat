@@ -46,6 +46,20 @@ PROFILE_RECEIPT_ENV = "HERDR_GROUP_CHAT_PROFILE_RECEIPT"
 PANE_BULLETS = ("•", "·")
 SOL_PANE_PROOF = (("gpt-5.6-sol",), PANE_BULLETS, ("high",))
 FABLE_PANE_PROOFS = (("fable",), ("5",)), (("high",), ("effort",))
+GROK_START_ARGS = (
+    "--model",
+    "grok-4.6",
+    "--reasoning-effort",
+    "high",
+    "--no-memory",
+    "--disable-web-search",
+    "--no-subagents",
+    "--permission-mode",
+    "bypassPermissions",
+)
+# The native Grok UI keeps `Grok 4.6 (high)` on screen after a turn, so the
+# fresh pane sequences also serve as the reopen pane sequences.
+GROK_PANE_PROOFS = ((("grok",), ("4.6",)), (("high",),))
 
 
 @dataclass(frozen=True)
@@ -67,43 +81,63 @@ class Participant:
     provider: str | None = None
     model: str = ""
     effort: str = ""
+    # Optional PATH prefix expanded into this participant's tab environment
+    # only; never the launcher's or any other participant's environment.
+    tab_path_prefix: str = ""
 
+
+SOL_PARTICIPANT = Participant(
+    role="sol",
+    kind="pi",
+    name="sol-peer",
+    start_args=(
+        "--provider",
+        "openai-codex",
+        "--model",
+        "gpt-5.6-sol",
+        "--thinking",
+        "high",
+    ),
+    pane_proofs=(SOL_PANE_PROOF,),
+    catalog_command=("pi", "--list-models", "gpt-5.6-sol"),
+    provider="openai-codex",
+    model="gpt-5.6-sol",
+    effort="high",
+)
+
+
+FABLE_PARTICIPANT = Participant(
+    role="fable",
+    kind="claude",
+    name="fable-peer",
+    start_args=("--model", "fable", "--effort", "high"),
+    pane_proofs=FABLE_PANE_PROOFS,
+    reopen_pane_proofs=((("fable",), ("5",)),),
+    reopen_process_argv0="claude",
+    reopen_process_args=("--model", "fable", "--effort", "high"),
+    model="fable",
+    effort="high",
+)
+
+GROK_PARTICIPANT = Participant(
+    role="grok",
+    kind="grok",
+    name="grok46-peer",
+    start_args=GROK_START_ARGS,
+    pane_proofs=GROK_PANE_PROOFS,
+    reopen_pane_proofs=GROK_PANE_PROOFS,
+    reopen_process_argv0="grok",
+    reopen_process_args=GROK_START_ARGS,
+    tab_path_prefix="~/.grok/bin",
+    model="grok-4.6",
+    effort="high",
+)
 
 # The single profile definition: participants, native launch argv, and the
 # canonical matched evidence the receipt carries. No other source exists.
 PROFILE_PARTICIPANTS: dict[str, tuple[Participant, ...]] = {
-    "sol-fable": (
-        Participant(
-            role="sol",
-            kind="pi",
-            name="sol-peer",
-            start_args=(
-                "--provider",
-                "openai-codex",
-                "--model",
-                "gpt-5.6-sol",
-                "--thinking",
-                "high",
-            ),
-            pane_proofs=(SOL_PANE_PROOF,),
-            catalog_command=("pi", "--list-models", "gpt-5.6-sol"),
-            provider="openai-codex",
-            model="gpt-5.6-sol",
-            effort="high",
-        ),
-        Participant(
-            role="fable",
-            kind="claude",
-            name="fable-peer",
-            start_args=("--model", "fable", "--effort", "high"),
-            pane_proofs=FABLE_PANE_PROOFS,
-            reopen_pane_proofs=((("fable",), ("5",)),),
-            reopen_process_argv0="claude",
-            reopen_process_args=("--model", "fable", "--effort", "high"),
-            model="fable",
-            effort="high",
-        ),
-    )
+    "sol-fable": (SOL_PARTICIPANT, FABLE_PARTICIPANT),
+    "sol-fable-grok": (SOL_PARTICIPANT, FABLE_PARTICIPANT, GROK_PARTICIPANT),
 }
 
 
@@ -593,6 +627,17 @@ def profile_room_exec(profile: str, participants: Sequence[Participant]) -> tupl
         profile_receipt_payload(profile, participants), sort_keys=True, separators=(",", ":")
     )
     return arguments, receipt
+
+
+def participant_tab_env(participant: Participant) -> list[str]:
+    """Tab-create env arguments; set only when a participant needs a PATH prefix."""
+    if not participant.tab_path_prefix:
+        return []
+    prefix = str(Path(participant.tab_path_prefix).expanduser())
+    parent = os.environ.get("PATH", "")
+    # No trailing separator: an empty PATH component would resolve the cwd.
+    combined = f"{prefix}{os.pathsep}{parent}" if parent else prefix
+    return ["--env", f"PATH={combined}"]
 
 
 def start_agent(
@@ -1161,6 +1206,7 @@ def start_participants(
                     agent_cwd,
                     "--label",
                     pending_label,
+                    *participant_tab_env(participant),
                     "--no-focus",
                 ],
                 timeout=None,

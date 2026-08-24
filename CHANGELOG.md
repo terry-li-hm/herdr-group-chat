@@ -4,6 +4,33 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Make the `sol-fable-grok` three-role room the default composition: action
+  id `new` (`New group chat`) now runs `./new-room --launch --profile
+  sol-fable-grok` instead of the classic four-agent launch, while the direct
+  no-profile `./new-room --launch` command and the new `new-classic` action
+  (`New classic four-agent chat`) preserve classic behavior. The profile
+  composes the existing `sol-fable` participants unchanged — `@sol`
+  (`sol-peer`, Pi with `--provider openai-codex --model gpt-5.6-sol --thinking
+  high`) and `@fable` (`fable-peer`, Claude with `--model fable --effort
+  high`) — plus `@grok` (`grok46-peer`, Grok with the exact native arguments
+  `--model grok-4.6 --reasoning-effort high --no-memory --disable-web-search
+  --no-subagents --permission-mode bypassPermissions`, no fallback). Only the
+  Grok participant tab is created with a prepended `~/.grok/bin` PATH through
+  the Herdr `tab create` environment; the launcher's own environment and
+  global config stay untouched. A fresh launch requires the bounded `Grok
+  4.6` and `high` pane token sequences — a live canary confirmed the native
+  UI keeps `Grok 4.6 (high)` after a turn — and a reopen additionally
+  requires the exact native foreground process argv0 `grok` with the
+  contiguous start-argument sequence; lookalikes and reordered or missing
+  argv never verify. The room stays atomic: any role failure aborts the
+  launch or reopen with no room opened and no receipt; a mismatching
+  existing Grok session is left open and blocks the launch, while
+  already-verified peers remain reusable on retry and an unverified new Grok
+  tab is closed through the existing pending-tab cleanup. The receipt records
+  harness `grok`, model `grok-4.6`, effort `high`, `native-ui verified`.
+  Stored rooms keep their own profile, so existing `sol-fable` and classic
+  rooms reopen unchanged.
+
 ## [0.5.0] - 2026-08-24
 
 - Keep room-pane registration two-phase so the outer launcher records the

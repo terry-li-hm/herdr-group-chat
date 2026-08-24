@@ -38,8 +38,11 @@ DEFAULT_AGENTS = {
 # One bounded built-in profile: its exact required roles and default synthesizer.
 # Targets and matched evidence come only from the launcher's verified receipt
 # payload; no profile-derived target fallback and no duplicated model detail.
-PROFILE_ROLES = {"sol-fable": ("sol", "fable")}
-PROFILE_SYNTHESIZER = {"sol-fable": "sol"}
+PROFILE_ROLES = {
+    "sol-fable": ("sol", "fable"),
+    "sol-fable-grok": ("sol", "fable", "grok"),
+}
+PROFILE_SYNTHESIZER = {"sol-fable": "sol", "sol-fable-grok": "sol"}
 PROFILE_RECEIPT_KIND = "profile_receipt"
 PROFILE_RECEIPT_ENV = "HERDR_GROUP_CHAT_PROFILE_RECEIPT"
 DEFAULT_STATE_DIR = Path("~/.local/state/herdr-group-chat")

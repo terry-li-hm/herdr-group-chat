@@ -9,13 +9,19 @@ platforms = ["macos", "linux"]
 id = "new"
 title = "New group chat"
 contexts = ["workspace", "tab", "pane"]
-command = ["./new-room", "--launch"]
+command = ["./new-room", "--launch", "--profile", "sol-fable-grok"]
 
 [[actions]]
 id = "new-sol-fable"
 title = "New Sol + Fable chat"
 contexts = ["workspace", "tab", "pane"]
 command = ["./new-room", "--launch", "--profile", "sol-fable"]
+
+[[actions]]
+id = "new-classic"
+title = "New classic four-agent chat"
+contexts = ["workspace", "tab", "pane"]
+command = ["./new-room", "--launch"]
 
 [[actions]]
 id = "open"

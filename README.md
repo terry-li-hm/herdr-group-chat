@@ -194,16 +194,49 @@ and never routed. The room records one non-secret `native-ui verified` system
 receipt per profile in the transcript, generated only after complete
 verification and deduplicated across reopens by its exact structured payload;
 this describes what the launcher saw in the native UIs, not a cryptographic or
-model-service attestation. Sol synthesizes reviews by default, and the default
-four-agent room is unchanged.
+model-service attestation. Sol synthesizes reviews by default, and the classic
+four-agent composition is unchanged.
+
+## Default Sol + Fable + Grok profile
+
+`New group chat` is now the opinionated default: action id `new` changes from
+the classic four-agent room to the bounded three-role `sol-fable-grok` room,
+launched via `./new-room --launch --profile sol-fable-grok`. The direct
+no-profile `./new-room --launch` command and the new `new-classic` action
+(`New classic four-agent chat`) preserve classic behavior. The room composes the existing `sol-fable` participants
+unchanged — `@sol` (Pi as `sol-peer`, `--provider openai-codex --model
+gpt-5.6-sol --thinking high`) and `@fable` (Claude Code as `fable-peer`,
+`--model fable --effort high`) — plus `@grok`, Grok as `grok46-peer` with
+the exact native arguments `--model grok-4.6 --reasoning-effort high
+--no-memory --disable-web-search --no-subagents --permission-mode
+bypassPermissions` and no fallback. Only the Grok participant tab's PATH is
+prepended with `~/.grok/bin` through the Herdr `tab create` environment, so
+the launcher's own environment and global config are never touched.
+
+Before any participant becomes routable, `@grok` must show the bounded
+`Grok 4.6` and `high` token sequences in its native pane (a live canary
+confirmed the UI keeps `Grok 4.6 (high)` after a turn); on reopen the proof
+additionally requires the exact native foreground process argv0 `grok` with
+the contiguous start-argument sequence. Suffixed or prefixed lookalikes such
+as `Grok 4.6.1` or `groklette 4.6` never verify. The room is atomic: if any
+of the three roles fails verification, the launch or reopen fails closed, no
+room opens, and the non-secret `native-ui verified` receipt is emitted only
+after all three verify. A mismatching existing Grok session is left open,
+blocks the launch, and already-verified peers stay available for a retry.
+The stored room keeps its own profile: previously opened `sol-fable` or
+classic rooms reopen unchanged, Sol synthesizes, and `New Sol + Fable chat`
+remains available. `New classic four-agent chat` (or a direct
+`./new-room --launch` without a profile) still opens the unchanged default
+Pi/Claude/Codex/Grok four-agent room.
 
 ## Limitations
 
 - Ordinary group turns remain serial; only `/review` first passes are parallel.
 - Every addressed agent must already be live in Herdr.
-- New-room setup starts all four default participants, or the two bounded
-  `sol-fable` profile participants; no other participant selection is
-  configurable.
+- New-room setup starts the four classic participants, the two bounded
+  `sol-fable` profile participants, or the three `sol-fable-grok` profile
+  participants; only these three fixed compositions are selectable, and
+  arbitrary participant selection is not configurable.
 - Retry state is kept in the running room process and does not survive a room
   restart. The transcript itself remains durable.
 - Cancellation sends Ctrl-C to the exact active Herdr agent tab, and only when

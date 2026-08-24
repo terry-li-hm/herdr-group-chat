@@ -1622,12 +1622,25 @@ def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:
     assert [action["id"] for action in manifest["actions"]] == [
         "new",
         "new-sol-fable",
+        "new-classic",
         "open",
+    ]
+    new_default = manifest["actions"][0]
+    assert new_default["title"] == "New group chat"
+    assert new_default["command"] == [
+        "./new-room",
+        "--launch",
+        "--profile",
+        "sol-fable-grok",
     ]
     sol_fable = manifest["actions"][1]
     assert sol_fable["title"] == "New Sol + Fable chat"
     assert sol_fable["command"] == ["./new-room", "--launch", "--profile", "sol-fable"]
     assert sol_fable["contexts"] == ["workspace", "tab", "pane"]
+    new_classic = manifest["actions"][2]
+    assert new_classic["title"] == "New classic four-agent chat"
+    assert new_classic["command"] == ["./new-room", "--launch"]
+    assert new_classic["contexts"] == ["workspace", "tab", "pane"]
     assert [pane["id"] for pane in manifest["panes"]] == ["new-room", "room"]
     assert all(pane["placement"] == "tab" for pane in manifest["panes"])
     assert "events" not in manifest
@@ -2489,3 +2502,153 @@ def test_tab_on_an_unmatched_query_closes_without_changing_text() -> None:
     # Up/Down remain no-ops with no suggestions.
     assert handle_picker_key("@zzz", "UP", (), 0) is None
     assert handle_picker_key("@zzz", "DOWN", (), 0) is None
+
+
+# --- default sol-fable-grok profile ---------------------------------------------------
+
+
+class TripleClient(ProfileClient):
+    def live_targets(self) -> set[str]:
+        return {"sol-peer", "fable-peer", "grok46-peer"}
+
+    def states(self) -> dict[str, str]:
+        return {"sol-peer": "idle", "fable-peer": "idle", "grok46-peer": "idle"}
+
+
+def make_sol_fable_grok_chat(tmp_path: Path) -> tuple[GroupChat, TripleClient, Transcript]:
+    transcript = Transcript(tmp_path, "sfg-room")
+    client = TripleClient()
+    chat = GroupChat(
+        transcript,
+        {"sol": "sol-peer", "fable": "fable-peer", "grok": "grok46-peer"},
+        client,
+        synthesizer="sol",
+    )
+    return chat, client, transcript
+
+
+VALID_SFG_RECEIPT = {
+    "profile": "sol-fable-grok",
+    "verified": [
+        dict(entry)
+        for entry in (
+            *VALID_RECEIPT["verified"][:2],
+            {
+                "role": "grok",
+                "target": "grok46-peer",
+                "harness": "grok",
+                "model": "grok-4.6",
+                "effort": "high",
+                "verification": "native-ui verified",
+            },
+        )
+    ],
+}
+
+
+def test_sol_fable_grok_profile_has_exact_ordered_roles_and_synthesizer() -> None:
+    assert namespace["PROFILE_ROLES"]["sol-fable-grok"] == ("sol", "fable", "grok")
+    assert namespace["PROFILE_SYNTHESIZER"]["sol-fable-grok"] == "sol"
+    assert namespace["PROFILE_ROLES"]["sol-fable"] == ("sol", "fable")
+
+
+def test_sol_fable_grok_room_routes_mention_review_and_anneal_over_all_three(
+    tmp_path: Path,
+) -> None:
+    chat, client, transcript = make_sol_fable_grok_chat(tmp_path)
+
+    created = chat.dispatch("@grok summarize the launch flags")
+    chat.review("challenge this plan")
+    chat.anneal("@sol,@grok harden this plan")
+
+    assert [item["sender"] for item in created] == ["human", "grok"]
+    routed = [target for target, _prompt in client.calls if "group chat" in _prompt]
+    assert routed[0] == "grok46-peer"  # the explicit mention
+    assert set(routed[1:4]) == {"sol-peer", "fable-peer", "grok46-peer"}  # review round
+    kinds = [(item["sender"], item["kind"]) for item in transcript.read()]
+    assert ("sol", "review_synthesis") in kinds
+    assert ("sol", "anneal_final") in kinds
+    assert ("grok", "anneal_challenge") in kinds
+
+
+def test_sol_fable_grok_requires_exactly_three_explicit_roles_through_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StaticClient(TripleClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(module, "HerdrClient", StaticClient)
+    monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], json.dumps(VALID_SFG_RECEIPT))
+    base = ["--state-dir", str(tmp_path), "--room", "strict-sfg", "--profile", "sol-fable-grok"]
+
+    assert main([*base, "--once", "hi"]) == 2  # zero mappings
+    assert main([*base, "--agent", "grok=grok46-peer", "--once", "hi"]) == 2  # partial
+    assert main([*base, "--agent", "zork=zork-peer", "--once", "hi"]) == 2  # unknown role
+    assert (
+        main(
+            [
+                *base,
+                "--agent",
+                "sol=sol-peer",
+                "--agent",
+                "fable=fable-peer",
+                "--agent",
+                "grok=grok46-peer",
+                "--agent",
+                "sol=dup-peer",  # duplicate role
+                "--once",
+                "hi",
+            ]
+        )
+        == 2
+    )
+    assert Transcript(tmp_path, "strict-sfg").read() == []
+
+
+def test_sol_fable_grok_exact_roster_records_the_verified_receipt_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StaticClient(TripleClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(module, "HerdrClient", StaticClient)
+    monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], json.dumps(VALID_SFG_RECEIPT))
+    base = [
+        "--state-dir",
+        str(tmp_path),
+        "--room",
+        "receipt-sfg",
+        "--profile",
+        "sol-fable-grok",
+        "--agent",
+        "sol=sol-peer",
+        "--agent",
+        "fable=fable-peer",
+        "--agent",
+        "grok=grok46-peer",
+    ]
+
+    assert main([*base, "--once", "hello from the human"]) == 0
+
+    receipts = [
+        item
+        for item in Transcript(tmp_path, "receipt-sfg").read()
+        if item["kind"] == namespace["PROFILE_RECEIPT_KIND"]
+    ]
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert receipt["meta"]["profile"] == "sol-fable-grok"
+    assert [entry["role"] for entry in receipt["meta"]["verified"]] == ["fable", "grok", "sol"]
+    body = receipt["body"]
+    for needle in (
+        "harness grok",
+        "model grok-4.6",
+        "effort high",
+        "target grok46-peer",
+        "native-ui verified",
+    ):
+        assert needle in body, needle
+    # The stored sol-fable room stays default-able: its profile is unchanged.
+    assert namespace["PROFILE_ROLES"]["sol-fable"] == ("sol", "fable")
