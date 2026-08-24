@@ -1,6 +1,6 @@
 id = "terry.herdr-group-chat"
 name = "Herdr Group Chat"
-version = "0.5.1"
+version = "0.5.2"
 min_herdr_version = "0.8.0"
 description = "A shared local room for full native AI coding agents managed by Herdr."
 platforms = ["macos", "linux"]
