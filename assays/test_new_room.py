@@ -206,6 +206,33 @@ def test_nested_launcher_transaction_fails_without_waiting_for_second_lock(
         assert time.monotonic() - started < 0.5
 
 
+def test_launcher_lock_closes_directory_on_socket_identity_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    missing_socket = tmp_path / "missing.sock"
+    monkeypatch.setenv("HERDR_SOCKET_PATH", str(missing_socket))
+    opened: list[int] = []
+    real_open = module._open_launcher_directory
+
+    def tracking_open(path: Path) -> int:
+        descriptor = real_open(path)
+        opened.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(module, "_open_launcher_directory", tracking_open)
+    with (
+        pytest.raises(BootstrapError, match="socket is unavailable"),
+        launcher_state_lock(state_dir),
+    ):
+        pass
+
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
 def test_transaction_refuses_to_write_after_server_socket_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

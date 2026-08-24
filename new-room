@@ -443,9 +443,9 @@ def launcher_state_lock(state_dir: Path) -> Iterator[Path]:
     if getattr(_launcher_transaction, "value", None) is not None:
         raise BootstrapError("nested launcher state transaction")
     state_dir = state_dir.expanduser()
-    directory_descriptor = _open_launcher_directory(state_dir)
     state_path = launcher_state_path(state_dir)
     lock_name = state_path.with_suffix(".lock").name
+    directory_descriptor = _open_launcher_directory(state_dir)
     try:
         try:
             lock_descriptor = os.open(

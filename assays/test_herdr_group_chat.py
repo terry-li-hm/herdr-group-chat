@@ -1608,6 +1608,70 @@ def test_interrupted_synthesis_is_cancelled_without_failure_entry(tmp_path: Path
     assert not any(item["kind"] == "review_synthesis" for item in transcript.read())
 
 
+def test_direct_group_chat_retry_waits_for_cancelled_attempt_to_drain(
+    tmp_path: Path,
+) -> None:
+    class DirectRetryClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_started = threading.Event()
+            self.release_first = threading.Event()
+            self.review_calls = 0
+
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            self.calls.append((target, prompt))
+            self.timeouts.append(timeout_ms)
+            if "Question for independent review" in prompt:
+                self.review_calls += 1
+                if self.review_calls == 1:
+                    self.first_started.set()
+                    assert self.release_first.wait(timeout=2)
+                    return "done", "late direct reply"
+                return "done", "direct retry reply"
+            return "done", "direct synthesis"
+
+    transcript = Transcript(tmp_path, "direct-retry-room")
+    client = DirectRetryClient()
+    chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client)
+    review = chat.plan_review("@claude Check direct retry safety")
+    errors: list[BaseException] = []
+
+    def run_review() -> None:
+        try:
+            chat.execute_review(review)
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=run_review)
+    worker.start()
+    assert client.first_started.wait(timeout=1)
+    chat.cancel_review(review)
+
+    with pytest.raises(ChatError, match="review attempt is already running"):
+        chat.retry_review(review, "claude")
+    with pytest.raises(ChatError, match="review attempt is already running"):
+        chat.retry_synthesis(review)
+
+    client.release_first.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert errors == []
+    assert review.responses == {}
+
+    chat.retry_review(review, "claude")
+    items = transcript.read()
+    assert [item["kind"] for item in items].count("review_response") == 1
+    assert [item["kind"] for item in items].count("review_synthesis") == 1
+    assert not any(item["body"] == "late direct reply" for item in items)
+    assert client.review_calls == 2
+
+
 def test_failed_review_can_retry_with_fresh_marker_and_resynthesize(tmp_path: Path) -> None:
     class FlakyClient(FakeClient):
         def __init__(self) -> None:

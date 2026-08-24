@@ -115,6 +115,7 @@ class ReviewRound:
     mode: str = "review"
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    attempt_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 def utc_now() -> str:
@@ -1493,7 +1494,24 @@ class GroupChat:
             on_state,
         )
 
+    @contextmanager
+    def _review_attempt(self, review: ReviewRound) -> Iterator[None]:
+        if not review.attempt_lock.acquire(blocking=False):
+            raise ChatError("a review attempt is already running")
+        try:
+            yield
+        finally:
+            review.attempt_lock.release()
+
     def execute_review(
+        self,
+        review: ReviewRound,
+        on_state: Callable[[str, str], None] | None = None,
+    ) -> ReviewRound:
+        with self._review_attempt(review):
+            return self._execute_review_attempt(review, on_state)
+
+    def _execute_review_attempt(
         self,
         review: ReviewRound,
         on_state: Callable[[str, str], None] | None = None,
@@ -1549,6 +1567,17 @@ class GroupChat:
         *,
         reset_cancel: bool = True,
     ) -> ReviewRound:
+        with self._review_attempt(review):
+            return self._retry_review_attempt(review, agent, on_state, reset_cancel=reset_cancel)
+
+    def _retry_review_attempt(
+        self,
+        review: ReviewRound,
+        agent: str,
+        on_state: Callable[[str, str], None] | None = None,
+        *,
+        reset_cancel: bool = True,
+    ) -> ReviewRound:
         if agent not in review.reviewers:
             raise ChatError(f"@{agent} was not a reviewer in the last round")
         with review.lock:
@@ -1579,6 +1608,16 @@ class GroupChat:
         return review
 
     def retry_synthesis(
+        self,
+        review: ReviewRound,
+        on_state: Callable[[str, str], None] | None = None,
+        *,
+        reset_cancel: bool = True,
+    ) -> ReviewRound:
+        with self._review_attempt(review):
+            return self._retry_synthesis_attempt(review, on_state, reset_cancel=reset_cancel)
+
+    def _retry_synthesis_attempt(
         self,
         review: ReviewRound,
         on_state: Callable[[str, str], None] | None = None,
@@ -2004,17 +2043,16 @@ class ReviewController:
                     raise ChatError(f"@{name} was not a reviewer in the last round")
                 if name in review.responses:
                     raise ChatError(f"@{name} already has a usable review response")
-                review.cancel_event = threading.Event()
             if name == "synthesis":
 
                 def action() -> ReviewRound:
-                    return self.chat.retry_synthesis(review, self._on_state, reset_cancel=False)
+                    return self.chat.retry_synthesis(review, self._on_state, reset_cancel=True)
 
                 label = "synthesis"
             else:
 
                 def action() -> ReviewRound:
-                    return self.chat.retry_review(review, name, self._on_state, reset_cancel=False)
+                    return self.chat.retry_review(review, name, self._on_state, reset_cancel=True)
 
                 label = f"@{name}"
             self._launch(action, review)

@@ -457,6 +457,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    transcript: Transcript | None = None
     try:
         transcript = Transcript(resolve_state_dir(args.state_dir), args.room)
         if args.show:
@@ -498,6 +499,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ChatError as error:
         print(f"orca-group-chat: {error}", file=sys.stderr)
         return 2
+    finally:
+        if transcript is not None:
+            transcript.close()
 
 
 def curses_run(chat: GroupChat, room: str) -> None:

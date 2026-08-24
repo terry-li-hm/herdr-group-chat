@@ -22,6 +22,8 @@ namespace = module.__dict__
 
 ChatError = namespace["ChatError"]
 OrcaClient = namespace["OrcaClient"]
+Transcript = namespace["Transcript"]
+main = namespace["main"]
 parse_agent_mappings = namespace["parse_agent_mappings"]
 resolve_state_dir = namespace["resolve_state_dir"]
 CI_WORKFLOW = EFFECTOR.parent / ".github" / "workflows" / "ci.yml"
@@ -57,6 +59,28 @@ def test_state_dir_precedence(tmp_path: Path) -> None:
     assert resolve_state_dir(explicit, {"ORCA_GROUP_CHAT_STATE_DIR": str(configured)}) == explicit
     assert resolve_state_dir(None, {"ORCA_GROUP_CHAT_STATE_DIR": str(configured)}) == configured
     assert resolve_state_dir(None, {}) == Path("~/.local/state/orca-group-chat")
+
+
+def test_main_closes_transcript_on_success_and_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instances: list[object] = []
+
+    class TrackingTranscript(Transcript):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            self.closed_by_main = False
+            instances.append(self)
+
+        def close(self) -> None:
+            self.closed_by_main = True
+            super().close()
+
+    monkeypatch.setattr(module, "Transcript", TrackingTranscript)
+    assert main(["--state-dir", str(tmp_path), "--room", "orca-success", "--show"]) == 0
+    assert main(["--state-dir", str(tmp_path), "--room", "orca-failure"]) == 2
+    assert len(instances) == 2
+    assert all(instance.closed_by_main for instance in instances)
 
 
 def test_live_targets_and_states_come_from_exact_terminal_handles() -> None:
