@@ -3,7 +3,7 @@
  *
  *   --transcript PATH          append-only Herdr Group Chat JSONL to render
  *   --agent NAME               repeatable; enables @NAME autocomplete
- *   --backend PATH             backend command (default: ./herdr-group-chat)
+ *   --backend PATH             backend command; required for the interactive TUI
  *   --backend-arg VALUE        repeatable; extra argv elements before --once
  *   --render-fixture PATH      parse and print the plain-text projection, no TUI
  */

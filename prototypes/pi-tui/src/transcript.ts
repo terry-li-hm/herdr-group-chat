@@ -12,6 +12,8 @@ export interface TranscriptRecord {
   recipients: string[];
   body: string;
   kind: string;
+  /** True for provisional records (e.g. draft review syntheses). */
+  provisional: boolean;
 }
 
 export class TranscriptError extends Error {}
@@ -52,7 +54,27 @@ export function parseTranscriptLine(line: string, lineNumber: number): Transcrip
       : [],
     body: record["body"],
     kind: record["kind"],
+    provisional: record["provisional"] === true,
   };
+}
+
+/**
+ * Presentation-only inbox projection, mirroring the Python relay's
+ * `inbox_messages`: exclude human turns; keep messages, non-provisional
+ * review syntheses, anneal finals, and attention-bearing review statuses.
+ */
+export function inboxMessages(records: TranscriptRecord[]): TranscriptRecord[] {
+  const attentionMarkers = ["blocked", "failed", "timed out", "cancelled"];
+  return records.filter((record) => {
+    if (record.sender === "human") return false;
+    if (record.kind === "anneal_final") return true;
+    if (record.kind === "review_synthesis" && !record.provisional) return true;
+    if (record.kind === "review_status") {
+      const body = record.body.toLowerCase();
+      return attentionMarkers.some((marker) => body.includes(marker));
+    }
+    return record.kind === "message";
+  });
 }
 
 /** Parse a full JSONL transcript text (blank lines are skipped). */
