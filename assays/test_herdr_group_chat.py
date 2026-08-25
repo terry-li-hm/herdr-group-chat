@@ -3581,6 +3581,96 @@ def test_council_export_rejects_bad_parents_and_lstat_errors(tmp_path: Path) -> 
     assert not (tmp_path / "denied.json").exists()
 
 
+def test_council_rejects_body_tampering_despite_consistent_metadata(tmp_path: Path) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "tamper-body-room")
+    run_council(chat)
+    records = transcript.read()
+
+    tampered_response = [dict(item) for item in records]
+    target = next(item for item in tampered_response if item["kind"] == "review_response")
+    target["body"] += " tampered"
+    with pytest.raises(ChatError, match="recomputed material"):
+        derive_council_ledger(tampered_response)
+
+    tampered_provisional = [dict(item) for item in records]
+    provisional = next(
+        item for item in tampered_provisional if item["kind"] == "consensus_provisional"
+    )
+    provisional["body"] += " tampered"
+    with pytest.raises(ChatError, match="recomputed material"):
+        derive_council_ledger(tampered_provisional)
+
+    # Every persisted hash changed together to one bogus-but-valid hex64 still
+    # fails because the recomputed material hash is the authority.
+    bogus = "b" * 64
+    all_changed = [dict(item) for item in records]
+    for item in all_changed:
+        if isinstance(item.get("meta"), dict) and "shared_material_sha256" in item["meta"]:
+            item["meta"]["shared_material_sha256"] = bogus
+    with pytest.raises(ChatError, match="recomputed material"):
+        derive_council_ledger(all_changed)
+
+    # Dropping one usable response leaves hash authority without material.
+    dropped = [
+        item
+        for item in records
+        if not (item["kind"] == "review_response" and item["sender"] == "claude")
+    ]
+    with pytest.raises(ChatError, match="without complete usable"):
+        derive_council_ledger(dropped)
+
+
+def test_council_shared_payload_requires_nonempty_strings() -> None:
+    complete = make_council_round(responses={"claude": "r1", "codex": "r2"}, synthesis="s")
+    assert council_shared_payload(complete)
+    for responses, synthesis in (
+        ({"claude": "", "codex": "r2"}, "s"),
+        ({"claude": "r1", "codex": None}, "s"),
+        ({"claude": "r1", "codex": "r2"}, ""),
+        ({"claude": "r1", "codex": "r2"}, None),
+    ):
+        review = make_council_round(responses=dict(responses), synthesis=synthesis)
+        with pytest.raises(ChatError):
+            council_shared_material_sha256(review)
+
+
+def test_council_rejects_empty_provisional_record(tmp_path: Path) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "empty-prov-room")
+    run_council(chat)
+    records = [dict(item) for item in transcript.read()]
+    provisional = next(item for item in records if item["kind"] == "consensus_provisional")
+    provisional["body"] = ""
+    with pytest.raises(ChatError, match="provisional synthesis record is empty"):
+        derive_council_ledger(records)
+
+
+def test_council_rejects_hash_on_preprovisional_terminal(tmp_path: Path) -> None:
+    client = ConsensusClient(blind_replies={"codex-peer": "CONSENSUS_SHARE_REFUSED"})
+    chat, transcript = make_consensus_chat(tmp_path, client, "refusal-hash-room")
+    run_council(chat)
+    records = [dict(item) for item in transcript.read()]
+    terminal = next(
+        item
+        for item in records
+        if item["kind"] == "consensus_status"
+        and item.get("meta", {}).get("terminal_outcome") is not None
+    )
+    assert "shared_material_sha256" not in terminal["meta"]
+    # Untampered: hashless pre-provisional terminal stays valid.
+    assert derive_council_ledger(records)["terminal_outcome"] == "refused"
+
+    injected = [dict(item) for item in records]
+    target = next(
+        item
+        for item in injected
+        if item["kind"] == "consensus_status"
+        and item.get("meta", {}).get("terminal_outcome") is not None
+    )
+    target["meta"] = {**dict(target["meta"]), "shared_material_sha256": "c" * 64}
+    with pytest.raises(ChatError, match=r"without (complete usable|matching)"):
+        derive_council_ledger(injected)
+
+
 def test_council_cli_status_and_export_offline(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:

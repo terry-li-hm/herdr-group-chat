@@ -1056,8 +1056,12 @@ def council_manifest(review: ReviewRound) -> dict[str, Any]:
 
 def council_shared_payload(review: ReviewRound) -> dict[str, Any]:
     """Deterministic shared material for hashing; excludes all random tokens."""
-    missing = [name for name in review.reviewers if not review.responses.get(name)]
-    if missing or review.synthesis is None:
+    missing = [
+        name
+        for name in review.reviewers
+        if not isinstance(review.responses.get(name), str) or not review.responses[name]
+    ]
+    if missing or not isinstance(review.synthesis, str) or not review.synthesis:
         raise ChatError(
             "council shared material is incomplete: "
             f"missing responses {missing!r}, synthesis {review.synthesis!r}"
@@ -1246,6 +1250,57 @@ def derive_council_ledger(
     if len(shared_hashes) > 1:
         raise ChatError("council votes disagree about the shared-material hash")
 
+    # Recompute the authoritative shared-material hash from the exact stored
+    # bodies so body tampering is detected even when every persisted hash stays
+    # mutually consistent. A hash authority without complete usable material
+    # (every response a non-empty string plus one non-empty provisional) is a
+    # contradiction.
+    provisional = provisionals[-1] if provisionals else None
+    provisional_body = provisional.get("body") if provisional is not None else None
+    if provisional is not None and (not isinstance(provisional_body, str) or not provisional_body):
+        raise ChatError("council provisional synthesis record is empty")
+    usable_response_bodies: list[str | None] = [
+        response_by_reviewer[reviewer].get("body")
+        if reviewer in response_by_reviewer
+        and isinstance(response_by_reviewer[reviewer].get("body"), str)
+        and response_by_reviewer[reviewer]["body"]
+        else None
+        for reviewer in reviewers
+    ]
+    material_complete = provisional is not None and all(
+        body is not None for body in usable_response_bodies
+    )
+    hash_authority = bool(vote_by_reviewer) or any(
+        isinstance(item.get("meta"), dict)
+        and item["meta"].get("shared_material_sha256") is not None
+        for item in statuses
+    )
+    if hash_authority and not material_complete:
+        raise ChatError("council hash authority exists without complete usable shared material")
+    expected_hash = (
+        council_sha256_text(
+            council_canonical_json(
+                {
+                    "question": objective,
+                    "blind_responses": [
+                        {"reviewer": reviewer, "response": body}
+                        for reviewer, body in zip(reviewers, usable_response_bodies, strict=True)
+                    ],
+                    "provisional_synthesis": provisional_body,
+                    "reviewers": list(reviewers),
+                    "synthesizer": synthesizer,
+                }
+            )
+        )
+        if material_complete
+        else None
+    )
+    for item in votes:
+        if item["meta"]["shared_material_sha256"] != expected_hash:
+            raise ChatError(
+                "council vote shared-material hash does not match the recomputed material"
+            )
+
     terminal_statuses = [
         item for item in statuses if item.get("meta", {}).get("terminal_outcome") is not None
     ]
@@ -1284,6 +1339,19 @@ def derive_council_ledger(
                 f"council status seq {item.get('seq')} carries neither verdicts "
                 "nor a terminal outcome"
             )
+        status_hash = meta.get("shared_material_sha256")
+        if status_hash is not None:
+            # Any status carrying a hash implies post-provisional material: it
+            # must be valid and equal the recomputed hash. A pre-provisional
+            # terminal has no shared material and must stay hashless.
+            if expected_hash is None or not _valid_hash(status_hash):
+                raise ChatError(
+                    "council status carries a shared-material hash without matching material"
+                )
+            if status_hash != expected_hash:
+                raise ChatError(
+                    "council status shared-material hash does not match the recomputed material"
+                )
         if has_verdicts:
             if meta.get("verdicts") != computed_verdicts:
                 raise ChatError("council status verdicts contradict the recorded vote artifacts")
@@ -1293,9 +1361,8 @@ def derive_council_ledger(
                 raise ChatError("council status lacks the human acceptance gate")
             if meta.get("reviewers") != reviewers:
                 raise ChatError("council status reviewers contradict the manifest")
-            status_hash = meta.get("shared_material_sha256")
             if vote_hash is not None:
-                if not _valid_hash(status_hash):
+                if status_hash is None:
                     raise ChatError(
                         "council status lacks a valid shared-material hash after provisional"
                     )
