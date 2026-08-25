@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-26
+
 - Persist a durable council manifest and shared-material hash: every consensus
   round records its schema-1 manifest on the review question and stamps one
   authoritative `shared_material_sha256` over the exact question, ordered blind
