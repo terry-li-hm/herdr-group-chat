@@ -45,6 +45,12 @@ parse_route = namespace["parse_route"]
 parse_anneal = namespace["parse_anneal"]
 parse_consensus_verdict = namespace.get("parse_consensus_verdict")
 consensus_untrusted_json = namespace.get("consensus_untrusted_json")
+council_canonical_json = namespace.get("council_canonical_json")
+council_sha256_text = namespace.get("council_sha256_text")
+council_manifest = namespace.get("council_manifest")
+council_shared_payload = namespace.get("council_shared_payload")
+council_shared_material_sha256 = namespace.get("council_shared_material_sha256")
+COUNCIL_SCHEMA_VERSION = namespace.get("COUNCIL_SCHEMA_VERSION")
 main = namespace["main"]
 resolve_state_dir = namespace["resolve_state_dir"]
 participant_status = namespace["participant_status"]
@@ -2884,6 +2890,126 @@ def make_consensus_chat(
     return chat, transcript
 
 
+def make_council_round(**overrides: object) -> object:
+    base: dict[str, object] = dict(
+        id="roundid01",
+        question=" hashed objective ",
+        reviewers=("claude", "codex"),
+        synthesizer="pi",
+        prompts={},
+        question_seq=None,
+        states={},
+    )
+    base.update(overrides)
+    return namespace["ReviewRound"](**base)  # type: ignore[arg-type]
+
+
+def test_council_manifest_exact_shape_and_hashes() -> None:
+    review = make_council_round()
+
+    assert council_manifest(review) == {
+        "schema_version": COUNCIL_SCHEMA_VERSION,
+        "round_id": "roundid01",
+        "objective_sha256": council_sha256_text(" hashed objective "),
+        "reviewers": ["claude", "codex"],
+        "synthesizer": "pi",
+        "participants": ["claude", "codex", "pi"],
+        "human_acceptance_required": True,
+    }
+    assert COUNCIL_SCHEMA_VERSION == 1
+    assert council_canonical_json({"b": 1, "a": "é"}) == '{"a":"é","b":1}'
+    assert council_sha256_text("abc") == (
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    )
+
+
+def test_council_shared_payload_requires_all_responses_and_synthesis() -> None:
+    complete = make_council_round(
+        responses={"claude": "r1", "codex": "r2"}, synthesis="s"
+    )
+    assert council_shared_payload(complete)["blind_responses"] == [
+        {"reviewer": "claude", "response": "r1"},
+        {"reviewer": "codex", "response": "r2"},
+    ]
+    missing_response = make_council_round(responses={"claude": "r1"}, synthesis="s")
+    with pytest.raises(ChatError):
+        council_shared_payload(missing_response)
+    missing_synthesis = make_council_round(responses={"claude": "r1", "codex": "r2"})
+    with pytest.raises(ChatError):
+        council_shared_material_sha256(missing_synthesis)
+
+
+def test_council_hash_identical_on_votes_statuses_and_terminal_after_provisional(
+    tmp_path: Path,
+) -> None:
+    client = ConsensusClient(
+        blind_replies={"claude-peer": "CLAUDE_BLIND", "codex-peer": "CODEX_BLIND"},
+        provisional="COUNCIL_PROVISIONAL",
+    )
+    chat, transcript = make_consensus_chat(tmp_path, client, "council-hash-room")
+
+    review = chat.consensus("@claude,@codex Hash the council")
+
+    expected = council_shared_material_sha256(review)
+    messages = transcript.read()
+    votes = [item for item in messages if item["kind"] == "consensus_vote"]
+    assert len(votes) == 2
+    assert {item["meta"]["council_shared_sha256"] for item in votes} == {expected}
+    statuses = [item for item in messages if item["kind"] == "consensus_status"]
+    assert len(statuses) == 1
+    assert statuses[0]["meta"]["council_shared_sha256"] == expected
+
+    # A terminal status sealed after the provisional exists also carries the hash.
+    sealed = make_council_round(
+        id=review.id,
+        question=review.question,
+        reviewers=review.reviewers,
+        synthesizer=review.synthesizer,
+        responses=dict(review.responses),
+        synthesis=review.synthesis,
+    )
+    assert chat._commit_consensus_terminal(sealed, "cancelled", "cancelled after vote")
+    terminal = transcript.read()[-1]
+    assert terminal["kind"] == "consensus_status"
+    assert terminal["meta"]["terminal_outcome"] == "cancelled"
+    assert terminal["meta"]["council_shared_sha256"] == expected
+
+
+def test_council_shared_hash_stable_across_random_prompt_tokens(tmp_path: Path) -> None:
+    hashes = []
+    for index in range(2):
+        client = ConsensusClient(
+            blind_replies={"claude-peer": "SAME_BLIND", "codex-peer": "SAME_BLIND"},
+            provisional="SAME_PROVISIONAL",
+        )
+        chat, transcript = make_consensus_chat(tmp_path, client, f"stable-{index}-room")
+        review = chat.consensus("@claude,@codex Same material")
+        votes = [item for item in transcript.read() if item["kind"] == "consensus_vote"]
+        assert votes
+        hashes.append({item["meta"]["council_shared_sha256"] for item in votes})
+        assert council_shared_material_sha256(review) in hashes[-1]
+
+    assert hashes[0] == hashes[1] and len(hashes[0]) == 1
+
+
+def test_council_manifest_persisted_on_review_question_and_no_hash_before_provisional(
+    tmp_path: Path,
+) -> None:
+    client = ConsensusClient(blind_replies={"codex-peer": "CONSENSUS_SHARE_REFUSED"})
+    chat, transcript = make_consensus_chat(tmp_path, client, "refusal-manifest-room")
+
+    review = chat.consensus("@claude,@codex Eligible question")
+
+    messages = transcript.read()
+    question = next(item for item in messages if item["kind"] == "review_question")
+    assert question["meta"]["council_participants"] == ["claude", "codex", "pi"]
+    assert question["meta"]["council_manifest"] == council_manifest(review)
+    for item in messages:
+        assert "council_shared_sha256" not in item.get("meta", {})
+    with pytest.raises(ChatError):
+        council_shared_material_sha256(review)
+
+
 @pytest.mark.parametrize(
     ("reply", "expected"),
     [
@@ -3007,6 +3133,8 @@ def test_consensus_runs_blind_barrier_shared_votes_and_unanimous_final(tmp_path:
     ]
     provisional_item = next(item for item in messages if item["kind"] == "consensus_provisional")
     assert provisional_item["provisional"] is True
+    import hashlib
+
     status = next(item for item in messages if item["kind"] == "consensus_status")
     assert status["meta"] == {
         "council_participants": ["claude", "codex", "pi"],
@@ -3014,6 +3142,21 @@ def test_consensus_runs_blind_barrier_shared_votes_and_unanimous_final(tmp_path:
         "verdicts": {"claude": "PASS", "codex": "PASS"},
         "unanimous": True,
         "human_acceptance_required": True,
+        "council_shared_sha256": hashlib.sha256(
+            council_canonical_json(
+                {
+                    "question": "Choose safely",
+                    "blind_responses": [
+                        {"reviewer": "claude", "response": "blind from claude-peer"},
+                        {"reviewer": "codex", "response": "blind from codex-peer"},
+                    ],
+                    "provisional_synthesis": "agreements; unresolved contention; "
+                    "candidate resolution",
+                    "reviewers": ["claude", "codex"],
+                    "synthesizer": "pi",
+                }
+            ).encode("utf-8")
+        ).hexdigest(),
     }
     assert review.mode == "consensus"
     assert review.terminal_outcome == "completed"

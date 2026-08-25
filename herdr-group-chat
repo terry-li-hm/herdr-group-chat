@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import curses
+import hashlib
 import json
 import os
 import re
@@ -47,6 +48,7 @@ PROFILE_ROLES = {
 PROFILE_SYNTHESIZER = {"sol-fable": "sol", "sol-fable-grok": "sol"}
 PROFILE_RECEIPT_KIND = "profile_receipt"
 PROFILE_RECEIPT_ENV = "HERDR_GROUP_CHAT_PROFILE_RECEIPT"
+COUNCIL_SCHEMA_VERSION = 1
 DEFAULT_STATE_DIR = Path("~/.local/state/herdr-group-chat")
 ROOM_ENV = "HERDR_GROUP_CHAT_ROOM"
 AGENTS_WORKSPACE_ENV = "HERDR_GROUP_CHAT_AGENTS_WORKSPACE_ID"
@@ -1029,6 +1031,54 @@ def consensus_item_meta(
     return scoped
 
 
+def council_canonical_json(payload: Mapping[str, Any]) -> str:
+    """Serialize a council payload deterministically: compact, key-sorted, UTF-8."""
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def council_sha256_text(text: str) -> str:
+    """SHA-256 over the exact UTF-8 encoding of the given text."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def council_manifest(review: ReviewRound) -> dict[str, Any]:
+    """Deterministic manifest describing the council round itself."""
+    return {
+        "schema_version": COUNCIL_SCHEMA_VERSION,
+        "round_id": review.id,
+        "objective_sha256": council_sha256_text(review.question),
+        "reviewers": list(review.reviewers),
+        "synthesizer": review.synthesizer,
+        "participants": list(consensus_participants(review)),
+        "human_acceptance_required": True,
+    }
+
+
+def council_shared_payload(review: ReviewRound) -> dict[str, Any]:
+    """Deterministic shared material for hashing; excludes all random tokens."""
+    missing = [name for name in review.reviewers if not review.responses.get(name)]
+    if missing or review.synthesis is None:
+        raise ChatError(
+            "council shared material is incomplete: "
+            f"missing responses {missing!r}, synthesis {review.synthesis!r}"
+        )
+    return {
+        "question": review.question,
+        "blind_responses": [
+            {"reviewer": name, "response": review.responses[name]}
+            for name in review.reviewers
+        ],
+        "provisional_synthesis": review.synthesis,
+        "reviewers": list(review.reviewers),
+        "synthesizer": review.synthesizer,
+    }
+
+
+def council_shared_material_sha256(review: ReviewRound) -> str:
+    """SHA-256 over the canonical shared material, stable across random prompt tokens."""
+    return council_sha256_text(council_canonical_json(council_shared_payload(review)))
+
+
 def build_consensus_blind_prompt(
     agent: str,
     question: str,
@@ -1327,7 +1377,9 @@ class GroupChat:
                 review.question,
                 kind="review_question",
                 round_id=review.id,
-                meta=consensus_item_meta(review) if review.mode == "consensus" else None,
+                meta=consensus_item_meta(review, {"council_manifest": council_manifest(review)})
+                if review.mode == "consensus"
+                else None,
             )
             review.question_seq = question_item["seq"]
         return True
@@ -1881,13 +1933,18 @@ class GroupChat:
             return
         parsed = parse_consensus_verdict(reply)
         verdict = parsed or "INVALID"
+        vote_meta: dict[str, Any] = {"verdict": verdict}
+        # Votes only ever run after the provisional barrier, but a directly driven
+        # or recovery-path call must not crash on incomplete shared material.
+        with suppress(ChatError):
+            vote_meta["council_shared_sha256"] = council_shared_material_sha256(review)
         self._commit_review_phase(
             review,
             agent,
             "done" if parsed else "invalid",
             on_state,
             message=(agent, ("human", "all"), reply, "consensus_vote", False),
-            message_meta={"verdict": verdict},
+            message_meta=vote_meta,
             consensus_vote=(reply, verdict),
         )
 
@@ -1913,6 +1970,7 @@ class GroupChat:
                     "verdicts": verdicts,
                     "unanimous": unanimous,
                     "human_acceptance_required": True,
+                    "council_shared_sha256": council_shared_material_sha256(review),
                 },
             ),
         )
@@ -1929,23 +1987,23 @@ class GroupChat:
             if review.terminal_outcome is not None:
                 return False
             verdicts, unanimous = self._consensus_verdict_ledger(review)
+            terminal_meta: dict[str, Any] = {
+                "reviewers": list(review.reviewers),
+                "verdicts": verdicts,
+                "unanimous": unanimous,
+                "human_acceptance_required": True,
+                "terminal_outcome": outcome,
+                "terminal_detail": detail,
+            }
+            if review.synthesis is not None:
+                terminal_meta["council_shared_sha256"] = council_shared_material_sha256(review)
             self.transcript.append(
                 "system",
                 ("human", "all"),
                 f"Consensus {detail}. Human acceptance is required.",
                 kind="consensus_status",
                 round_id=review.id,
-                meta=consensus_item_meta(
-                    review,
-                    {
-                        "reviewers": list(review.reviewers),
-                        "verdicts": verdicts,
-                        "unanimous": unanimous,
-                        "human_acceptance_required": True,
-                        "terminal_outcome": outcome,
-                        "terminal_detail": detail,
-                    },
-                ),
+                meta=consensus_item_meta(review, terminal_meta),
             )
             review.terminal_outcome = outcome
             review.terminal_detail = detail
