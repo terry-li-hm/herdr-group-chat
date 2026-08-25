@@ -1001,7 +1001,7 @@ def parse_consensus_verdict(reply: str) -> str | None:
 def consensus_share_refused(reply: str) -> bool:
     """Recognize only an exact refusal sentinel on the first non-empty line."""
     first = next((line for line in reply.splitlines() if line.strip()), "")
-    return first == CONSENSUS_SHARE_REFUSED
+    return first.strip() == CONSENSUS_SHARE_REFUSED
 
 
 def consensus_participants(review: ReviewRound) -> tuple[str, ...]:

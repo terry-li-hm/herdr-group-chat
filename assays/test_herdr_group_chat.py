@@ -3056,10 +3056,11 @@ def test_consensus_refusal_or_empty_blind_stops_with_terminal_nonunanimous_statu
     assert review.terminal_outcome == outcome
 
 
+@pytest.mark.parametrize("indent", ["", " ", "\t"])
 def test_consensus_refusal_discards_trailing_text_and_persists_only_sentinel(
-    tmp_path: Path,
+    tmp_path: Path, indent: str
 ) -> None:
-    trailing = "CONSENSUS_SHARE_REFUSED\nPRIVATE_TRAILING_EXPLANATION"
+    trailing = f"{indent}CONSENSUS_SHARE_REFUSED\nPRIVATE_TRAILING_EXPLANATION"
     client = ConsensusClient(blind_replies={"codex-peer": trailing})
     chat, transcript = make_consensus_chat(tmp_path, client, "trailing-refusal-room")
 
@@ -3077,7 +3078,8 @@ def test_consensus_refusal_discards_trailing_text_and_persists_only_sentinel(
     "reply",
     [
         "CONSENSUS_SHARE_REFUSED extra",
-        " CONSENSUS_SHARE_REFUSED",
+        "CONSENSUS_SHARE_REFUSED_SUFFIX",
+        "CONSENSUS_SHARE_REFUSED\twith explanation",
         "Ordinary answer\nCONSENSUS_SHARE_REFUSED",
     ],
 )
