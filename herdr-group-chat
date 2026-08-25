@@ -56,8 +56,10 @@ MENTION_RE = re.compile(r"^@([a-z0-9_,@-]+)\s+(.*)$", re.DOTALL | re.IGNORECASE)
 REPLY_TOKEN_RE = re.compile(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})")
 CONSENSUS_SHARE_REFUSED = "CONSENSUS_SHARE_REFUSED"
 CONSENSUS_VERDICT_RE = re.compile(r"\AVERDICT: (PASS|REVISE)(?:[ \t]+(\S.*))?\Z")
-CONSENSUS_EXPLANATION_CONNECTOR_RE = re.compile(r"\A(?:or|and|versus|vs)\b", re.IGNORECASE)
-CONSENSUS_EXPLANATION_VERDICT_RE = re.compile(r"\b(?:PASS|REVISE)\b")
+CONSENSUS_EXPLANATION_CONNECTOR_RE = re.compile(
+    r"\A(?:or|and|versus|vs)(?![A-Za-z0-9])", re.IGNORECASE
+)
+CONSENSUS_EXPLANATION_VERDICT_RE = re.compile(r"(?<![A-Za-z0-9])(?:PASS|REVISE)(?![A-Za-z0-9])")
 # Herdr reports agent status heuristically and flips idle->working with a lag, and a
 # 240-line alternate-screen read is a scrolling capture that took ~6 s on a busy host.
 # So the relay polls at a modest interval, defers the first read until the agent has been

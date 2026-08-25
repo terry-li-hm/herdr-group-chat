@@ -2895,6 +2895,10 @@ def make_consensus_chat(
         ("VERDICT: PASS The candidate final token is exactly ORCHID.", "PASS"),
         ("VERDICT: PASS\tThe candidate is internally consistent.", "PASS"),
         ("VERDICT: REVISE Material evidence is still missing.", "REVISE"),
+        ("VERDICT: PASS oracle evidence supports the candidate.", "PASS"),
+        ("VERDICT: REVISE\tvscode output exposes a mismatch.", "REVISE"),
+        ("VERDICT: PASS The PASSAGE remains consistent.", "PASS"),
+        ("VERDICT: REVISE\tThe REVISE2 case remains unresolved.", "REVISE"),
     ],
 )
 def test_consensus_verdict_parser_accepts_anchored_first_line_forms(
@@ -2931,6 +2935,26 @@ def test_consensus_verdict_parser_accepts_anchored_first_line_forms(
 )
 def test_consensus_verdict_parser_rejects_non_boundary_forms(reply: str) -> None:
     assert parse_consensus_verdict(reply) is None
+
+
+@pytest.mark.parametrize(("verdict", "other"), [("PASS", "REVISE"), ("REVISE", "PASS")])
+@pytest.mark.parametrize("separator", [" ", "\t"])
+@pytest.mark.parametrize("connector", ["or", "and", "versus", "vs"])
+def test_consensus_verdict_parser_rejects_underscore_delimited_connectors(
+    verdict: str, other: str, separator: str, connector: str
+) -> None:
+    assert parse_consensus_verdict(f"VERDICT: {verdict}{separator}{connector}_{other}") is None
+
+
+@pytest.mark.parametrize(("verdict", "other"), [("PASS", "REVISE"), ("REVISE", "PASS")])
+@pytest.mark.parametrize("separator", [" ", "\t"])
+def test_consensus_verdict_parser_rejects_underscore_delimited_embedded_verdicts(
+    verdict: str, other: str, separator: str
+) -> None:
+    assert (
+        parse_consensus_verdict(f"VERDICT: {verdict}{separator}The_candidate_is_{other}_instead")
+        is None
+    )
 
 
 def test_consensus_json_serialization_prevents_source_from_closing_boundary() -> None:
