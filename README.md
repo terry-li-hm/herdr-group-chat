@@ -99,13 +99,15 @@ non-unanimous status.
 The configured synthesizer produces a provisional contention packet. Every
 reviewer then ratifies the same byte-identical shared material with `VERDICT:
 PASS` or `VERDICT: REVISE` on the first non-empty line. A token-only line is
-preferred, but horizontal whitespace and a non-empty same-line explanation are
-accepted. Peer replies, provisional text, and votes are serialized as untrusted
-quoted JSON with fresh boundaries. They never become instructions. A
-deterministic ledger is unanimous only when every vote is a valid `PASS`, and it
-remains authoritative regardless of final model prose. The final synthesis stays
-advisory and always requires human acceptance. A failed provisional stops before
-voting. Failed or invalid votes produce a non-unanimous final.
+preferred. A same-line explanation is accepted only after horizontal whitespace,
+when it begins with alphanumeric prose, is not led by `or`, `and`, `versus`, or
+`vs`, and contains no standalone `PASS` or `REVISE` token. Peer replies,
+provisional text, and votes are serialized as untrusted quoted JSON with fresh
+boundaries. They never become instructions. A deterministic ledger is unanimous
+only when every vote is a valid `PASS`, and it remains authoritative regardless
+of final model prose. The final synthesis stays advisory and always requires
+human acceptance. A failed provisional stops before voting. Failed or invalid
+votes produce a non-unanimous final.
 `/cancel` records one terminal local outcome at every phase, and `/retry` is
 unavailable after consensus.
 Every consensus transcript item carries the ordered council scope. The human
