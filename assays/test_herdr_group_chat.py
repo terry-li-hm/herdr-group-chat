@@ -2954,10 +2954,10 @@ def test_council_hash_identical_on_votes_statuses_and_terminal_after_provisional
     messages = transcript.read()
     votes = [item for item in messages if item["kind"] == "consensus_vote"]
     assert len(votes) == 2
-    assert {item["meta"]["council_shared_sha256"] for item in votes} == {expected}
+    assert {item["meta"]["shared_material_sha256"] for item in votes} == {expected}
     statuses = [item for item in messages if item["kind"] == "consensus_status"]
     assert len(statuses) == 1
-    assert statuses[0]["meta"]["council_shared_sha256"] == expected
+    assert statuses[0]["meta"]["shared_material_sha256"] == expected
 
     # A terminal status sealed after the provisional exists also carries the hash.
     sealed = make_council_round(
@@ -2972,7 +2972,7 @@ def test_council_hash_identical_on_votes_statuses_and_terminal_after_provisional
     terminal = transcript.read()[-1]
     assert terminal["kind"] == "consensus_status"
     assert terminal["meta"]["terminal_outcome"] == "cancelled"
-    assert terminal["meta"]["council_shared_sha256"] == expected
+    assert terminal["meta"]["shared_material_sha256"] == expected
 
 
 def test_council_shared_hash_stable_across_random_prompt_tokens(tmp_path: Path) -> None:
@@ -2986,10 +2986,30 @@ def test_council_shared_hash_stable_across_random_prompt_tokens(tmp_path: Path) 
         review = chat.consensus("@claude,@codex Same material")
         votes = [item for item in transcript.read() if item["kind"] == "consensus_vote"]
         assert votes
-        hashes.append({item["meta"]["council_shared_sha256"] for item in votes})
+        hashes.append({item["meta"]["shared_material_sha256"] for item in votes})
         assert council_shared_material_sha256(review) in hashes[-1]
 
     assert hashes[0] == hashes[1] and len(hashes[0]) == 1
+
+
+def test_council_incomplete_directly_driven_vote_record_raises_and_appends_no_vote(
+    tmp_path: Path,
+) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "incomplete-vote-room")
+    review = chat.plan_consensus("@claude,@codex Eligible question")
+    assert chat._activate_review(review)
+    assert not review.responses and review.synthesis is None
+
+    future = Future()
+    future.set_result(("done", "VERDICT: PASS\nPremature vote."))
+
+    with pytest.raises(ChatError):
+        chat._record_consensus_vote(review, "claude", future, None)
+
+    messages = transcript.read()
+    assert not any(item["kind"] == "consensus_vote" for item in messages)
+    assert "claude" not in review.votes
+    assert "claude" not in review.verdicts
 
 
 def test_council_manifest_persisted_on_review_question_and_no_hash_before_provisional(
@@ -3005,7 +3025,7 @@ def test_council_manifest_persisted_on_review_question_and_no_hash_before_provis
     assert question["meta"]["council_participants"] == ["claude", "codex", "pi"]
     assert question["meta"]["council_manifest"] == council_manifest(review)
     for item in messages:
-        assert "council_shared_sha256" not in item.get("meta", {})
+        assert "shared_material_sha256" not in item.get("meta", {})
     with pytest.raises(ChatError):
         council_shared_material_sha256(review)
 
@@ -3142,7 +3162,7 @@ def test_consensus_runs_blind_barrier_shared_votes_and_unanimous_final(tmp_path:
         "verdicts": {"claude": "PASS", "codex": "PASS"},
         "unanimous": True,
         "human_acceptance_required": True,
-        "council_shared_sha256": hashlib.sha256(
+        "shared_material_sha256": hashlib.sha256(
             council_canonical_json(
                 {
                     "question": "Choose safely",
@@ -3477,6 +3497,10 @@ def test_consensus_cancel_after_vote_append_keeps_committed_verdict_in_terminal_
     chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "vote-cancel-race-room")
     review = chat.plan_consensus("@claude,@codex Choose safely")
     assert chat._activate_review(review)
+    # The vote-commit race needs the provisional barrier already passed so the
+    # authoritative shared-material hash exists for the directly driven vote.
+    review.responses.update({"claude": "CLAUDE_BLIND", "codex": "CODEX_BLIND"})
+    review.synthesis = "COUNCIL_PROVISIONAL"
     original_commit = chat._commit_review_phase
     vote_appended = threading.Event()
     release_vote_commit = threading.Event()

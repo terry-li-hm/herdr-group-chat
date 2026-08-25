@@ -1934,10 +1934,10 @@ class GroupChat:
         parsed = parse_consensus_verdict(reply)
         verdict = parsed or "INVALID"
         vote_meta: dict[str, Any] = {"verdict": verdict}
-        # Votes only ever run after the provisional barrier, but a directly driven
-        # or recovery-path call must not crash on incomplete shared material.
-        with suppress(ChatError):
-            vote_meta["council_shared_sha256"] = council_shared_material_sha256(review)
+        # Votes only ever run after the provisional barrier; a directly driven
+        # or recovery-path call with incomplete shared material must fail loudly
+        # rather than persist a vote without its authoritative hash.
+        vote_meta["shared_material_sha256"] = council_shared_material_sha256(review)
         self._commit_review_phase(
             review,
             agent,
@@ -1970,7 +1970,7 @@ class GroupChat:
                     "verdicts": verdicts,
                     "unanimous": unanimous,
                     "human_acceptance_required": True,
-                    "council_shared_sha256": council_shared_material_sha256(review),
+                    "shared_material_sha256": council_shared_material_sha256(review),
                 },
             ),
         )
@@ -1996,7 +1996,7 @@ class GroupChat:
                 "terminal_detail": detail,
             }
             if review.synthesis is not None:
-                terminal_meta["council_shared_sha256"] = council_shared_material_sha256(review)
+                terminal_meta["shared_material_sha256"] = council_shared_material_sha256(review)
             self.transcript.append(
                 "system",
                 ("human", "all"),
