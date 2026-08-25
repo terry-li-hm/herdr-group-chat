@@ -25,6 +25,7 @@ sys.modules[module.__name__] = module
 loader.exec_module(module)
 namespace = module.__dict__
 
+Future = namespace["Future"]
 ChatError = namespace["ChatError"]
 GroupChat = namespace["GroupChat"]
 HerdrClient = namespace["HerdrClient"]
@@ -2950,6 +2951,7 @@ def test_consensus_runs_blind_barrier_shared_votes_and_unanimous_final(tmp_path:
     assert provisional_item["provisional"] is True
     status = next(item for item in messages if item["kind"] == "consensus_status")
     assert status["meta"] == {
+        "council_participants": ["claude", "codex", "pi"],
         "reviewers": ["claude", "codex"],
         "verdicts": {"claude": "PASS", "codex": "PASS"},
         "unanimous": True,
@@ -2958,6 +2960,56 @@ def test_consensus_runs_blind_barrier_shared_votes_and_unanimous_final(tmp_path:
     assert review.mode == "consensus"
     assert review.terminal_outcome == "completed"
     assert messages[-1]["meta"]["terminal_outcome"] == "completed"
+
+
+def test_consensus_scope_excludes_nonparticipant_from_later_ordinary_prompt(
+    tmp_path: Path,
+) -> None:
+    client = ConsensusClient(
+        votes={
+            "claude-peer": "VERDICT: PASS\nCLAUDE_COUNCIL_VOTE",
+            "codex-peer": "VERDICT: PASS\nCODEX_COUNCIL_VOTE",
+        },
+        blind_replies={
+            "claude-peer": "CLAUDE_COUNCIL_BLIND",
+            "codex-peer": "CODEX_COUNCIL_BLIND",
+        },
+        provisional="COUNCIL_PROVISIONAL",
+    )
+    transcript = Transcript(tmp_path, "scoped-consensus-room")
+    chat = GroupChat(
+        transcript,
+        {
+            "pi": "pi-peer",
+            "claude": "claude-peer",
+            "codex": "codex-peer",
+            "grok": "grok-peer",
+        },
+        client,
+        synthesizer="pi",
+    )
+
+    review = chat.consensus("@claude,@codex COUNCIL_QUESTION")
+    council_items = [item for item in transcript.read() if item.get("round_id") == review.id]
+    assert council_items
+    assert all(
+        item.get("meta", {}).get("council_participants") == ["claude", "codex", "pi"]
+        for item in council_items
+    )
+
+    calls_before_dispatch = len(client.calls)
+    chat.dispatch("@grok ORDINARY_ROOM_MESSAGE")
+    grok_calls = [
+        prompt for target, prompt in client.calls[calls_before_dispatch:] if target == "grok-peer"
+    ]
+
+    assert len(set(grok_calls)) == 1
+    grok_prompt = grok_calls[0]
+    assert "ORDINARY_ROOM_MESSAGE" in grok_prompt
+    assert all(item["body"] not in grok_prompt for item in council_items)
+    assert council_items == [
+        item for item in transcript.read() if item.get("round_id") == review.id
+    ]
 
 
 def test_consensus_blind_prompt_discloses_sharing_and_allows_safe_refusal(
@@ -3002,6 +3054,50 @@ def test_consensus_refusal_or_empty_blind_stops_with_terminal_nonunanimous_statu
     assert terminal[0]["meta"]["unanimous"] is False
     assert terminal[0]["meta"]["verdicts"] == {"claude": "MISSING", "codex": "MISSING"}
     assert review.terminal_outcome == outcome
+
+
+def test_consensus_refusal_discards_trailing_text_and_persists_only_sentinel(
+    tmp_path: Path,
+) -> None:
+    trailing = "CONSENSUS_SHARE_REFUSED\nPRIVATE_TRAILING_EXPLANATION"
+    client = ConsensusClient(blind_replies={"codex-peer": trailing})
+    chat, transcript = make_consensus_chat(tmp_path, client, "trailing-refusal-room")
+
+    review = chat.consensus("@claude,@codex Eligible question")
+
+    messages = transcript.read()
+    refusal = next(item for item in messages if item.get("meta", {}).get("share_refused"))
+    assert refusal["body"] == "CONSENSUS_SHARE_REFUSED"
+    assert "PRIVATE_TRAILING_EXPLANATION" not in json.dumps(messages)
+    assert "codex" not in review.responses
+    assert review.terminal_outcome == "refused"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "CONSENSUS_SHARE_REFUSED extra",
+        " CONSENSUS_SHARE_REFUSED",
+        "Ordinary answer\nCONSENSUS_SHARE_REFUSED",
+    ],
+)
+def test_consensus_refusal_lookalikes_remain_ordinary_blind_replies(
+    tmp_path: Path, reply: str
+) -> None:
+    client = ConsensusClient(blind_replies={"codex-peer": reply})
+    chat, transcript = make_consensus_chat(tmp_path, client, "refusal-lookalike-room")
+
+    review = chat.consensus("@claude,@codex Eligible question")
+
+    response = next(
+        item
+        for item in transcript.read()
+        if item["kind"] == "review_response" and item["sender"] == "codex"
+    )
+    assert response["body"] == reply.strip()
+    assert response.get("meta", {}).get("share_refused") is None
+    assert review.responses["codex"] == reply
+    assert review.terminal_outcome == "completed"
 
 
 def test_consensus_serializes_untrusted_peer_text_and_repeats_binding_instructions(
@@ -3146,6 +3242,50 @@ def test_consensus_missing_vote_is_nonunanimous_and_still_finalizes(tmp_path: Pa
     assert status["meta"]["verdicts"] == {"claude": "PASS", "codex": "MISSING"}
     assert status["meta"]["unanimous"] is False
     assert any(item["kind"] == "consensus_final" for item in transcript.read())
+
+
+def test_consensus_cancel_after_vote_append_keeps_committed_verdict_in_terminal_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "vote-cancel-race-room")
+    review = chat.plan_consensus("@claude,@codex Choose safely")
+    assert chat._activate_review(review)
+    original_commit = chat._commit_review_phase
+    vote_appended = threading.Event()
+    release_vote_commit = threading.Event()
+    record_finished = threading.Event()
+
+    def gated_commit(*args: object, **kwargs: object) -> bool:
+        committed = original_commit(*args, **kwargs)
+        message = kwargs.get("message")
+        if isinstance(message, tuple) and message[3] == "consensus_vote":
+            vote_appended.set()
+            assert release_vote_commit.wait(timeout=2)
+        return committed
+
+    monkeypatch.setattr(chat, "_commit_review_phase", gated_commit)
+    future = Future()
+    future.set_result(("done", "VERDICT: PASS\nCommitted before cancellation."))
+
+    def record_vote() -> None:
+        chat._record_consensus_vote(review, "claude", future, None)
+        record_finished.set()
+
+    worker = threading.Thread(target=record_vote)
+    worker.start()
+    assert vote_appended.wait(timeout=2)
+    assert chat.cancel_review(review)
+    release_vote_commit.set()
+    worker.join(timeout=2)
+    assert record_finished.is_set()
+
+    messages = transcript.read()
+    votes = [item for item in messages if item["kind"] == "consensus_vote"]
+    terminals = [item for item in messages if item.get("meta", {}).get("terminal_outcome")]
+    assert len(votes) == 1
+    assert len(terminals) == 1
+    assert terminals[0]["meta"]["terminal_outcome"] == "cancelled"
+    assert terminals[0]["meta"]["verdicts"] == {"claude": "PASS", "codex": "MISSING"}
 
 
 @pytest.mark.parametrize(

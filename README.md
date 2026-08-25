@@ -91,8 +91,10 @@ answer blind and concurrently. Use this mode only when the question, payload,
 and expected reply class are eligible on every selected reviewer route and the
 configured synthesizer route. The relay cannot classify that eligibility. Each
 blind prompt discloses verbatim redistribution and permits the exact
-non-sensitive reply `CONSENSUS_SHARE_REFUSED`; refusal or an empty reply stops
-before provisional synthesis with a non-unanimous status.
+non-sensitive reply `CONSENSUS_SHARE_REFUSED`; when it is the exact first
+non-empty line, the relay keeps only that sentinel and discards trailing text.
+Refusal or an empty reply stops before provisional synthesis with a
+non-unanimous status.
 
 The configured synthesizer produces a provisional contention packet. Every
 reviewer then ratifies the same byte-identical shared material with `VERDICT:
@@ -105,6 +107,9 @@ human acceptance. A failed provisional stops before voting. Failed or invalid
 votes produce a non-unanimous final.
 `/cancel` records one terminal local outcome at every phase, and `/retry` is
 unavailable after consensus.
+Every consensus transcript item carries the ordered council scope. The human
+room transcript remains complete, while later ordinary prompts omit those
+items for agents outside the selected reviewers and synthesizer.
 
 `/inbox` switches the transcript to a presentation-only inbox of final agent
 replies, review syntheses, system notices, and review statuses that need

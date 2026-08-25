@@ -14,6 +14,9 @@ All notable changes to this project are documented here.
   JSON data, every started round records one structured terminal outcome,
   controller notices reflect phase failures, direct retries fail closed, and the
   inbox hides clean unanimous status entries.
+- Scope every consensus transcript item to its ordered council for later agent
+  delivery, commit vote artifacts and verdict bookkeeping atomically with
+  cancellation, and reduce first-line refusal replies to the safe sentinel.
 - Bind transcript and launcher transactions to validated directory descriptors,
   deduplicate profile receipts atomically, and discard late review replies after
   local cancellation while committing one completion or cancellation outcome.

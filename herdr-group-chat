@@ -899,6 +899,15 @@ def format_context(messages: Sequence[dict[str, Any]]) -> str:
     return "\n\n".join(f"[{item['sender']}] {item['body']}" for item in messages)
 
 
+def message_visible_to_agent(item: Mapping[str, Any], agent: str) -> bool:
+    """Hide council-scoped transcript items only from routes outside that council."""
+    meta = item.get("meta")
+    if not isinstance(meta, dict) or "council_participants" not in meta:
+        return True
+    scope = meta["council_participants"]
+    return isinstance(scope, list) and agent in scope
+
+
 def build_prompt(
     agent: str,
     messages: Sequence[dict[str, Any]],
@@ -987,6 +996,24 @@ def parse_consensus_verdict(reply: str) -> str | None:
     if first == "VERDICT: REVISE":
         return "REVISE"
     return None
+
+
+def consensus_share_refused(reply: str) -> bool:
+    """Recognize only an exact refusal sentinel on the first non-empty line."""
+    first = next((line for line in reply.splitlines() if line.strip()), "")
+    return first == CONSENSUS_SHARE_REFUSED
+
+
+def consensus_participants(review: ReviewRound) -> tuple[str, ...]:
+    return tuple(dict.fromkeys((*review.reviewers, review.synthesizer)))
+
+
+def consensus_item_meta(
+    review: ReviewRound, meta: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    scoped = dict(meta or {})
+    scoped["council_participants"] = list(consensus_participants(review))
+    return scoped
 
 
 def build_consensus_blind_prompt(
@@ -1221,7 +1248,9 @@ class GroupChat:
                 messages = [
                     item
                     for item in self.transcript.read()
-                    if item["seq"] > cursors.get(agent, 0) and item["sender"] != agent
+                    if item["seq"] > cursors.get(agent, 0)
+                    and item["sender"] != agent
+                    and message_visible_to_agent(item, agent)
                 ]
                 delivered_through = max(item["seq"] for item in messages)
                 token = uuid.uuid4().hex
@@ -1282,6 +1311,7 @@ class GroupChat:
                 review.question,
                 kind="review_question",
                 round_id=review.id,
+                meta=consensus_item_meta(review) if review.mode == "consensus" else None,
             )
             review.question_seq = question_item["seq"]
         return True
@@ -1382,6 +1412,7 @@ class GroupChat:
         store_response: bool = False,
         store_synthesis: bool = False,
         message_meta: Mapping[str, Any] | None = None,
+        consensus_vote: tuple[str, str] | None = None,
         terminal_outcome: str | None = None,
         terminal_detail: str | None = None,
     ) -> bool:
@@ -1396,6 +1427,11 @@ class GroupChat:
             else:
                 if message is not None:
                     sender, recipients, body, kind, provisional = message
+                    stored_meta = (
+                        consensus_item_meta(review, message_meta)
+                        if review.mode == "consensus"
+                        else message_meta
+                    )
                     self.transcript.append(
                         sender,
                         recipients,
@@ -1403,12 +1439,16 @@ class GroupChat:
                         kind=kind,
                         round_id=review.id,
                         provisional=provisional,
-                        meta=message_meta,
+                        meta=stored_meta,
                     )
                 if store_response and reply is not None:
                     review.responses[agent] = reply
                 if store_synthesis and reply is not None:
                     review.synthesis = reply
+                if consensus_vote is not None:
+                    vote_reply, verdict = consensus_vote
+                    review.votes[agent] = vote_reply
+                    review.verdicts[agent] = verdict
                 if terminal_outcome is not None:
                     review.terminal_outcome = terminal_outcome
                     review.terminal_detail = terminal_detail
@@ -1479,7 +1519,7 @@ class GroupChat:
                 ),
             )
             return
-        if review.mode == "consensus" and reply == CONSENSUS_SHARE_REFUSED:
+        if review.mode == "consensus" and consensus_share_refused(reply):
             self._commit_review_phase(
                 review,
                 agent,
@@ -1825,18 +1865,15 @@ class GroupChat:
             return
         parsed = parse_consensus_verdict(reply)
         verdict = parsed or "INVALID"
-        committed = self._commit_review_phase(
+        self._commit_review_phase(
             review,
             agent,
             "done" if parsed else "invalid",
             on_state,
             message=(agent, ("human", "all"), reply, "consensus_vote", False),
             message_meta={"verdict": verdict},
+            consensus_vote=(reply, verdict),
         )
-        if committed:
-            with review.lock:
-                review.votes[agent] = reply
-                review.verdicts[agent] = verdict
 
     @staticmethod
     def _consensus_verdict_ledger(review: ReviewRound) -> tuple[dict[str, str], bool]:
@@ -1853,12 +1890,15 @@ class GroupChat:
             f"Unanimous: {str(unanimous).lower()}.",
             kind="consensus_status",
             round_id=review.id,
-            meta={
-                "reviewers": list(review.reviewers),
-                "verdicts": verdicts,
-                "unanimous": unanimous,
-                "human_acceptance_required": True,
-            },
+            meta=consensus_item_meta(
+                review,
+                {
+                    "reviewers": list(review.reviewers),
+                    "verdicts": verdicts,
+                    "unanimous": unanimous,
+                    "human_acceptance_required": True,
+                },
+            ),
         )
         return verdicts, unanimous
 
@@ -1879,14 +1919,17 @@ class GroupChat:
                 f"Consensus {detail}. Human acceptance is required.",
                 kind="consensus_status",
                 round_id=review.id,
-                meta={
-                    "reviewers": list(review.reviewers),
-                    "verdicts": verdicts,
-                    "unanimous": unanimous,
-                    "human_acceptance_required": True,
-                    "terminal_outcome": outcome,
-                    "terminal_detail": detail,
-                },
+                meta=consensus_item_meta(
+                    review,
+                    {
+                        "reviewers": list(review.reviewers),
+                        "verdicts": verdicts,
+                        "unanimous": unanimous,
+                        "human_acceptance_required": True,
+                        "terminal_outcome": outcome,
+                        "terminal_detail": detail,
+                    },
+                ),
             )
             review.terminal_outcome = outcome
             review.terminal_detail = detail
