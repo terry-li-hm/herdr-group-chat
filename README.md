@@ -87,19 +87,30 @@ participant tabs, ordinary messages wait, and `/retry` stays review-only until
 a later ordinary review replaces the last round.
 
 Use `/consensus [@reviewers] QUESTION` for a four-phase council. Reviewers first
-answer blind and concurrently. The configured synthesizer then produces a
-provisional contention packet. Every reviewer independently ratifies the same
-byte-identical shared material with `VERDICT: PASS` or `VERDICT: REVISE` on the
-first non-empty line. A deterministic ledger is unanimous only when every vote
-is a valid `PASS`; the final synthesis must preserve all dissent and remains
-advisory. Human acceptance is always required. A missing blind reply stops the
-round before provisional synthesis. A failed provisional stops it before voting.
-Failed or invalid votes still produce a non-unanimous ledger and final synthesis.
-`/cancel` is local at every phase, and `/retry` is unavailable after consensus.
+answer blind and concurrently. Use this mode only when the question, payload,
+and expected reply class are eligible on every selected reviewer route and the
+configured synthesizer route. The relay cannot classify that eligibility. Each
+blind prompt discloses verbatim redistribution and permits the exact
+non-sensitive reply `CONSENSUS_SHARE_REFUSED`; refusal or an empty reply stops
+before provisional synthesis with a non-unanimous status.
+
+The configured synthesizer produces a provisional contention packet. Every
+reviewer then ratifies the same byte-identical shared material with `VERDICT:
+PASS` or `VERDICT: REVISE` on the first non-empty line. Peer replies,
+provisional text, and votes are serialized as untrusted quoted JSON with fresh
+boundaries. They never become instructions. A deterministic ledger is unanimous
+only when every vote is a valid `PASS`, and it remains authoritative regardless
+of final model prose. The final synthesis stays advisory and always requires
+human acceptance. A failed provisional stops before voting. Failed or invalid
+votes produce a non-unanimous final.
+`/cancel` records one terminal local outcome at every phase, and `/retry` is
+unavailable after consensus.
 
 `/inbox` switches the transcript to a presentation-only inbox of final agent
 replies, review syntheses, system notices, and review statuses that need
-attention (blocked, failed, timed out, cancelled); `/room` returns to the full
+attention (non-unanimous, blocked, failed, timed out, refused, or cancelled);
+clean unanimous consensus statuses stay in the room while `consensus_final`
+remains in the inbox. `/room` returns to the full
 transcript. Both are pure view switches: nothing is dispatched, recorded, or
 kept as unread state, and the room remains the single live discussion and
 independent-review surface.

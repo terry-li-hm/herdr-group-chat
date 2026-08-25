@@ -9,6 +9,11 @@ All notable changes to this project are documented here.
   a deterministic unanimity ledger, and one advisory final synthesis. The mode
   reuses the review controller, cancellation boundary, participant checks,
   timeouts, and append-only transcript; it does not support partial retry.
+- Harden consensus sharing and termination: blind prompts disclose verbatim
+  redistribution and allow refusal, shared model text is isolated as token-bound
+  JSON data, every started round records one structured terminal outcome,
+  controller notices reflect phase failures, direct retries fail closed, and the
+  inbox hides clean unanimous status entries.
 - Bind transcript and launcher transactions to validated directory descriptors,
   deduplicate profile receipts atomically, and discard late review replies after
   local cancellation while committing one completion or cancellation outcome.
