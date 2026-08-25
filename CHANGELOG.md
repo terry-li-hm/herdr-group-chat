@@ -4,22 +4,24 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+
+## [0.6.0] - 2026-08-26
+
+- Add `/consensus [@reviewers] QUESTION`: concurrent blind reviews, one
+  provisional contention synthesis, concurrent strict PASS/REVISE ratification,
+  a deterministic unanimous anchored PASS/REVISE ledger, and one advisory final
+  synthesis. The mode reuses the review controller and append-only transcript.
+- Make consensus sharing fail closed: blind prompts disclose verbatim
+  redistribution and permit refusal, invalid or empty replies stop the round,
+  and cancellation or phase failure records one terminal local outcome.
+- Scope every consensus transcript item to its ordered council for later agent
+  delivery, isolate shared model text as token-bound JSON data, and keep direct
+  retries unavailable after consensus. Final output remains advisory and requires
+  human acceptance; the relay does not provide native Herdr group chat,
+  automated judgment, or release authority.
 - Accept unambiguous same-line prose after an anchored consensus verdict token
   while rejecting token lookalikes, punctuation-led suffixes, connector-led
   alternatives, and embedded verdict tokens.
-- Add `/consensus [@reviewers] QUESTION`: concurrent blind reviews, one
-  provisional contention synthesis, concurrent strict PASS/REVISE ratification,
-  a deterministic unanimity ledger, and one advisory final synthesis. The mode
-  reuses the review controller, cancellation boundary, participant checks,
-  timeouts, and append-only transcript; it does not support partial retry.
-- Harden consensus sharing and termination: blind prompts disclose verbatim
-  redistribution and allow refusal, shared model text is isolated as token-bound
-  JSON data, every started round records one structured terminal outcome,
-  controller notices reflect phase failures, direct retries fail closed, and the
-  inbox hides clean unanimous status entries.
-- Scope every consensus transcript item to its ordered council for later agent
-  delivery, commit vote artifacts and verdict bookkeeping atomically with
-  cancellation, and reduce first-line refusal replies to the safe sentinel.
 - Bind transcript and launcher transactions to validated directory descriptors,
   deduplicate profile receipts atomically, and discard late review replies after
   local cancellation while committing one completion or cancellation outcome.
@@ -28,6 +30,13 @@ All notable changes to this project are documented here.
   role intentionally closes the plugin-recorded tab before starting its replacement
   (visible as `replace @role` in setup output), with symmetric regression coverage
   for `sol-fable-grok` → classic and classic → `sol-fable-grok` switches.
+- Evaluate and retain the standalone, peer-neutral `prototypes/pi-tui` frontend
+  as a frozen reference. It uses `@earendil-works/pi-tui` directly, keeps the
+  Python relay as sole transcript writer, preserves exact argv dispatch and local
+  room/inbox views, and has fixtures and tests. The live A/B retains curses
+  because it is more compact and exposes participant, delivery, and actionable
+  failure state. The prototype remains unwired from the plugin, has no standing
+  Node CI commitment, and is not an active experimental adoption.
 
 ## [0.5.2] - 2026-08-24
 

@@ -28,7 +28,7 @@ executable uses `uv` to run Python 3.13.
 Install the pinned release from GitHub:
 
 ```bash
-herdr plugin install terry-li-hm/herdr-group-chat --ref v0.5.2
+herdr plugin install terry-li-hm/herdr-group-chat --ref v0.6.0
 herdr plugin action invoke new --plugin terry.herdr-group-chat
 ```
 
@@ -155,8 +155,9 @@ Uninstall a GitHub-managed copy with:
 herdr plugin uninstall terry.herdr-group-chat
 ```
 
-The manifest declares two actions and two managed pane entrypoints: **New group
-chat**, **Open group chat**, the visible setup pane, and the room pane. Herdr
+The manifest declares four actions and two managed pane entrypoints: **New group
+chat**, **New Sol + Fable chat**, **New classic four-agent chat**, and **Open
+group chat**, plus the visible setup pane and the room pane. Herdr
 supplies `HERDR_PLUGIN_STATE_DIR`, so transcripts and the plugin's exact
 workspace and pane identifiers stay in a server-instance-scoped, locked state file. This
 keeps multiple Herdr sessions separate and serializes overlapping launcher and
@@ -164,11 +165,13 @@ setup processes. The launcher never claims a workspace merely because its label
 is `agents · group-chat` or `group-chat`. Standalone CLI use retains
 `~/.local/state/herdr-group-chat/`; an explicit `--state-dir` always wins.
 
-Invoking **New group chat** opens a visible setup tab, reuses any live named
-peers, creates tabs for missing Pi, Claude, Codex, and Grok participants, and
-then becomes a fresh `group-chat` room. It replaces the previous plugin-owned
-room pane but retains that room's transcript. **Open group chat** focuses the
-exact recorded plugin pane or reopens the last room without starting models.
+Invoking **New group chat** opens a visible setup tab for the verified atomic
+Sol/Fable/Grok default, reuses any live named peers, creates tabs for missing
+participants, and then becomes a fresh `group-chat` room. **New classic
+four-agent chat** separately opens the Pi/Claude/Codex/Grok composition. New
+launches replace the previous plugin-owned room pane but retain that room's
+transcript. **Open group chat** focuses the exact recorded plugin pane or
+reopens the last room without starting models.
 The transcript and input remain visible while you switch among participant
 tabs. Failed cleanup remains recorded for a later retry instead of silently
 losing ownership of the old pane. Participant setup failures are recorded as
@@ -176,10 +179,10 @@ system entries in the new room's transcript, so a missing peer is explained
 rather than silently offline.
 
 Compact mode keeps the room alone in the initiating workspace and places the
-four native agent tabs in a secondary `agents · group-chat` workspace, with
-each participant tab labeled `<kind> · group-chat` (for example `pi ·
-group-chat`). These labels are display-only; routing and reuse still key on the
-exact recorded workspace and pane identifiers. Enter `/agents` to
+participant tabs in a secondary `agents · group-chat` workspace, with each
+participant tab labeled `<role> · group-chat` (for example `pi · group-chat` or
+`sol · group-chat`). These labels are display-only; routing and reuse still key
+on the exact recorded workspace and pane identifiers. Enter `/agents` to
 reveal that workspace or `/show pi`, `/show claude`, `/show codex`, or `/show
 grok` to focus one native agent directly. Use Herdr's workspace switcher or
 **Open group chat** to return.
@@ -261,7 +264,7 @@ blocks the launch, and already-verified peers stay available for a retry.
 The stored room keeps its own profile: previously opened `sol-fable` or
 classic rooms reopen unchanged, Sol synthesizes, and `New Sol + Fable chat`
 remains available. `New classic four-agent chat` (or a direct
-`./new-room --launch` without a profile) still opens the unchanged default
+`./new-room --launch` without a profile) still opens the unchanged classic
 Pi/Claude/Codex/Grok four-agent room.
 
 ## Limitations
