@@ -114,6 +114,29 @@ Every consensus transcript item carries the ordered council scope. The human
 room transcript remains complete, while later ordinary prompts omit those
 items for agents outside the selected reviewers and synthesizer.
 
+`/council status` derives a read-only durable council ledger from the
+transcript without appending or dispatching anything. It shows the latest
+round prefix, its phase (prepared, blind, provisional, voting, ratified, or
+closed), the ordered reviewers with each vote verdict or `MISSING`, the
+unanimity decision, any terminal outcome, and that human acceptance is
+required. Contradictory records — a tampered objective, scope, shared-material
+hash, or authoritative status — fail loudly instead of rendering a status.
+
+`/council export PATH` writes that same canonical ledger as compact
+sorted-key JSON plus a trailing newline to a new file only. It refuses to
+overwrite anything (including symlinks), requires an existing directory
+parent, creates the leaf exclusively with mode 0600, fsyncs the complete
+write, and removes a partial leaf on any write error. With no council round
+recorded, status prints a clear message while export fails.
+
+The same surfaces work offline from the standalone CLI, before any agent or
+profile setup:
+
+```bash
+./herdr-group-chat --council-status
+./herdr-group-chat --council-export council-ledger.json
+```
+
 `/inbox` switches the transcript to a presentation-only inbox of final agent
 replies, review syntheses, system notices, and review statuses that need
 attention (non-unanimous, blocked, failed, timed out, refused, or cancelled);
@@ -141,6 +164,8 @@ The standalone CLI remains available:
 ./herdr-group-chat --once "/review @claude,@codex Compare these options."
 ./herdr-group-chat --once "/anneal @pi,@claude Harden this plan."
 ./herdr-group-chat --once "/consensus @claude,@codex Decide whether this is ready."
+./herdr-group-chat --council-status
+./herdr-group-chat --council-export council-ledger.json
 ./herdr-group-chat --synthesizer codex --agent-timeout grok=900000
 ./herdr-group-chat --show
 ```

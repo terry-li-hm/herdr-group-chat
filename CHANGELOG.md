@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Persist a durable council manifest and shared-material hash: every consensus
+  round records its schema-1 manifest on the review question and stamps one
+  authoritative `shared_material_sha256` over the exact question, ordered blind
+  responses, and provisional synthesis on every vote, authoritative status, and
+  post-provisional terminal status. A vote cannot be appended without its hash.
+- Add `/council status` and `/council export PATH` plus `--council-status` and
+  `--council-export PATH`: a read-only derived durable council ledger validating
+  manifest shape, objective hash, council scope, per-reviewer response and vote
+  uniqueness, verdict validity, one consistent shared-material hash, and
+  authoritative status verdicts and unanimity against the vote artifacts.
+  Contradictions raise a relay error; unrelated records are ignored. Export
+  writes canonical compact sorted-key JSON plus a newline to a new 0600 leaf
+  only, refusing overwrites and symlinks, fsyncing the complete write, and
+  removing a partial leaf on write failure.
+
 ## [0.6.0] - 2026-08-26
 
 - Add `/consensus [@reviewers] QUESTION`: concurrent blind reviews, one

@@ -45,6 +45,9 @@ parse_route = namespace["parse_route"]
 parse_anneal = namespace["parse_anneal"]
 parse_consensus_verdict = namespace.get("parse_consensus_verdict")
 consensus_untrusted_json = namespace.get("consensus_untrusted_json")
+derive_council_ledger = namespace.get("derive_council_ledger")
+council_status_message = namespace.get("council_status_message")
+export_council_ledger = namespace.get("export_council_ledger")
 council_canonical_json = namespace.get("council_canonical_json")
 council_sha256_text = namespace.get("council_sha256_text")
 council_manifest = namespace.get("council_manifest")
@@ -2924,9 +2927,7 @@ def test_council_manifest_exact_shape_and_hashes() -> None:
 
 
 def test_council_shared_payload_requires_all_responses_and_synthesis() -> None:
-    complete = make_council_round(
-        responses={"claude": "r1", "codex": "r2"}, synthesis="s"
-    )
+    complete = make_council_round(responses={"claude": "r1", "codex": "r2"}, synthesis="s")
     assert council_shared_payload(complete)["blind_responses"] == [
         {"reviewer": "claude", "response": "r1"},
         {"reviewer": "codex", "response": "r2"},
@@ -3010,6 +3011,325 @@ def test_council_incomplete_directly_driven_vote_record_raises_and_appends_no_vo
     assert not any(item["kind"] == "consensus_vote" for item in messages)
     assert "claude" not in review.votes
     assert "claude" not in review.verdicts
+
+
+def run_council(chat: GroupChat) -> object:
+    return chat.consensus("@claude,@codex Choose safely")
+
+
+def council_prefix(
+    records: list[dict[str, object]], kinds: tuple[str, ...]
+) -> list[dict[str, object]]:
+    """Return records up to and including the first item matching any of kinds."""
+    for index, item in enumerate(records):
+        if item["kind"] in kinds:
+            return records[: index + 1]
+    raise AssertionError(f"no {kinds} item in records")
+
+
+def test_council_status_derives_completed_unanimous_ledger(tmp_path: Path) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "ledger-done-room")
+    review = run_council(chat)
+
+    ledger = derive_council_ledger(transcript.read())
+    messages = transcript.read()
+    provisional = next(item for item in messages if item["kind"] == "consensus_provisional")
+    votes = {item["sender"]: item for item in messages if item["kind"] == "consensus_vote"}
+    shared = votes["claude"]["meta"]["shared_material_sha256"]
+    assert ledger == {
+        "schema_version": 1,
+        "round_id": review.id,
+        "objective": "Choose safely",
+        "objective_sha256": council_sha256_text("Choose safely"),
+        "reviewers": ["claude", "codex"],
+        "synthesizer": "pi",
+        "participants": ["claude", "codex", "pi"],
+        "phase": "closed",
+        "responses": [
+            {
+                "reviewer": name,
+                "seq": next(
+                    item["seq"]
+                    for item in messages
+                    if item["kind"] == "review_response" and item["sender"] == name
+                ),
+                "sha256": council_sha256_text(f"blind from {name}-peer"),
+            }
+            for name in ("claude", "codex")
+        ],
+        "provisional": {
+            "seq": provisional["seq"],
+            "sha256": council_sha256_text(provisional["body"]),
+        },
+        "votes": [
+            {
+                "reviewer": name,
+                "seq": votes[name]["seq"],
+                "sha256": council_sha256_text(votes[name]["body"]),
+                "verdict": "PASS",
+                "shared_material_sha256": shared,
+            }
+            for name in ("claude", "codex")
+        ],
+        "verdicts": {"claude": "PASS", "codex": "PASS"},
+        "unanimous": True,
+        "terminal_outcome": "completed",
+        "terminal_detail": "completed",
+        "human_acceptance_required": True,
+        "unresolved_recovery": False,
+    }
+    status = council_status_message(messages)
+    assert "phase closed" in status
+    assert "terminal: completed" in status
+    assert "human acceptance required" in status
+    assert review.id[:8] in status
+
+
+def test_council_status_derives_invalid_vote_as_nonunanimous(tmp_path: Path) -> None:
+    client = ConsensusClient(
+        votes={"claude-peer": "I pass this.", "codex-peer": "VERDICT: PASS\nFine."}
+    )
+    chat, transcript = make_consensus_chat(tmp_path, client, "ledger-invalid-room")
+    run_council(chat)
+
+    ledger = derive_council_ledger(transcript.read())
+    assert ledger["verdicts"] == {"claude": "INVALID", "codex": "PASS"}
+    assert ledger["unanimous"] is False
+    assert ledger["phase"] == "closed"
+    assert "claude INVALID" in council_status_message(transcript.read())
+
+
+@pytest.mark.parametrize("outcome", ["refused", "failed"])
+def test_council_status_refusal_terminal_is_closed_without_recovery(
+    tmp_path: Path, outcome: str
+) -> None:
+    reply = "CONSENSUS_SHARE_REFUSED" if outcome == "refused" else ""
+    client = ConsensusClient(blind_replies={"codex-peer": reply})
+    chat, transcript = make_consensus_chat(tmp_path, client, f"ledger-{outcome}-room")
+    run_council(chat)
+
+    ledger = derive_council_ledger(transcript.read())
+    assert ledger["phase"] == "closed"
+    assert ledger["terminal_outcome"] == outcome
+    assert ledger["unresolved_recovery"] is False
+    assert ledger["verdicts"] == {"claude": "MISSING", "codex": "MISSING"}
+    assert ledger["votes"] == []
+
+
+@pytest.mark.parametrize(
+    ("stop_kind", "phase", "unresolved"),
+    [
+        ("review_question", "prepared", False),
+        ("review_response", "blind", True),
+        ("consensus_provisional_after_responses", "provisional", False),
+        ("consensus_provisional", "voting", True),
+        ("consensus_status", "ratified", False),
+        ("consensus_final", "closed", False),
+    ],
+)
+def test_council_status_partial_phases(
+    tmp_path: Path, stop_kind: str, phase: str, unresolved: bool
+) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), f"partial-{phase}-room")
+    run_council(chat)
+    records = transcript.read()
+    if stop_kind == "consensus_provisional_after_responses":
+        # Drop the provisional and everything after: all responses, no synthesis.
+        last_response = max(item["seq"] for item in records if item["kind"] == "review_response")
+        prefix = [item for item in records if item["seq"] <= last_response]
+    else:
+        prefix = council_prefix(records, (stop_kind,))
+
+    ledger = derive_council_ledger(prefix)
+    assert ledger["phase"] == phase
+    assert ledger["unresolved_recovery"] is unresolved
+    if phase != "closed":
+        assert ledger["terminal_outcome"] is None
+    assert "unresolved recovery" in council_status_message(prefix) if unresolved else True
+
+
+def test_council_status_selects_latest_and_named_round(tmp_path: Path) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "multi-council-room")
+    first = chat.consensus("@claude,@codex First question")
+    second = chat.consensus("@claude,@codex Second question")
+
+    assert derive_council_ledger(transcript.read())["round_id"] == second.id
+    named = derive_council_ledger(transcript.read(), round_id=first.id)
+    assert named["round_id"] == first.id
+    assert named["objective"] == "First question"
+    with pytest.raises(ChatError):
+        derive_council_ledger(transcript.read(), round_id="nonexistent-round-id")
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["objective", "scope", "shared_hash", "status_verdicts", "status_unanimous"],
+)
+def test_council_status_rejects_tampering(tmp_path: Path, tamper: str) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), f"tamper-{tamper}-room")
+    run_council(chat)
+    records = transcript.read()
+    if tamper == "objective":
+        next(item for item in records if item["kind"] == "review_question")["body"] += " tampered"
+    elif tamper == "scope":
+        vote = next(item for item in records if item["kind"] == "consensus_vote")
+        vote["meta"]["council_participants"] = ["claude", "codex", "pi", "grok"]
+    elif tamper == "shared_hash":
+        vote = next(item for item in records if item["kind"] == "consensus_vote")
+        vote["meta"]["shared_material_sha256"] = "0" * 64
+    elif tamper == "status_verdicts":
+        status = next(item for item in records if item["kind"] == "consensus_status")
+        status["meta"]["verdicts"] = {"claude": "PASS", "codex": "MISSING"}
+    else:
+        status = next(item for item in records if item["kind"] == "consensus_status")
+        status["meta"]["unanimous"] = False
+
+    with pytest.raises(ChatError):
+        derive_council_ledger(records)
+
+
+@pytest.mark.parametrize(
+    "kind", ["review_response", "consensus_vote", "consensus_provisional", "consensus_final"]
+)
+def test_council_status_rejects_duplicate_artifacts(tmp_path: Path, kind: str) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), f"dup-{kind}-room")
+    run_council(chat)
+    records = transcript.read()
+    target = next(item for item in records if item["kind"] == kind)
+    if kind == "review_response":
+        target = next(
+            item for item in records if item["kind"] == kind and item["sender"] == "claude"
+        )
+    duplicated = [*records, dict(target)]
+
+    with pytest.raises(ChatError):
+        derive_council_ledger(duplicated)
+
+
+def test_council_status_command_is_read_only(tmp_path: Path) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "readonly-status-room")
+    run_council(chat)
+    before = transcript.read()
+
+    status = handle_local_command("/council status", chat)
+
+    assert status is not None and "phase closed" in status
+    assert transcript.read() == before
+    no_round = handle_local_command("/council status", chat)
+    assert no_round
+    assert handle_local_command("/council", chat) == "Usage: /council status · /council export PATH"
+    assert handle_local_command("/council export", chat) == "Usage: /council export PATH"
+
+
+def test_council_status_message_without_any_round(tmp_path: Path) -> None:
+    transcript = Transcript(tmp_path, "empty-council-room")
+    assert council_status_message(transcript.read()) == (
+        "No council rounds are recorded in this room."
+    )
+
+
+def test_council_export_is_canonical_repeatable_and_private(tmp_path: Path) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "export-room")
+    run_council(chat)
+    records = transcript.read()
+
+    first = export_council_ledger(records, tmp_path / "council-a.json")
+    second = export_council_ledger(records, tmp_path / "council-b.json")
+
+    payload = first.read_bytes()
+    assert payload == second.read_bytes()
+    assert payload.endswith(b"\n")
+    assert payload[:-1].decode("utf-8") == council_canonical_json(derive_council_ledger(records))
+    assert first.stat().st_mode & 0o777 == 0o600
+    assert second.stat().st_mode & 0o777 == 0o600
+
+    exported = handle_local_command(f"/council export {tmp_path / 'council-c.json'}", chat)
+    assert exported is not None and str(tmp_path / "council-c.json") in exported
+    with pytest.raises(ChatError):
+        export_council_ledger(records, tmp_path / "council-a.json")
+
+
+def test_council_export_refuses_existing_symlink_and_bad_parents(tmp_path: Path) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "export-refuse-room")
+    run_council(chat)
+    records = transcript.read()
+    existing = tmp_path / "exists.json"
+    existing.write_text("keep")
+    symlink = tmp_path / "link.json"
+    symlink.symlink_to(existing)
+    leaf_file = tmp_path / "plain-file"
+    leaf_file.write_text("not a directory")
+
+    for target in (
+        existing,
+        symlink,
+        leaf_file / "council.json",
+        tmp_path / "missing-parent" / "council.json",
+    ):
+        with pytest.raises(ChatError):
+            export_council_ledger(records, target)
+    assert existing.read_text() == "keep"
+    assert list(tmp_path.glob("missing-parent")) == []
+
+
+def test_council_export_removes_partial_file_on_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "export-partial-room")
+    run_council(chat)
+    records = transcript.read()
+    target = tmp_path / "partial.json"
+    real_write = os.write
+
+    def failing_write(descriptor: int, data: object) -> int:
+        real_write(descriptor, data)
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(os, "write", failing_write)
+    with pytest.raises(ChatError):
+        export_council_ledger(records, target)
+    monkeypatch.undo()
+
+    assert not target.exists()
+
+
+def test_council_cli_status_and_export_offline(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "cli-council-room")
+    run_council(chat)
+    state_dir = transcript.state_dir
+    room = "cli-council-room"
+
+    code = main(["--council-status", "--state-dir", str(state_dir), "--room", room])
+    assert code == 0
+    assert "phase closed" in capsys.readouterr().out
+
+    target = tmp_path / "cli-council.json"
+    code = main(["--council-export", str(target), "--state-dir", str(state_dir), "--room", room])
+    assert code == 0
+    assert str(target) in capsys.readouterr().out.strip()
+    assert json.loads(target.read_text()) == derive_council_ledger(transcript.read())
+
+    empty = Transcript(tmp_path, "cli-empty-room")
+    code = main(
+        ["--council-status", "--state-dir", str(empty.state_dir), "--room", "cli-empty-room"]
+    )
+    assert code == 0
+    assert "No council rounds" in capsys.readouterr().out
+
+    code = main(
+        [
+            "--council-export",
+            str(tmp_path / "nope.json"),
+            "--state-dir",
+            str(empty.state_dir),
+            "--room",
+            "cli-empty-room",
+        ]
+    )
+    assert code == 2
+    assert not (tmp_path / "nope.json").exists()
 
 
 def test_council_manifest_persisted_on_review_question_and_no_hash_before_provisional(

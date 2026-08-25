@@ -1065,8 +1065,7 @@ def council_shared_payload(review: ReviewRound) -> dict[str, Any]:
     return {
         "question": review.question,
         "blind_responses": [
-            {"reviewer": name, "response": review.responses[name]}
-            for name in review.reviewers
+            {"reviewer": name, "response": review.responses[name]} for name in review.reviewers
         ],
         "provisional_synthesis": review.synthesis,
         "reviewers": list(review.reviewers),
@@ -1077,6 +1076,341 @@ def council_shared_payload(review: ReviewRound) -> dict[str, Any]:
 def council_shared_material_sha256(review: ReviewRound) -> str:
     """SHA-256 over the canonical shared material, stable across random prompt tokens."""
     return council_sha256_text(council_canonical_json(council_shared_payload(review)))
+
+
+COUNCIL_QUESTION_KIND = "review_question"
+COUNCIL_RESPONSE_KIND = "review_response"
+COUNCIL_PROVISIONAL_KIND = "consensus_provisional"
+COUNCIL_VOTE_KIND = "consensus_vote"
+COUNCIL_STATUS_KIND = "consensus_status"
+COUNCIL_FINAL_KIND = "consensus_final"
+COUNCIL_VALID_VOTE_VERDICTS = frozenset({"PASS", "REVISE", "INVALID"})
+
+
+def _council_questions(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in records
+        if item.get("kind") == COUNCIL_QUESTION_KIND
+        and isinstance(item.get("meta"), dict)
+        and isinstance(item["meta"].get("council_manifest"), dict)
+    ]
+
+
+def _council_scoped(
+    records: Sequence[Mapping[str, Any]],
+    round_id: str,
+    kind: str,
+    participants: Sequence[str],
+) -> list[dict[str, Any]]:
+    items = [
+        item for item in records if item.get("kind") == kind and item.get("round_id") == round_id
+    ]
+    for item in items:
+        meta = item.get("meta")
+        scope = meta.get("council_participants") if isinstance(meta, dict) else None
+        if scope != list(participants):
+            raise ChatError(
+                f"{kind} seq {item.get('seq')} has council scope {scope!r}, "
+                f"expected {list(participants)!r}"
+            )
+    return items
+
+
+def _council_body_sha256(item: Mapping[str, Any], kind: str) -> str:
+    body = item.get("body")
+    if not isinstance(body, str):
+        raise ChatError(f"{kind} seq {item.get('seq')} lacks a text body")
+    return council_sha256_text(body)
+
+
+def derive_council_ledger(
+    records: Sequence[Mapping[str, Any]], round_id: str | None = None
+) -> dict[str, Any]:
+    """Derive the authoritative durable council ledger from transcript records.
+
+    Pure and read-only: contradictions raise ChatError, unrelated records are
+    ignored, and nothing is appended or resumed.
+    """
+    questions = _council_questions(records)
+    if round_id is None:
+        if not questions:
+            raise ChatError("no council rounds are recorded")
+        question = questions[-1]
+    else:
+        matching = [item for item in questions if item.get("round_id") == round_id]
+        if not matching:
+            raise ChatError(f"no council round with id {round_id}")
+        question = matching[-1]
+    selected_id = question.get("round_id")
+    if not isinstance(selected_id, str) or not selected_id:
+        raise ChatError("council question lacks a round id")
+    if sum(1 for item in questions if item.get("round_id") == selected_id) > 1:
+        raise ChatError(f"multiple council questions for round {selected_id}")
+
+    manifest = dict(question["meta"]["council_manifest"])
+    expected_keys = {
+        "schema_version",
+        "round_id",
+        "objective_sha256",
+        "reviewers",
+        "synthesizer",
+        "participants",
+        "human_acceptance_required",
+    }
+    if set(manifest) != expected_keys:
+        raise ChatError(f"council manifest for round {selected_id} has unexpected shape")
+    if manifest["schema_version"] != COUNCIL_SCHEMA_VERSION:
+        raise ChatError(
+            f"council manifest schema {manifest['schema_version']!r} is not "
+            f"{COUNCIL_SCHEMA_VERSION}"
+        )
+    if manifest["round_id"] != selected_id:
+        raise ChatError("council manifest round id does not match its transcript round")
+    reviewers = manifest["reviewers"]
+    synthesizer = manifest["synthesizer"]
+    if (
+        not isinstance(reviewers, list)
+        or not reviewers
+        or not all(isinstance(name, str) and name for name in reviewers)
+        or not isinstance(synthesizer, str)
+        or not synthesizer
+    ):
+        raise ChatError("council manifest reviewers or synthesizer are malformed")
+    participants = manifest["participants"]
+    if participants != list(dict.fromkeys((*reviewers, synthesizer))):
+        raise ChatError("council manifest participants do not match reviewers and synthesizer")
+    if manifest["human_acceptance_required"] is not True:
+        raise ChatError("council manifest lacks the human acceptance gate")
+    objective = question.get("body")
+    if not isinstance(objective, str):
+        raise ChatError("council question lacks an objective body")
+    if manifest["objective_sha256"] != council_sha256_text(objective):
+        raise ChatError("council manifest objective hash does not match the question body")
+    if question["meta"].get("council_participants") != participants:
+        raise ChatError("council question carries an inconsistent council scope")
+
+    responses = _council_scoped(records, selected_id, COUNCIL_RESPONSE_KIND, participants)
+    provisionals = _council_scoped(records, selected_id, COUNCIL_PROVISIONAL_KIND, participants)
+    votes = _council_scoped(records, selected_id, COUNCIL_VOTE_KIND, participants)
+    statuses = _council_scoped(records, selected_id, COUNCIL_STATUS_KIND, participants)
+    finals = _council_scoped(records, selected_id, COUNCIL_FINAL_KIND, participants)
+    if len(provisionals) > 1:
+        raise ChatError(f"multiple provisional syntheses for round {selected_id}")
+    if len(finals) > 1:
+        raise ChatError(f"multiple final syntheses for round {selected_id}")
+
+    response_by_reviewer: dict[str, dict[str, Any]] = {}
+    for item in responses:
+        reviewer = item.get("sender")
+        if reviewer in response_by_reviewer:
+            raise ChatError(f"duplicate council response from {reviewer!r}")
+        response_by_reviewer[reviewer] = item
+    vote_by_reviewer: dict[str, dict[str, Any]] = {}
+    shared_hashes: set[str] = set()
+    for item in votes:
+        reviewer = item.get("sender")
+        if reviewer in vote_by_reviewer:
+            raise ChatError(f"duplicate council vote from {reviewer!r}")
+        meta = item.get("meta", {})
+        verdict = meta.get("verdict")
+        if verdict not in COUNCIL_VALID_VOTE_VERDICTS:
+            raise ChatError(f"council vote from {reviewer!r} has invalid verdict {verdict!r}")
+        shared_hash = meta.get("shared_material_sha256")
+        if (
+            not isinstance(shared_hash, str)
+            or len(shared_hash) != 64
+            or not all(char in "0123456789abcdef" for char in shared_hash)
+        ):
+            raise ChatError(f"council vote from {reviewer!r} lacks a valid shared-material hash")
+        shared_hashes.add(shared_hash)
+        vote_by_reviewer[reviewer] = item
+    if len(shared_hashes) > 1:
+        raise ChatError("council votes disagree about the shared-material hash")
+
+    terminal_status = next(
+        (item for item in statuses if item.get("meta", {}).get("terminal_outcome") is not None),
+        None,
+    )
+    authoritative_status = next(
+        (item for item in statuses if "verdicts" in item.get("meta", {})), None
+    )
+    final = finals[-1] if finals else None
+
+    computed_verdicts = {
+        reviewer: vote_by_reviewer[reviewer]["meta"]["verdict"]
+        if reviewer in vote_by_reviewer
+        else "MISSING"
+        for reviewer in reviewers
+    }
+    computed_unanimous = all(verdict == "PASS" for verdict in computed_verdicts.values())
+    if authoritative_status is not None:
+        status_meta = authoritative_status["meta"]
+        if status_meta.get("verdicts") != computed_verdicts:
+            raise ChatError("council status verdicts contradict the recorded vote artifacts")
+        if status_meta.get("unanimous") is not computed_unanimous:
+            raise ChatError("council status unanimity contradicts the recorded vote artifacts")
+        if status_meta.get("human_acceptance_required") is not True:
+            raise ChatError("council status lacks the human acceptance gate")
+        if status_meta.get("reviewers") != reviewers:
+            raise ChatError("council status reviewers contradict the manifest")
+        status_hash = status_meta.get("shared_material_sha256")
+        if shared_hashes and status_hash is not None and status_hash not in shared_hashes:
+            raise ChatError("council status shared-material hash contradicts the votes")
+    if terminal_status is not None:
+        terminal_meta = terminal_status["meta"]
+        terminal_hash = terminal_meta.get("shared_material_sha256")
+        if shared_hashes and terminal_hash is not None and terminal_hash not in shared_hashes:
+            raise ChatError("terminal council status hash contradicts the votes")
+
+    all_responses_present = all(reviewer in response_by_reviewer for reviewer in reviewers)
+    all_votes_present = all(reviewer in vote_by_reviewer for reviewer in reviewers)
+    if terminal_status is not None or final is not None:
+        phase = "closed"
+    elif authoritative_status is not None:
+        phase = "ratified"
+    elif provisionals:
+        phase = "voting"
+    elif all_responses_present:
+        phase = "provisional"
+    elif responses:
+        phase = "blind"
+    else:
+        phase = "prepared"
+    unresolved_recovery = phase == "blind" or (phase == "voting" and not all_votes_present)
+
+    if terminal_status is not None:
+        terminal_outcome = terminal_status["meta"]["terminal_outcome"]
+        terminal_detail = terminal_status["meta"].get("terminal_detail")
+    elif final is not None:
+        terminal_outcome = final.get("meta", {}).get("terminal_outcome", "completed")
+        terminal_detail = terminal_outcome
+    else:
+        terminal_outcome = None
+        terminal_detail = None
+
+    provisional = provisionals[-1] if provisionals else None
+    return {
+        "schema_version": COUNCIL_SCHEMA_VERSION,
+        "round_id": selected_id,
+        "objective": objective,
+        "objective_sha256": manifest["objective_sha256"],
+        "reviewers": list(reviewers),
+        "synthesizer": synthesizer,
+        "participants": list(participants),
+        "phase": phase,
+        "responses": [
+            {
+                "reviewer": reviewer,
+                "seq": response_by_reviewer[reviewer]["seq"],
+                "sha256": _council_body_sha256(response_by_reviewer[reviewer], "response"),
+            }
+            for reviewer in reviewers
+            if reviewer in response_by_reviewer
+        ],
+        "provisional": (
+            {
+                "seq": provisional["seq"],
+                "sha256": _council_body_sha256(provisional, "provisional"),
+            }
+            if provisional is not None
+            else None
+        ),
+        "votes": [
+            {
+                "reviewer": reviewer,
+                "seq": vote_by_reviewer[reviewer]["seq"],
+                "sha256": _council_body_sha256(vote_by_reviewer[reviewer], "vote"),
+                "verdict": vote_by_reviewer[reviewer]["meta"]["verdict"],
+                "shared_material_sha256": vote_by_reviewer[reviewer]["meta"][
+                    "shared_material_sha256"
+                ],
+            }
+            for reviewer in reviewers
+            if reviewer in vote_by_reviewer
+        ],
+        "verdicts": computed_verdicts,
+        "unanimous": computed_unanimous,
+        "terminal_outcome": terminal_outcome,
+        "terminal_detail": terminal_detail,
+        "human_acceptance_required": True,
+        "unresolved_recovery": unresolved_recovery,
+    }
+
+
+def council_status_message(records: Sequence[Mapping[str, Any]]) -> str:
+    """Compact, read-only status line for the latest durable council round."""
+    if not _council_questions(records):
+        return "No council rounds are recorded in this room."
+    ledger = derive_council_ledger(records)
+    votes = ", ".join(
+        f"{reviewer} {ledger['verdicts'][reviewer]}" for reviewer in ledger["reviewers"]
+    )
+    line = (
+        f"council {ledger['round_id'][:8]} phase {ledger['phase']} · "
+        f"reviewers {' '.join('@' + name for name in ledger['reviewers'])} · "
+        f"votes: {votes} · unanimous: {str(ledger['unanimous']).lower()}"
+    )
+    if ledger["terminal_outcome"] is not None:
+        line += f" · terminal: {ledger['terminal_outcome']}"
+    if ledger["unresolved_recovery"]:
+        line += " · unresolved recovery"
+    line += " · human acceptance required"
+    return line
+
+
+def export_council_ledger(
+    records: Sequence[Mapping[str, Any]], target: str | os.PathLike[str]
+) -> Path:
+    """Write the canonical durable council ledger JSON to a new leaf only.
+
+    Refuses to overwrite anything (including symlinks), requires an existing
+    directory parent, creates the leaf exclusively with mode 0600, and removes
+    the partial leaf on any write error.
+    """
+    ledger = derive_council_ledger(records)
+    payload = (council_canonical_json(ledger) + "\n").encode("utf-8")
+    path = Path(target).expanduser()
+    parent = path.parent if str(path.parent) else Path(".")
+    try:
+        os.lstat(path)
+    except OSError:
+        pass
+    else:
+        raise ChatError(f"refusing to overwrite existing path: {path}")
+    try:
+        parent_stat = os.stat(parent)
+    except OSError as error:
+        raise ChatError(f"invalid export parent directory {parent}: {error}") from error
+    if not stat.S_ISDIR(parent_stat.st_mode):
+        raise ChatError(f"export parent is not a directory: {parent}")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise ChatError(f"cannot create export file {path}: {error}") from error
+    try:
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("incomplete council ledger write")
+            view = view[written:]
+        os.fsync(descriptor)
+    except OSError as error:
+        with suppress(OSError):
+            os.unlink(path)
+        raise ChatError(f"failed to write council ledger {path}: {error}") from error
+    finally:
+        os.close(descriptor)
+    return path
 
 
 def build_consensus_blind_prompt(
@@ -2840,10 +3174,25 @@ def handle_local_command(
             return "The agents workspace is unavailable; use /show <agent>."
         chat.client.focus_workspace(chat.agents_workspace_id)
         return "Focused the agents workspace."
+    if stripped == "/council" or stripped.startswith("/council "):
+        command = stripped.removeprefix("/council").strip()
+        if command == "status":
+            return council_status_message(chat.transcript.read())
+        if command == "export" or command.startswith("export "):
+            target = command.removeprefix("export").strip()
+            if not target:
+                return "Usage: /council export PATH"
+            try:
+                exported = export_council_ledger(chat.transcript.read(), target)
+            except ChatError as error:
+                return f"Council export failed: {error}"
+            return f"Exported council ledger to {exported}"
+        return "Usage: /council status · /council export PATH"
     if stripped == "/help":
         return (
             "Commands: /review [@agents] QUESTION · /anneal @author,@critic QUESTION · "
             "/consensus [@agents] QUESTION · /retry <agent|synthesis> · /cancel · /agents · "
+            "/council status · /council export PATH · "
             "/show <agent> · /inbox · /room · PgUp/PgDn · @ opens a mention picker "
             "(Tab completes, Esc closes)"
         )
@@ -3087,6 +3436,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agents-workspace", default=os.environ.get(AGENTS_WORKSPACE_ENV))
     parser.add_argument("--once", metavar="MESSAGE")
     parser.add_argument("--show", action="store_true")
+    parser.add_argument(
+        "--council-status", action="store_true", help="print durable council status and exit"
+    )
+    parser.add_argument(
+        "--council-export",
+        metavar="PATH",
+        help="export the durable council ledger JSON to a new file and exit",
+    )
     return parser
 
 
@@ -3095,6 +3452,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     transcript: Transcript | None = None
     try:
         transcript = Transcript(resolve_state_dir(args.state_dir), args.room)
+        if args.council_status:
+            print(council_status_message(transcript.read()))
+            return 0
+        if args.council_export is not None:
+            try:
+                exported = export_council_ledger(transcript.read(), args.council_export)
+            except ChatError as error:
+                print(f"council export failed: {error}", file=sys.stderr)
+                return 2
+            print(exported)
+            return 0
         if args.show:
             for line in message_lines(transcript.read(), 100):
                 print(line)
