@@ -3209,6 +3209,46 @@ def test_cancel_stops_consensus_at_each_phase(
     assert controller.status() == "Consensus cancelled locally; participants may continue working."
 
 
+def test_immediate_consensus_cancel_before_activation_records_only_terminal_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ConsensusClient()
+    chat, transcript = make_consensus_chat(tmp_path, client, "pre-activation-cancel-room")
+    controller = ReviewController(chat)
+    original_activate = chat._activate_review
+    activation_started = threading.Event()
+    release_activation = threading.Event()
+
+    def gated_activate(review: object) -> bool:
+        activation_started.set()
+        assert release_activation.wait(timeout=2)
+        return original_activate(review)
+
+    monkeypatch.setattr(chat, "_activate_review", gated_activate)
+    controller.start_consensus("@claude,@codex Choose safely")
+    assert activation_started.wait(timeout=2)
+
+    assert controller.cancel() == "Local cancellation requested; participants may continue working."
+    release_activation.set()
+    assert controller.wait(timeout=2)
+
+    messages = transcript.read()
+    terminal = [
+        item
+        for item in messages
+        if item["kind"] == "consensus_status" and item.get("meta", {}).get("terminal_outcome")
+    ]
+    assert len(terminal) == 1
+    assert terminal[0]["meta"]["terminal_outcome"] == "cancelled"
+    assert not {
+        "review_question",
+        "consensus_provisional",
+        "consensus_vote",
+        "consensus_final",
+    }.intersection(item["kind"] for item in messages)
+    assert client.calls == []
+
+
 def test_consensus_controller_wiring_retry_picker_help_and_rendering(tmp_path: Path) -> None:
     client = ConsensusClient()
     chat, transcript = make_consensus_chat(tmp_path, client, "wiring-room")

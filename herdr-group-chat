@@ -2177,7 +2177,7 @@ class GroupChat:
             for name, state in review.states.items():
                 if state == "queued":
                     review.states[name] = "cancelled"
-            if review.mode == "consensus" and review.question_seq is not None:
+            if review.mode == "consensus":
                 self._commit_consensus_terminal(
                     review,
                     "cancelled",
