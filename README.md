@@ -52,6 +52,7 @@ participants review. Pi synthesizes by default.
 /review Review this email draft and recommend the final wording.
 /review @claude,@codex Challenge this architecture.
 /anneal @pi,@claude Harden this plan.
+/consensus @claude,@codex Decide whether this is ready.
 /cancel
 /retry claude
 /retry synthesis
@@ -67,14 +68,14 @@ successful retry triggers a fresh synthesis. Use Page Up and Page
 Down to scroll the transcript while work continues.
 
 Typing `@` at the start of the recipient token — at the beginning of the line
-or right after `/review `, `/anneal `, or a comma still inside that token —
+or right after `/review `, `/anneal `, `/consensus `, or a comma still inside that token —
 opens a compact mention picker on the status row (`Mentions: [@sol] @fable`).
 Typed characters filter it case-insensitively, Up/Down cycle the selection,
 Tab completes the selected handle without adding a trailing space (a comma
 continues the recipient list, a space begins the message), Esc closes it with
 the text unchanged, and Enter still submits exactly what is shown. Already
 selected handles are excluded from later suggestions; `@all` is offered for
-plain messages and `/review` but never for `/anneal`.
+plain messages, `/review`, and `/consensus` but never for `/anneal`.
 
 Use `/anneal @author,@critic QUESTION` for a two-participant adversarial pass
 over one question. Both answer blind and concurrently (a missing blind reply
@@ -84,6 +85,17 @@ Anneal runs through the same single review controller as `/review`, so
 `/cancel` stops local orchestration at every phase without interrupting the
 participant tabs, ordinary messages wait, and `/retry` stays review-only until
 a later ordinary review replaces the last round.
+
+Use `/consensus [@reviewers] QUESTION` for a four-phase council. Reviewers first
+answer blind and concurrently. The configured synthesizer then produces a
+provisional contention packet. Every reviewer independently ratifies the same
+byte-identical shared material with `VERDICT: PASS` or `VERDICT: REVISE` on the
+first non-empty line. A deterministic ledger is unanimous only when every vote
+is a valid `PASS`; the final synthesis must preserve all dissent and remains
+advisory. Human acceptance is always required. A missing blind reply stops the
+round before provisional synthesis. A failed provisional stops it before voting.
+Failed or invalid votes still produce a non-unanimous ledger and final synthesis.
+`/cancel` is local at every phase, and `/retry` is unavailable after consensus.
 
 `/inbox` switches the transcript to a presentation-only inbox of final agent
 replies, review syntheses, system notices, and review statuses that need
@@ -109,6 +121,7 @@ The standalone CLI remains available:
 ./herdr-group-chat --once "@all Compare these options."
 ./herdr-group-chat --once "/review @claude,@codex Compare these options."
 ./herdr-group-chat --once "/anneal @pi,@claude Harden this plan."
+./herdr-group-chat --once "/consensus @claude,@codex Decide whether this is ready."
 ./herdr-group-chat --synthesizer codex --agent-timeout grok=900000
 ./herdr-group-chat --show
 ```
@@ -234,7 +247,8 @@ Pi/Claude/Codex/Grok four-agent room.
 
 ## Limitations
 
-- Ordinary group turns remain serial; only `/review` first passes are parallel.
+- Ordinary group turns remain serial. `/review`, `/anneal`, and `/consensus`
+  blind passes are parallel; consensus votes are also parallel.
 - Every addressed agent must already be live in Herdr.
 - New-room setup starts the four classic participants, the two bounded
   `sol-fable` profile participants, or the three `sol-fable-grok` profile

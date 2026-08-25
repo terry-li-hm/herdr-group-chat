@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Add `/consensus [@reviewers] QUESTION`: concurrent blind reviews, one
+  provisional contention synthesis, concurrent strict PASS/REVISE ratification,
+  a deterministic unanimity ledger, and one advisory final synthesis. The mode
+  reuses the review controller, cancellation boundary, participant checks,
+  timeouts, and append-only transcript; it does not support partial retry.
 - Bind transcript and launcher transactions to validated directory descriptors,
   deduplicate profile receipts atomically, and discard late review replies after
   local cancellation while committing one completion or cancellation outcome.

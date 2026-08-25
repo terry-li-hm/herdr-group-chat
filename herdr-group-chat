@@ -112,6 +112,8 @@ class ReviewRound:
     states: dict[str, str]
     responses: dict[str, str] = field(default_factory=dict)
     synthesis: str | None = None
+    votes: dict[str, str] = field(default_factory=dict)
+    verdicts: dict[str, str] = field(default_factory=dict)
     mode: str = "review"
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
@@ -974,6 +976,91 @@ def build_synthesis_prompt(
     )
 
 
+def parse_consensus_verdict(reply: str) -> str | None:
+    """Return a valid consensus verdict from the first non-empty reply line."""
+    first = next((line for line in reply.splitlines() if line.strip()), "")
+    if first == "VERDICT: PASS":
+        return "PASS"
+    if first == "VERDICT: REVISE":
+        return "REVISE"
+    return None
+
+
+def reviewer_ordered_material(review: ReviewRound) -> str:
+    return "\n\n".join(
+        f"[@{name}] {review.responses.get(name, '(no usable response)')}"
+        for name in review.reviewers
+    )
+
+
+def build_consensus_provisional_prompt(review: ReviewRound, token: str, host: str = "Herdr") -> str:
+    return (
+        f"You are @{review.synthesizer}, the configured synthesizer in a local {host} group "
+        "chat. Keep your normal capabilities, instructions, and data-handling rules. Produce "
+        "a Provisional contention packet and candidate resolution. Identify agreements and "
+        "every unresolved contention. This is provisional and must not claim consensus. Do not "
+        f"use {host} to relay this reply.\n\nOriginal question:\n\n{review.question}\n\n"
+        f"Reviewer-ordered blind replies:\n\n{reviewer_ordered_material(review)}\n\n"
+        "Return one direct provisional packet. Wrap only that message between these marker "
+        f"lines:\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}\n"
+    )
+
+
+def consensus_shared_material(review: ReviewRound) -> str:
+    return (
+        f"Original question:\n\n{review.question}\n\nReviewer-ordered blind replies:\n\n"
+        f"{reviewer_ordered_material(review)}\n\nProvisional contention packet and candidate "
+        f"resolution:\n\n{review.synthesis or ''}"
+    )
+
+
+def build_consensus_vote_prompt(
+    review: ReviewRound,
+    reviewer: str,
+    shared_material: str,
+    token: str,
+    host: str = "Herdr",
+) -> str:
+    return (
+        f"You are @{reviewer}, ratifying a provisional council result in a local {host} group "
+        "chat. Keep your normal capabilities, instructions, and data-handling rules. Assess the "
+        "shared material below. The first non-empty line of your reply must be exactly VERDICT: "
+        "PASS or VERDICT: REVISE. Explain your decision after that line. Do not use "
+        f"{host} to relay this reply.\n\nCONSENSUS_SHARED_MATERIAL_BEGIN\n"
+        f"{shared_material}\nCONSENSUS_SHARED_MATERIAL_END\n\n"
+        "Wrap the complete reply between these marker lines:\n"
+        f"HGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}\n"
+    )
+
+
+def build_consensus_final_prompt(
+    review: ReviewRound,
+    shared_material: str,
+    verdicts: Mapping[str, str],
+    unanimous: bool,
+    token: str,
+    host: str = "Herdr",
+) -> str:
+    vote_text = "\n\n".join(
+        f"[@{name}] verdict={verdicts[name]}\n{review.votes.get(name, '(no usable vote)')}"
+        for name in review.reviewers
+    )
+    ledger = json.dumps(dict(verdicts), ensure_ascii=False, separators=(",", ":"))
+    return (
+        f"You are @{review.synthesizer}, producing the final advisory synthesis for a local "
+        f"{host} consensus council. Keep your normal capabilities, instructions, and "
+        "data-handling rules. The Deterministic unanimity ledger below is authoritative. You "
+        "must not upgrade dissent or invalid or missing votes to consensus. Preserve every "
+        "material dissent. The final is advisory and cannot grant action, send, landing, "
+        "release, or publication authority. Do not use "
+        f"{host} to relay this reply.\n\n{shared_material}\n\nRatification votes:\n\n"
+        f"{vote_text}\n\nDeterministic unanimity ledger:\nverdicts: {ledger}\n"
+        f"unanimous: {str(unanimous).lower()}\nhuman_acceptance_required: true\n\n"
+        "Return one direct final synthesis. Wrap only that message between these marker lines:\n"
+        f"HGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}\n"
+    )
+
+
 def failure_state(error: ChatError) -> str:
     detail = str(error).lower()
     return "timed_out" if "timeout" in detail or "timed out" in detail else "failed"
@@ -1151,12 +1238,24 @@ class GroupChat:
             mode="anneal",
         )
 
+    def plan_consensus(self, text: str) -> ReviewRound:
+        review = self.plan_review(text)
+        review.mode = "consensus"
+        return review
+
     def anneal(
         self,
         text: str,
         on_state: Callable[[str, str], None] | None = None,
     ) -> ReviewRound:
         return self.execute_review(self.plan_anneal(text), on_state)
+
+    def consensus(
+        self,
+        text: str,
+        on_state: Callable[[str, str], None] | None = None,
+    ) -> ReviewRound:
+        return self.execute_review(self.plan_consensus(text), on_state)
 
     def prepare_review(self, text: str) -> ReviewRound:
         review = self.plan_review(text)
@@ -1189,6 +1288,7 @@ class GroupChat:
         reply: str | None = None,
         store_response: bool = False,
         store_synthesis: bool = False,
+        message_meta: Mapping[str, Any] | None = None,
     ) -> bool:
         """Commit one phase outcome atomically with its cancellation decision."""
         with review.lock:
@@ -1206,6 +1306,7 @@ class GroupChat:
                         kind=kind,
                         round_id=review.id,
                         provisional=provisional,
+                        meta=message_meta,
                     )
                 if store_response and reply is not None:
                     review.responses[agent] = reply
@@ -1273,6 +1374,21 @@ class GroupChat:
                     "system",
                     ("human",),
                     f"@{agent} is blocked and needs attention in {self.host_label}.",
+                    "review_status",
+                    False,
+                ),
+            )
+            return
+        if review.mode == "consensus" and not reply.strip():
+            self._commit_review_phase(
+                review,
+                agent,
+                "failed",
+                on_state,
+                message=(
+                    "system",
+                    ("human",),
+                    f"@{agent} consensus blind review failed: empty response",
                     "review_status",
                     False,
                 ),
@@ -1350,6 +1466,7 @@ class GroupChat:
         provisional: bool = False,
         begun: bool = False,
         store_synthesis: bool = False,
+        require_nonempty: bool = False,
     ) -> str | None:
         """Run one single-participant phase (synthesis, challenge, or final) to completion."""
         if not begun and not self._begin_review_call(review, agent, state, on_state):
@@ -1399,6 +1516,21 @@ class GroupChat:
                     "system",
                     ("human",),
                     f"{blocked_notice} and needs attention in {self.host_label}.",
+                    "review_status",
+                    False,
+                ),
+            )
+            return None
+        if require_nonempty and not reply.strip():
+            self._commit_review_phase(
+                review,
+                agent,
+                "failed",
+                on_state,
+                message=(
+                    "system",
+                    ("human",),
+                    f"{failure_prefix} failed: empty response",
                     "review_status",
                     False,
                 ),
@@ -1501,6 +1633,177 @@ class GroupChat:
             on_state,
         )
 
+    def _run_consensus_vote(
+        self,
+        review: ReviewRound,
+        agent: str,
+        prompt: str,
+        on_state: Callable[[str, str], None] | None,
+    ) -> tuple[str, str]:
+        if not self._begin_review_call(review, agent, "voting", on_state):
+            raise ChatError("review cancelled")
+        return self.client.turn(
+            self.agents[agent], prompt, self._timeout_for(agent), review.cancel_event
+        )
+
+    def _record_consensus_vote(
+        self,
+        review: ReviewRound,
+        agent: str,
+        future: Future[tuple[str, str]],
+        on_state: Callable[[str, str], None] | None,
+    ) -> None:
+        try:
+            status, reply = future.result()
+        except ChatError as error:
+            failure = failure_state(error)
+            self._commit_review_phase(
+                review,
+                agent,
+                failure,
+                on_state,
+                message=(
+                    "system",
+                    ("human",),
+                    f"@{agent} consensus vote {failure.replace('_', ' ')}: {error}",
+                    "review_status",
+                    False,
+                ),
+            )
+            return
+        except Exception as error:
+            self._commit_review_phase(
+                review,
+                agent,
+                "failed",
+                on_state,
+                message=(
+                    "system",
+                    ("human",),
+                    f"@{agent} consensus vote failed: unexpected {error!r}",
+                    "review_status",
+                    False,
+                ),
+            )
+            return
+        if status == "blocked":
+            self._commit_review_phase(
+                review,
+                agent,
+                "blocked",
+                on_state,
+                message=(
+                    "system",
+                    ("human",),
+                    f"@{agent} consensus vote is blocked and needs attention in {self.host_label}.",
+                    "review_status",
+                    False,
+                ),
+            )
+            return
+        parsed = parse_consensus_verdict(reply)
+        verdict = parsed or "INVALID"
+        committed = self._commit_review_phase(
+            review,
+            agent,
+            "done" if parsed else "invalid",
+            on_state,
+            message=(agent, ("human", "all"), reply, "consensus_vote", False),
+            message_meta={"verdict": verdict},
+        )
+        if committed:
+            with review.lock:
+                review.votes[agent] = reply
+                review.verdicts[agent] = verdict
+
+    def _record_consensus_ledger(
+        self, review: ReviewRound, body: str | None = None
+    ) -> tuple[dict[str, str], bool]:
+        verdicts = {name: review.verdicts.get(name, "MISSING") for name in review.reviewers}
+        unanimous = all(verdict == "PASS" for verdict in verdicts.values())
+        self.transcript.append(
+            "system",
+            ("human", "all"),
+            body
+            or (
+                "Consensus ratification complete. Human acceptance is required. "
+                f"Unanimous: {str(unanimous).lower()}."
+            ),
+            kind="consensus_status",
+            round_id=review.id,
+            meta={
+                "reviewers": list(review.reviewers),
+                "verdicts": verdicts,
+                "unanimous": unanimous,
+                "human_acceptance_required": True,
+            },
+        )
+        return verdicts, unanimous
+
+    def _consensus_continue(
+        self,
+        review: ReviewRound,
+        on_state: Callable[[str, str], None] | None,
+    ) -> None:
+        with review.lock:
+            if review.cancel_event.is_set():
+                return
+        provisional = self._execute_phase(
+            review,
+            review.synthesizer,
+            build_consensus_provisional_prompt(review, uuid.uuid4().hex, self.host_label),
+            "provisional",
+            on_state,
+            kind="consensus_provisional",
+            failure_prefix=f"@{review.synthesizer} provisional synthesis",
+            blocked_notice=f"@{review.synthesizer} provisional synthesis is blocked",
+            provisional=True,
+            store_synthesis=True,
+            require_nonempty=True,
+        )
+        if provisional is None:
+            return
+        shared_material = consensus_shared_material(review)
+        prompts = {
+            agent: build_consensus_vote_prompt(
+                review, agent, shared_material, uuid.uuid4().hex, self.host_label
+            )
+            for agent in review.reviewers
+        }
+        with ThreadPoolExecutor(
+            max_workers=len(review.reviewers), thread_name_prefix="hgchat-consensus-vote"
+        ) as pool:
+            futures = {
+                pool.submit(
+                    self._run_consensus_vote, review, agent, prompts[agent], on_state
+                ): agent
+                for agent in review.reviewers
+            }
+            for future in as_completed(futures):
+                self._record_consensus_vote(review, futures[future], future, on_state)
+        with review.lock:
+            if review.cancel_event.is_set():
+                return
+            verdicts, unanimous = self._record_consensus_ledger(review)
+        self._execute_phase(
+            review,
+            review.synthesizer,
+            build_consensus_final_prompt(
+                review,
+                shared_material,
+                verdicts,
+                unanimous,
+                uuid.uuid4().hex,
+                self.host_label,
+            ),
+            "finalizing",
+            on_state,
+            kind="consensus_final",
+            failure_prefix=f"@{review.synthesizer} final consensus synthesis",
+            blocked_notice=f"@{review.synthesizer} final consensus synthesis is blocked",
+            require_nonempty=True,
+        )
+
     @contextmanager
     def _review_attempt(self, review: ReviewRound) -> Iterator[None]:
         if not review.attempt_lock.acquire(blocking=False):
@@ -1536,10 +1839,11 @@ class GroupChat:
                 self._record_reviewer_result(review, futures[future], future, on_state)
         with review.lock:
             if review.cancel_event.is_set():
+                label = review.mode.title()
                 self.transcript.append(
                     "system",
                     ("human",),
-                    "Review cancelled locally; participants may continue working; "
+                    f"{label} cancelled locally; participants may continue working; "
                     "synthesis was not started.",
                     kind="review_status",
                     round_id=review.id,
@@ -1554,6 +1858,16 @@ class GroupChat:
                     round_id=review.id,
                 )
                 return review
+            if review.mode == "consensus" and len(review.responses) < len(review.reviewers):
+                self._record_consensus_ledger(
+                    review,
+                    "Consensus stopped: every blind reply is required; provisional synthesis "
+                    "was skipped. Human acceptance is required.",
+                )
+                return review
+        if review.mode == "consensus":
+            self._consensus_continue(review, on_state)
+            return review
         self._synthesize_review(review, on_state)
         if review.mode == "anneal":
             self._anneal_continue(review, on_state)
@@ -1797,6 +2111,15 @@ def message_lines(messages: Sequence[dict[str, Any]], width: int) -> list[str]:
             label += " [challenge]"
         elif item.get("kind") == "anneal_final":
             label += " [final]"
+        elif item.get("kind") == "consensus_provisional":
+            label += " [provisional]"
+        elif item.get("kind") == "consensus_vote":
+            verdict = item.get("meta", {}).get("verdict", "INVALID")
+            label += f" [vote {verdict}]"
+        elif item.get("kind") == "consensus_final":
+            label += " [final]"
+        elif item.get("kind") == "consensus_status":
+            label += " [consensus status]"
         prefix = f"{label}> "
         paragraphs = str(item["body"]).splitlines() or [""]
         first = True
@@ -1828,7 +2151,9 @@ def inbox_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         kind = item.get("kind")
         if sender == "human":
             continue
-        if kind == "anneal_final" or (kind == "review_synthesis" and not item.get("provisional")):
+        if kind in {"anneal_final", "consensus_final", "consensus_status"} or (
+            kind == "review_synthesis" and not item.get("provisional")
+        ):
             kept.append(item)
         elif kind == "review_status":
             body = str(item.get("body", "")).lower()
@@ -1877,7 +2202,7 @@ def visible_wrapped_lines(
     return lines[start:end], max_offset
 
 
-MENTION_COMMAND_PREFIXES = ("/review ", "/anneal ")
+MENTION_COMMAND_PREFIXES = ("/review ", "/anneal ", "/consensus ")
 MENTION_NAME_RE = re.compile(r"@([a-z0-9_-]+)", re.IGNORECASE)
 
 
@@ -1979,18 +2304,18 @@ class ReviewController:
 
     def _run(self, action: Callable[[], ReviewRound], review: ReviewRound) -> None:
         failure_notice: str | None = None
+        label = review.mode.title()
         try:
             action()
         except ChatError as error:
-            failure_notice = f"Review failed: {error}"
+            failure_notice = f"{label} failed: {error}"
         except Exception as error:
-            failure_notice = f"Review failed unexpectedly: {error}"
+            failure_notice = f"{label} failed unexpectedly: {error}"
         with self._lock:
             # Completion and local cancellation serialize on this same lock.
             # The active worker remains installed until this exact thread exits.
             if self._active is not review:
                 return
-            label = "Anneal" if review.mode == "anneal" else "Review"
             if review.cancel_event.is_set():
                 notice = f"{label} cancelled locally; participants may continue working."
             elif failure_notice is not None:
@@ -2033,6 +2358,15 @@ class ReviewController:
         author, critic = review.reviewers
         return f"Anneal started: @{author} authors, @{critic} critiques."
 
+    def start_consensus(self, text: str) -> str:
+        with self._lock:
+            if self._active is not None:
+                raise ChatError("a review is already running")
+            review = self.chat.plan_consensus(text)
+            self._launch(lambda: self.chat.execute_review(review, self._on_state), review)
+        reviewers = ", @".join(review.reviewers)
+        return f"Consensus started with @{reviewers}; @{review.synthesizer} synthesizes."
+
     def retry(self, target: str) -> str:
         name = target.removeprefix("@").strip().lower()
         with self._lock:
@@ -2041,8 +2375,8 @@ class ReviewController:
             if self._last is None:
                 raise ChatError("there is no review to retry")
             review = self._last
-            if review.mode == "anneal":
-                raise ChatError("/retry is review-only; the last round was an anneal")
+            if review.mode != "review":
+                raise ChatError(f"/retry is review-only; the last round was a {review.mode}")
             with review.lock:
                 if review.question_seq is None:
                     raise ChatError("the last review never started and cannot be retried")
@@ -2083,7 +2417,7 @@ class ReviewController:
             # blocks starts, retries, and ordinary dispatch while cancellation
             # is still propagating, and prevents event replacement by a retry.
             self._cancel_pending = True
-            label = "Anneal" if review.mode == "anneal" else "Review"
+            label = review.mode.title()
             self._notice = f"{label} cancelled locally; participants may continue working."
         return "Local cancellation requested; participants may continue working."
 
@@ -2096,14 +2430,14 @@ class ReviewController:
             if self._active is None:
                 if self._cancel_pending and self._thread is not None and self._thread.is_alive():
                     order = tuple(dict.fromkeys((*self._last.reviewers, self._last.synthesizer)))
-                    prefix = "Anneal" if self._last.mode == "anneal" else "Review"
+                    prefix = self._last.mode.title()
                     labels = [f"@{name} {self._states.get(name, 'queued')}" for name in order]
                     return f"{prefix}: " + " · ".join(labels)
                 return self._notice
             review = self._active
             order = tuple(dict.fromkeys((*review.reviewers, review.synthesizer)))
             labels = [f"@{name} {self._states.get(name, 'queued')}" for name in order]
-            prefix = "Anneal" if review.mode == "anneal" else "Review"
+            prefix = review.mode.title()
         return f"{prefix}: " + " · ".join(labels)
 
     def clear_notice(self) -> None:
@@ -2149,8 +2483,9 @@ def handle_local_command(
     if stripped == "/help":
         return (
             "Commands: /review [@agents] QUESTION · /anneal @author,@critic QUESTION · "
-            "/retry <agent|synthesis> · /cancel · /agents · /show <agent> · /inbox · /room · "
-            "PgUp/PgDn · @ opens a mention picker (Tab completes, Esc closes)"
+            "/consensus [@agents] QUESTION · /retry <agent|synthesis> · /cancel · /agents · "
+            "/show <agent> · /inbox · /room · PgUp/PgDn · @ opens a mention picker "
+            "(Tab completes, Esc closes)"
         )
     if stripped == "/review" or stripped.startswith("/review "):
         if reviews is None:
@@ -2166,6 +2501,13 @@ def handle_local_command(
         if not question:
             return "Usage: /anneal @author,@critic QUESTION"
         return reviews.start_anneal(question)
+    if stripped == "/consensus" or stripped.startswith("/consensus "):
+        if reviews is None:
+            return "Review control is unavailable."
+        question = stripped.removeprefix("/consensus").strip()
+        if not question:
+            return "Usage: /consensus [@agent,@agent] QUESTION"
+        return reviews.start_consensus(question)
     if stripped == "/cancel":
         if reviews is None:
             return "Review control is unavailable."
@@ -2321,7 +2663,7 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
                 buffer = ""
                 continue
             if reviews.is_active():
-                status = "A review is running; use /cancel or wait before sending another message."
+                status = "A council round is running; use /cancel or wait before sending."
                 status_override = True
                 buffer = ""
                 continue
@@ -2439,6 +2781,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if not question:
                     raise ChatError("usage: --once '/anneal @author,@critic QUESTION'")
                 chat.anneal(question)
+                created = transcript.read()[before:]
+            elif args.once.strip() == "/consensus" or args.once.strip().startswith("/consensus "):
+                question = args.once.strip().removeprefix("/consensus").strip()
+                if not question:
+                    raise ChatError("usage: --once '/consensus [@agents] QUESTION'")
+                chat.consensus(question)
                 created = transcript.read()[before:]
             else:
                 created = chat.dispatch(args.once)

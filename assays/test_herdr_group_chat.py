@@ -42,6 +42,7 @@ message_lines = namespace["message_lines"]
 parse_agent_timeouts = namespace["parse_agent_timeouts"]
 parse_route = namespace["parse_route"]
 parse_anneal = namespace["parse_anneal"]
+parse_consensus_verdict = namespace.get("parse_consensus_verdict")
 main = namespace["main"]
 resolve_state_dir = namespace["resolve_state_dir"]
 participant_status = namespace["participant_status"]
@@ -2808,6 +2809,307 @@ def test_anneal_command_wiring_rejects_before_any_transcript_mutation(tmp_path: 
         with pytest.raises(ChatError):
             handle_local_command(bad, chat, controller)
     assert transcript.read() == []
+
+
+# --- bounded consensus council ------------------------------------------------------
+
+
+class ConsensusClient(FakeClient):
+    def __init__(self, votes: dict[str, str] | None = None) -> None:
+        super().__init__()
+        self.votes = votes or {
+            "claude-peer": "VERDICT: PASS\nNo remaining objection.",
+            "codex-peer": "VERDICT: PASS\nRatified.",
+        }
+        self.blind_barrier = threading.Barrier(2)
+        self.call_lock = threading.Lock()
+
+    def turn(
+        self,
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, str]:
+        with self.call_lock:
+            self.calls.append((target, prompt))
+            self.timeouts.append(timeout_ms)
+        if "Question for independent review" in prompt:
+            self.blind_barrier.wait(timeout=2)
+            return "done", f"blind from {target}"
+        if "CONSENSUS_SHARED_MATERIAL_BEGIN" in prompt:
+            return "done", self.votes[target]
+        if "Deterministic unanimity ledger" in prompt:
+            return "done", f"final from {target}"
+        if "Produce a Provisional contention packet" in prompt:
+            return "done", "agreements; unresolved contention; candidate resolution"
+        return super().turn(target, prompt, timeout_ms, cancel_event)
+
+
+def make_consensus_chat(
+    tmp_path: Path, client: FakeClient, room: str = "consensus-room"
+) -> tuple[GroupChat, Transcript]:
+    transcript = Transcript(tmp_path, room)
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        client,
+        synthesizer="pi",
+    )
+    return chat, transcript
+
+
+def test_consensus_verdict_parser_requires_exact_first_nonempty_line() -> None:
+    assert parse_consensus_verdict("VERDICT: PASS\nReason") == "PASS"
+    assert parse_consensus_verdict("\n  \nVERDICT: REVISE\nReason") == "REVISE"
+    for reply in (
+        "PASS",
+        "Verdict: PASS",
+        " VERDICT: PASS",
+        "VERDICT: PASS ",
+        "VERDICT: PASS extra",
+        "Reason\nVERDICT: PASS",
+        "",
+    ):
+        assert parse_consensus_verdict(reply) is None
+
+
+def test_consensus_runs_blind_barrier_shared_votes_and_unanimous_final(tmp_path: Path) -> None:
+    client = ConsensusClient()
+    chat, transcript = make_consensus_chat(tmp_path, client)
+
+    review = chat.consensus("@claude,@codex Choose safely")
+
+    calls = client.calls
+    blind = [call for call in calls if "Question for independent review" in call[1]]
+    assert {target for target, _ in blind} == {"claude-peer", "codex-peer"}
+    assert all("blind from" not in prompt for _, prompt in blind)
+    provisional = [call for call in calls if "Produce a Provisional contention packet" in call[1]]
+    assert [target for target, _ in provisional] == ["pi-peer"]
+    assert provisional[0][1].index("blind from claude-peer") < provisional[0][1].index(
+        "blind from codex-peer"
+    )
+    votes = [call for call in calls if "CONSENSUS_SHARED_MATERIAL_BEGIN" in call[1]]
+    assert {target for target, _ in votes} == {"claude-peer", "codex-peer"}
+
+    def shared(prompt: str) -> str:
+        return prompt.split("CONSENSUS_SHARED_MATERIAL_BEGIN\n", 1)[1].split(
+            "\nCONSENSUS_SHARED_MATERIAL_END", 1
+        )[0]
+
+    assert len({shared(prompt) for _, prompt in votes}) == 1
+    final = [call for call in calls if "Deterministic unanimity ledger" in call[1]]
+    assert [target for target, _ in final] == ["pi-peer"]
+    assert "unanimous: true" in final[0][1]
+    assert "cannot grant action, send, landing, release, or publication authority" in final[0][1]
+
+    messages = transcript.read()
+    assert [item["kind"] for item in messages].count("review_response") == 2
+    assert [item["kind"] for item in messages][-4:] == [
+        "consensus_vote",
+        "consensus_vote",
+        "consensus_status",
+        "consensus_final",
+    ]
+    provisional_item = next(item for item in messages if item["kind"] == "consensus_provisional")
+    assert provisional_item["provisional"] is True
+    status = next(item for item in messages if item["kind"] == "consensus_status")
+    assert status["meta"] == {
+        "reviewers": ["claude", "codex"],
+        "verdicts": {"claude": "PASS", "codex": "PASS"},
+        "unanimous": True,
+        "human_acceptance_required": True,
+    }
+    assert review.mode == "consensus"
+
+
+def test_consensus_dissent_and_invalid_vote_produce_nonunanimous_final(tmp_path: Path) -> None:
+    client = ConsensusClient(
+        {
+            "claude-peer": "VERDICT: REVISE\nMaterial concern.",
+            "codex-peer": "I pass this.",
+        }
+    )
+    chat, transcript = make_consensus_chat(tmp_path, client, "dissent-room")
+
+    chat.consensus("@claude,@codex Choose safely")
+
+    votes = [item for item in transcript.read() if item["kind"] == "consensus_vote"]
+    assert {item["sender"]: item["meta"]["verdict"] for item in votes} == {
+        "claude": "REVISE",
+        "codex": "INVALID",
+    }
+    status = next(item for item in transcript.read() if item["kind"] == "consensus_status")
+    assert status["meta"]["verdicts"] == {"claude": "REVISE", "codex": "INVALID"}
+    assert status["meta"]["unanimous"] is False
+    final_prompt = client.calls[-1][1]
+    assert "unanimous: false" in final_prompt
+    assert "must not upgrade dissent or invalid or missing votes to consensus" in final_prompt
+    assert any(item["kind"] == "consensus_final" for item in transcript.read())
+
+
+def test_consensus_missing_blind_stops_before_provisional(tmp_path: Path) -> None:
+    class MissingBlindClient(ConsensusClient):
+        def turn(
+            self, target: str, prompt: str, *args: object, **kwargs: object
+        ) -> tuple[str, str]:
+            if "Question for independent review" in prompt and target == "codex-peer":
+                with self.call_lock:
+                    self.calls.append((target, prompt))
+                self.blind_barrier.wait(timeout=2)
+                raise ChatError("blind failed")
+            return super().turn(target, prompt, *args, **kwargs)
+
+    client = MissingBlindClient()
+    chat, transcript = make_consensus_chat(tmp_path, client, "missing-blind-room")
+
+    chat.consensus("@claude,@codex Choose safely")
+
+    kinds = [item["kind"] for item in transcript.read()]
+    assert "consensus_provisional" not in kinds
+    assert "consensus_vote" not in kinds
+    assert "consensus_final" not in kinds
+    status = next(item for item in transcript.read() if item["kind"] == "consensus_status")
+    assert status["meta"]["unanimous"] is False
+    assert status["meta"]["verdicts"] == {"claude": "MISSING", "codex": "MISSING"}
+
+
+def test_consensus_failed_provisional_stops_before_vote(tmp_path: Path) -> None:
+    class FailedProvisionalClient(ConsensusClient):
+        def turn(
+            self, target: str, prompt: str, *args: object, **kwargs: object
+        ) -> tuple[str, str]:
+            if "Produce a Provisional contention packet" in prompt:
+                with self.call_lock:
+                    self.calls.append((target, prompt))
+                raise ChatError("provisional failed")
+            return super().turn(target, prompt, *args, **kwargs)
+
+    client = FailedProvisionalClient()
+    chat, transcript = make_consensus_chat(tmp_path, client, "failed-provisional-room")
+
+    chat.consensus("@claude,@codex Choose safely")
+
+    kinds = [item["kind"] for item in transcript.read()]
+    assert "consensus_vote" not in kinds
+    assert "consensus_status" not in kinds
+    assert "consensus_final" not in kinds
+
+
+def test_consensus_missing_vote_is_nonunanimous_and_still_finalizes(tmp_path: Path) -> None:
+    class MissingVoteClient(ConsensusClient):
+        def turn(
+            self, target: str, prompt: str, *args: object, **kwargs: object
+        ) -> tuple[str, str]:
+            if "CONSENSUS_SHARED_MATERIAL_BEGIN" in prompt and target == "codex-peer":
+                with self.call_lock:
+                    self.calls.append((target, prompt))
+                raise ChatError("vote timed out")
+            return super().turn(target, prompt, *args, **kwargs)
+
+    client = MissingVoteClient()
+    chat, transcript = make_consensus_chat(tmp_path, client, "missing-vote-room")
+
+    chat.consensus("@claude,@codex Choose safely")
+
+    status = next(item for item in transcript.read() if item["kind"] == "consensus_status")
+    assert status["meta"]["verdicts"] == {"claude": "PASS", "codex": "MISSING"}
+    assert status["meta"]["unanimous"] is False
+    assert any(item["kind"] == "consensus_final" for item in transcript.read())
+
+
+@pytest.mark.parametrize(
+    "phase,marker,forbidden",
+    [
+        ("blind", "Question for independent review", "consensus_provisional"),
+        ("provisional", "Produce a Provisional contention packet", "consensus_vote"),
+        ("voting", "CONSENSUS_SHARED_MATERIAL_BEGIN", "consensus_status"),
+        ("final", "Deterministic unanimity ledger", "consensus_final"),
+    ],
+)
+def test_cancel_stops_consensus_at_each_phase(
+    tmp_path: Path, phase: str, marker: str, forbidden: str
+) -> None:
+    class PhaseGateClient(ConsensusClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = threading.Event()
+
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            if marker in prompt:
+                with self.call_lock:
+                    self.calls.append((target, prompt))
+                self.started.set()
+                assert cancel_event is not None
+                assert cancel_event.wait(timeout=2)
+                raise ChatError("review cancelled")
+            return super().turn(target, prompt, timeout_ms, cancel_event)
+
+    client = PhaseGateClient()
+    chat, transcript = make_consensus_chat(tmp_path, client, f"cancel-consensus-{phase}")
+    controller = ReviewController(chat)
+    controller.start_consensus("@claude,@codex Choose safely")
+    assert client.started.wait(timeout=2)
+    assert controller.cancel() == "Local cancellation requested; participants may continue working."
+    assert controller.wait(timeout=2)
+
+    assert forbidden not in [item["kind"] for item in transcript.read()]
+    assert controller.status() == "Consensus cancelled locally; participants may continue working."
+
+
+def test_consensus_controller_wiring_retry_picker_help_and_rendering(tmp_path: Path) -> None:
+    client = ConsensusClient()
+    chat, transcript = make_consensus_chat(tmp_path, client, "wiring-room")
+    controller = ReviewController(chat)
+    assert handle_local_command("/consensus", chat, None) == "Review control is unavailable."
+    assert handle_local_command("/consensus", chat, controller) == (
+        "Usage: /consensus [@agent,@agent] QUESTION"
+    )
+    assert "/consensus [@agents] QUESTION" in handle_local_command("/help", chat, controller)
+    assert "all" in (mention_suggestions("/consensus @", tuple(chat.agents)) or ())
+    assert controller.start_consensus("@claude,@codex Choose safely").startswith(
+        "Consensus started"
+    )
+    assert controller.wait(timeout=2)
+    with pytest.raises(ChatError, match="review-only"):
+        controller.retry("claude")
+    lines = message_lines(transcript.read(), 100)
+    assert any("[provisional]>" in line for line in lines)
+    assert any("[vote PASS]>" in line for line in lines)
+    assert any("[final]>" in line for line in lines)
+    inbox = inbox_messages(transcript.read())
+    assert [item["kind"] for item in inbox] == ["consensus_status", "consensus_final"]
+
+
+def test_once_consensus_runs_synchronously_through_group_chat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorded: dict[str, str] = {}
+
+    def fake_consensus(self: GroupChat, text: str) -> object:
+        recorded["text"] = text
+        return None
+
+    monkeypatch.setattr(GroupChat, "consensus", fake_consensus)
+    monkeypatch.delenv("HERDR_GROUP_CHAT_SETUP_FAILURES", raising=False)
+    code = main(
+        [
+            "--room",
+            "once-consensus-room",
+            "--state-dir",
+            str(tmp_path),
+            "--once",
+            "/consensus @pi,@claude decide once",
+        ]
+    )
+    assert code == 0
+    assert recorded["text"] == "@pi,@claude decide once"
 
 
 # --- bounded sol-fable model profile -------------------------------------------------
