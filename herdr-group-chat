@@ -1133,20 +1133,30 @@ def derive_council_ledger(
     ignored, and nothing is appended or resumed.
     """
     questions = _council_questions(records)
-    if round_id is None:
-        if not questions:
-            raise ChatError("no council rounds are recorded")
-        question = questions[-1]
-    else:
-        matching = [item for item in questions if item.get("round_id") == round_id]
-        if not matching:
-            raise ChatError(f"no council round with id {round_id}")
-        question = matching[-1]
+    if not questions:
+        raise ChatError(
+            "no council rounds are recorded"
+            if round_id is None
+            else f"no council round with id {round_id}"
+        )
+    for item in questions:
+        seq = item.get("seq")
+        if not isinstance(seq, int) or isinstance(seq, bool):
+            raise ChatError("council question authority has a noninteger seq")
+    round_ids = [item.get("round_id") for item in questions]
+    if len(set(round_ids)) != len(round_ids):
+        raise ChatError("duplicate council question authority")
+    candidates = (
+        [item for item in questions if item.get("round_id") == round_id]
+        if round_id is not None
+        else questions
+    )
+    if not candidates:
+        raise ChatError(f"no council round with id {round_id}")
+    question = max(candidates, key=lambda item: item["seq"])
     selected_id = question.get("round_id")
     if not isinstance(selected_id, str) or not selected_id:
         raise ChatError("council question lacks a round id")
-    if sum(1 for item in questions if item.get("round_id") == selected_id) > 1:
-        raise ChatError(f"multiple council questions for round {selected_id}")
 
     manifest = dict(question["meta"]["council_manifest"])
     expected_keys = {
@@ -1203,13 +1213,21 @@ def derive_council_ledger(
     response_by_reviewer: dict[str, dict[str, Any]] = {}
     for item in responses:
         reviewer = item.get("sender")
+        if reviewer not in reviewers:
+            raise ChatError(f"council response from non-reviewer {reviewer!r}")
         if reviewer in response_by_reviewer:
             raise ChatError(f"duplicate council response from {reviewer!r}")
+        if item.get("meta", {}).get("share_refused") is True:
+            # A refusal sentinel is not a usable blind response; without a
+            # terminal status the round stays blind and unresolved.
+            continue
         response_by_reviewer[reviewer] = item
     vote_by_reviewer: dict[str, dict[str, Any]] = {}
     shared_hashes: set[str] = set()
     for item in votes:
         reviewer = item.get("sender")
+        if reviewer not in reviewers:
+            raise ChatError(f"council vote from non-reviewer {reviewer!r}")
         if reviewer in vote_by_reviewer:
             raise ChatError(f"duplicate council vote from {reviewer!r}")
         meta = item.get("meta", {})
@@ -1228,13 +1246,17 @@ def derive_council_ledger(
     if len(shared_hashes) > 1:
         raise ChatError("council votes disagree about the shared-material hash")
 
-    terminal_status = next(
-        (item for item in statuses if item.get("meta", {}).get("terminal_outcome") is not None),
-        None,
-    )
-    authoritative_status = next(
-        (item for item in statuses if "verdicts" in item.get("meta", {})), None
-    )
+    terminal_statuses = [
+        item for item in statuses if item.get("meta", {}).get("terminal_outcome") is not None
+    ]
+    verdict_statuses = [item for item in statuses if "verdicts" in item.get("meta", {})]
+    nonterminal_verdict_statuses = [
+        item for item in verdict_statuses if item not in terminal_statuses
+    ]
+    if len(terminal_statuses) > 1:
+        raise ChatError(f"multiple terminal council statuses for round {selected_id}")
+    if len(nonterminal_verdict_statuses) > 1:
+        raise ChatError(f"multiple verdict council statuses for round {selected_id}")
     final = finals[-1] if finals else None
 
     computed_verdicts = {
@@ -1244,30 +1266,74 @@ def derive_council_ledger(
         for reviewer in reviewers
     }
     computed_unanimous = all(verdict == "PASS" for verdict in computed_verdicts.values())
-    if authoritative_status is not None:
-        status_meta = authoritative_status["meta"]
-        if status_meta.get("verdicts") != computed_verdicts:
-            raise ChatError("council status verdicts contradict the recorded vote artifacts")
-        if status_meta.get("unanimous") is not computed_unanimous:
-            raise ChatError("council status unanimity contradicts the recorded vote artifacts")
-        if status_meta.get("human_acceptance_required") is not True:
-            raise ChatError("council status lacks the human acceptance gate")
-        if status_meta.get("reviewers") != reviewers:
-            raise ChatError("council status reviewers contradict the manifest")
-        status_hash = status_meta.get("shared_material_sha256")
-        if shared_hashes and status_hash is not None and status_hash not in shared_hashes:
-            raise ChatError("council status shared-material hash contradicts the votes")
-    if terminal_status is not None:
-        terminal_meta = terminal_status["meta"]
-        terminal_hash = terminal_meta.get("shared_material_sha256")
-        if shared_hashes and terminal_hash is not None and terminal_hash not in shared_hashes:
-            raise ChatError("terminal council status hash contradicts the votes")
+    vote_hash = next(iter(shared_hashes), None)
+
+    def _valid_hash(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value)
+        )
+
+    for item in statuses:
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        is_terminal = item in terminal_statuses
+        has_verdicts = "verdicts" in meta
+        if not is_terminal and not has_verdicts:
+            raise ChatError(
+                f"council status seq {item.get('seq')} carries neither verdicts "
+                "nor a terminal outcome"
+            )
+        if has_verdicts:
+            if meta.get("verdicts") != computed_verdicts:
+                raise ChatError("council status verdicts contradict the recorded vote artifacts")
+            if meta.get("unanimous") is not computed_unanimous:
+                raise ChatError("council status unanimity contradicts the recorded vote artifacts")
+            if meta.get("human_acceptance_required") is not True:
+                raise ChatError("council status lacks the human acceptance gate")
+            if meta.get("reviewers") != reviewers:
+                raise ChatError("council status reviewers contradict the manifest")
+            status_hash = meta.get("shared_material_sha256")
+            if vote_hash is not None:
+                if not _valid_hash(status_hash):
+                    raise ChatError(
+                        "council status lacks a valid shared-material hash after provisional"
+                    )
+                if status_hash != vote_hash:
+                    raise ChatError("council status shared-material hash contradicts the votes")
+        if is_terminal:
+            required = {
+                "reviewers",
+                "verdicts",
+                "unanimous",
+                "human_acceptance_required",
+                "terminal_outcome",
+                "terminal_detail",
+            }
+            missing = sorted(required - set(meta))
+            if missing:
+                raise ChatError(
+                    f"terminal council status seq {item.get('seq')} is missing {missing}"
+                )
+            if not isinstance(meta["terminal_outcome"], str) or not meta["terminal_outcome"]:
+                raise ChatError("terminal council status has a malformed terminal outcome")
+
+    if final is not None:
+        if final.get("sender") != synthesizer:
+            raise ChatError("council final synthesis is not from the manifest synthesizer")
+        final_meta = final.get("meta") if isinstance(final.get("meta"), dict) else {}
+        if final_meta.get("terminal_outcome") != "completed":
+            raise ChatError("council final lacks a completed terminal outcome")
+        if terminal_statuses:
+            raise ChatError("council final coexists with a terminal council status")
+
+    terminal_status = terminal_statuses[0] if terminal_statuses else None
 
     all_responses_present = all(reviewer in response_by_reviewer for reviewer in reviewers)
     all_votes_present = all(reviewer in vote_by_reviewer for reviewer in reviewers)
     if terminal_status is not None or final is not None:
         phase = "closed"
-    elif authoritative_status is not None:
+    elif verdict_statuses:
         phase = "ratified"
     elif provisionals:
         phase = "voting"
@@ -1283,8 +1349,8 @@ def derive_council_ledger(
         terminal_outcome = terminal_status["meta"]["terminal_outcome"]
         terminal_detail = terminal_status["meta"].get("terminal_detail")
     elif final is not None:
-        terminal_outcome = final.get("meta", {}).get("terminal_outcome", "completed")
-        terminal_detail = terminal_outcome
+        terminal_outcome = "completed"
+        terminal_detail = "completed"
     else:
         terminal_outcome = None
         terminal_detail = None
@@ -1371,20 +1437,29 @@ def export_council_ledger(
     ledger = derive_council_ledger(records)
     payload = (council_canonical_json(ledger) + "\n").encode("utf-8")
     path = Path(target).expanduser()
-    parent = path.parent if str(path.parent) else Path(".")
     try:
         os.lstat(path)
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as error:
+        raise ChatError(f"cannot inspect export path {path}: {error}") from error
     else:
         raise ChatError(f"refusing to overwrite existing path: {path}")
+    parent = path.parent if str(path.parent) else Path(".")
+    leaf = path.name
+    if not leaf or leaf in {".", ".."}:
+        raise ChatError(f"export path has no file name: {path}")
+    parent_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     try:
-        parent_stat = os.stat(parent)
+        parent_fd = os.open(parent, parent_flags)
     except OSError as error:
         raise ChatError(f"invalid export parent directory {parent}: {error}") from error
-    if not stat.S_ISDIR(parent_stat.st_mode):
-        raise ChatError(f"export parent is not a directory: {parent}")
-    flags = (
+    leaf_flags = (
         os.O_WRONLY
         | os.O_CREAT
         | os.O_EXCL
@@ -1392,24 +1467,29 @@ def export_council_ledger(
         | getattr(os, "O_CLOEXEC", 0)
     )
     try:
-        descriptor = os.open(path, flags, 0o600)
-    except OSError as error:
-        raise ChatError(f"cannot create export file {path}: {error}") from error
-    try:
-        os.fchmod(descriptor, 0o600)
-        view = memoryview(payload)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError("incomplete council ledger write")
-            view = view[written:]
-        os.fsync(descriptor)
-    except OSError as error:
-        with suppress(OSError):
-            os.unlink(path)
-        raise ChatError(f"failed to write council ledger {path}: {error}") from error
+        try:
+            descriptor = os.open(leaf, leaf_flags, 0o600, dir_fd=parent_fd)
+        except OSError as error:
+            raise ChatError(f"cannot create export file {path}: {error}") from error
+        try:
+            os.fchmod(descriptor, 0o600)
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("incomplete council ledger write")
+                view = view[written:]
+            os.fsync(descriptor)
+        except OSError as error:
+            with suppress(OSError):
+                os.unlink(leaf, dir_fd=parent_fd)
+            raise ChatError(f"failed to write council ledger {path}: {error}") from error
+        finally:
+            # A close failure must never replace the primary wrapped write error.
+            with suppress(OSError):
+                os.close(descriptor)
     finally:
-        os.close(descriptor)
+        os.close(parent_fd)
     return path
 
 

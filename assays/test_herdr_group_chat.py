@@ -3293,6 +3293,294 @@ def test_council_export_removes_partial_file_on_write_failure(
     assert not target.exists()
 
 
+def test_council_authority_gaps_fixed_after_adversarial_review(tmp_path: Path) -> None:
+    """DeepSeek findings: missing-hash and verdict-less terminal statuses."""
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "adv-term-room")
+    run_council(chat)
+    records = transcript.read()
+    vote_hash = next(
+        item["meta"]["shared_material_sha256"]
+        for item in records
+        if item["kind"] == "consensus_vote"
+    )
+    vote = next(item for item in records if item["kind"] == "consensus_vote")
+    scope = vote["meta"]["council_participants"]
+    reviewers = ["claude", "codex"]
+    verdicts = {"claude": "PASS", "codex": "PASS"}
+
+    def terminal_status(**meta: object) -> dict[str, object]:
+        base: dict[str, object] = {
+            "seq": 9000,
+            "at": "2026-08-26T00:00:00+00:00",
+            "sender": "system",
+            "recipients": ["human", "all"],
+            "body": "Consensus cancelled after vote.",
+            "kind": "consensus_status",
+            "round_id": vote["round_id"],
+            "meta": {
+                "council_participants": scope,
+                "reviewers": reviewers,
+                "verdicts": verdicts,
+                "unanimous": True,
+                "human_acceptance_required": True,
+                "terminal_outcome": "cancelled",
+                "terminal_detail": "cancelled after vote",
+                "shared_material_sha256": vote_hash,
+                **meta,
+            },
+        }
+        return base
+
+    # Drop the final so a terminal status may legitimately close the round.
+    without_final = [item for item in records if item["kind"] != "consensus_final"]
+    assert derive_council_ledger([*without_final, terminal_status()])["phase"] == "closed"
+
+    # Missing shared-material hash on a terminal status after provisional.
+    stripped = terminal_status()
+    del stripped["meta"]["shared_material_sha256"]
+    with pytest.raises(ChatError, match="shared-material hash"):
+        derive_council_ledger([*without_final, stripped])
+
+    # Terminal status without verdicts is rejected.
+    verdictless = terminal_status()
+    del verdictless["meta"]["verdicts"]
+    with pytest.raises(ChatError, match="missing"):
+        derive_council_ledger([*without_final, verdictless])
+
+    # Missing hash on the nonterminal verdict status after provisional.
+    stripped_status = next(
+        dict(item) for item in without_final if item["kind"] == "consensus_status"
+    )
+    stripped_status["meta"] = {
+        key: value
+        for key, value in stripped_status["meta"].items()
+        if key != "shared_material_sha256"
+    }
+    with pytest.raises(ChatError, match="shared-material hash"):
+        derive_council_ledger(
+            [item for item in without_final if item["kind"] != "consensus_status"]
+            + [stripped_status]
+        )
+
+
+def test_council_validates_every_terminal_status_field(tmp_path: Path) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "adv-fields-room")
+    run_council(chat)
+    records = transcript.read()
+    vote = next(item for item in records if item["kind"] == "consensus_vote")
+    good = {
+        "council_participants": vote["meta"]["council_participants"],
+        "reviewers": ["claude", "codex"],
+        "verdicts": {"claude": "PASS", "codex": "PASS"},
+        "unanimous": True,
+        "human_acceptance_required": True,
+        "terminal_outcome": "cancelled",
+        "terminal_detail": "cancelled after vote",
+        "shared_material_sha256": vote["meta"]["shared_material_sha256"],
+    }
+    without_final = [item for item in records if item["kind"] != "consensus_final"]
+
+    def with_terminal(meta: dict[str, object]) -> list[dict[str, object]]:
+        return [
+            *without_final,
+            {
+                "seq": 9001,
+                "sender": "system",
+                "recipients": ["human", "all"],
+                "body": "Consensus cancelled.",
+                "kind": "consensus_status",
+                "round_id": vote["round_id"],
+                "meta": meta,
+            },
+        ]
+
+    assert derive_council_ledger(with_terminal(dict(good)))
+    bad_variants = [
+        {**good, "reviewers": ["claude"]},
+        {**good, "verdicts": {"claude": "PASS", "codex": "MISSING"}},
+        {**good, "unanimous": False},
+        {**good, "human_acceptance_required": False},
+        {**good, "terminal_outcome": ""},
+        {key: value for key, value in good.items() if key != "terminal_detail"},
+    ]
+    for meta in bad_variants:
+        with pytest.raises(ChatError):
+            derive_council_ledger(with_terminal(meta))
+
+    # A malformed status with neither verdicts nor a terminal outcome.
+    with pytest.raises(ChatError, match="neither verdicts"):
+        derive_council_ledger(
+            [
+                *without_final,
+                {
+                    "seq": 9002,
+                    "sender": "system",
+                    "recipients": ["human", "all"],
+                    "body": "mystery",
+                    "kind": "consensus_status",
+                    "round_id": vote["round_id"],
+                    "meta": {"council_participants": good["council_participants"]},
+                },
+            ]
+        )
+
+    # At most one terminal status and at most one nonterminal verdict ledger.
+    doubled = with_terminal(dict(good))
+    doubled.append(dict(doubled[-1]))
+    with pytest.raises(ChatError, match="multiple terminal"):
+        derive_council_ledger(doubled)
+
+
+def test_council_rejects_nonreviewer_senders_and_treats_refusal_as_unusable(
+    tmp_path: Path,
+) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "adv-sender-room")
+    run_council(chat)
+    records = transcript.read()
+
+    rogue_response = dict(next(item for item in records if item["kind"] == "review_response"))
+    rogue_response["sender"] = "grok"
+    with pytest.raises(ChatError, match="non-reviewer"):
+        derive_council_ledger([*records, rogue_response])
+
+    rogue_vote = dict(next(item for item in records if item["kind"] == "consensus_vote"))
+    rogue_vote["sender"] = "grok"
+    with pytest.raises(ChatError, match="non-reviewer"):
+        derive_council_ledger([*records, rogue_vote])
+
+    # A refusal response without a terminal status keeps the round blind and
+    # unresolved instead of counting as a usable blind response.
+    question = next(item for item in records if item["kind"] == "review_question")
+    response = next(
+        item for item in records if item["kind"] == "review_response" and item["sender"] == "claude"
+    )
+    refused = next(
+        item for item in records if item["kind"] == "review_response" and item["sender"] == "codex"
+    )
+    refused = dict(refused)
+    refused["meta"] = {**dict(refused.get("meta", {})), "share_refused": True}
+    ledger = derive_council_ledger([question, response, refused])
+    assert ledger["phase"] == "blind"
+    assert ledger["unresolved_recovery"] is True
+    assert ledger["responses"] == [
+        {
+            "reviewer": response["sender"],
+            "seq": response["seq"],
+            "sha256": council_sha256_text(response["body"]),
+        }
+    ]
+
+
+def test_council_question_authority_selection_rules(tmp_path: Path) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "adv-select-room")
+    first = chat.consensus("@claude,@codex First question")
+    chat.consensus("@claude,@codex Second question")
+    records = transcript.read()
+
+    # Greatest seq wins even when input order is shuffled.
+    shuffled = sorted(records, key=lambda item: item["seq"], reverse=True)
+    assert derive_council_ledger(shuffled)["objective"] == "Second question"
+
+    # Duplicate question authority for one round id is rejected.
+    question = next(item for item in records if item["kind"] == "review_question")
+    duplicated_question = dict(question)
+    duplicated_question["seq"] = 9100
+    with pytest.raises(ChatError, match="duplicate council question"):
+        derive_council_ledger([*records, duplicated_question])
+
+    # Noninteger question seq is rejected.
+    bad_seq = dict(question)
+    bad_seq["seq"] = "9101"
+    with pytest.raises(ChatError, match="noninteger"):
+        derive_council_ledger([question, bad_seq])
+
+    # Named selection still reaches the earlier round.
+    assert derive_council_ledger(records, round_id=first.id)["objective"] == "First question"
+
+
+def test_council_final_requires_completed_terminal_metadata(tmp_path: Path) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "adv-final-room")
+    run_council(chat)
+    records = transcript.read()
+    final = next(item for item in records if item["kind"] == "consensus_final")
+
+    # Wrong sender.
+    rogue_final = dict(final)
+    rogue_final["sender"] = "claude"
+    replaced = [rogue_final if item is final else item for item in records]
+    with pytest.raises(ChatError, match="synthesizer"):
+        derive_council_ledger(replaced)
+
+    # Missing or non-completed terminal metadata on the final.
+    stripped = dict(final)
+    stripped["meta"] = {
+        key: value for key, value in final["meta"].items() if key != "terminal_outcome"
+    }
+    replaced = [stripped if item is final else item for item in records]
+    with pytest.raises(ChatError, match="completed terminal outcome"):
+        derive_council_ledger(replaced)
+
+    failed = dict(final)
+    failed["meta"] = {**dict(final["meta"]), "terminal_outcome": "failed"}
+    replaced = [failed if item is final else item for item in records]
+    with pytest.raises(ChatError, match="completed terminal outcome"):
+        derive_council_ledger(replaced)
+
+    # A terminal status may not coexist with the completed final.
+    vote = next(item for item in records if item["kind"] == "consensus_vote")
+    terminal = {
+        "seq": 9200,
+        "sender": "system",
+        "recipients": ["human", "all"],
+        "body": "Consensus cancelled.",
+        "kind": "consensus_status",
+        "round_id": vote["round_id"],
+        "meta": {
+            "council_participants": vote["meta"]["council_participants"],
+            "reviewers": ["claude", "codex"],
+            "verdicts": {"claude": "PASS", "codex": "PASS"},
+            "unanimous": True,
+            "human_acceptance_required": True,
+            "terminal_outcome": "cancelled",
+            "terminal_detail": "cancelled after vote",
+            "shared_material_sha256": vote["meta"]["shared_material_sha256"],
+        },
+    }
+    with pytest.raises(ChatError, match="coexists"):
+        derive_council_ledger([*records, terminal])
+
+
+def test_council_export_rejects_bad_parents_and_lstat_errors(tmp_path: Path) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "adv-export-room")
+    run_council(chat)
+    records = transcript.read()
+    real_file = tmp_path / "plain"
+    real_file.write_text("not a directory")
+    symlink_dir = tmp_path / "link-dir"
+    symlink_dir.symlink_to(tmp_path, target_is_directory=True)
+
+    for parent, pattern in (
+        (real_file, "cannot inspect"),  # lstat under a non-directory fails first
+        (symlink_dir, "parent"),
+        (tmp_path / "missing", "parent"),
+    ):
+        with pytest.raises(ChatError, match=pattern):
+            export_council_ledger(records, parent / "council.json")
+
+    # A non-FileNotFoundError lstat failure is wrapped, not leaked.
+    def failing_lstat(path: object, **kwargs: object) -> object:
+        raise PermissionError("simulated lstat denial")
+
+    original_lstat = os.lstat
+    os.lstat = failing_lstat  # type: ignore[assignment]
+    try:
+        with pytest.raises(ChatError, match="cannot inspect"):
+            export_council_ledger(records, tmp_path / "denied.json")
+    finally:
+        os.lstat = original_lstat  # type: ignore[assignment]
+    assert not (tmp_path / "denied.json").exists()
+
+
 def test_council_cli_status_and_export_offline(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
