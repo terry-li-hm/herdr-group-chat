@@ -2884,19 +2884,39 @@ def make_consensus_chat(
     return chat, transcript
 
 
-def test_consensus_verdict_parser_requires_exact_first_nonempty_line() -> None:
-    assert parse_consensus_verdict("VERDICT: PASS\nReason") == "PASS"
-    assert parse_consensus_verdict("\n  \nVERDICT: REVISE\nReason") == "REVISE"
-    for reply in (
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        ("VERDICT: PASS", "PASS"),
+        ("VERDICT: PASS\nReason", "PASS"),
+        ("\n  \nVERDICT: REVISE\nReason", "REVISE"),
+        ("  VERDICT: PASS  ", "PASS"),
+        ("\tVERDICT: REVISE\tNeeds revision.\t", "REVISE"),
+        ("VERDICT: PASS The candidate final token is exactly ORCHID.", "PASS"),
+    ],
+)
+def test_consensus_verdict_parser_accepts_anchored_first_line_forms(
+    reply: str, expected: str
+) -> None:
+    assert parse_consensus_verdict(reply) == expected
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
         "PASS",
         "Verdict: PASS",
-        " VERDICT: PASS",
-        "VERDICT: PASS ",
-        "VERDICT: PASS extra",
+        "VERDICT: PASSAGE",
+        "VERDICT: PASS: explanation",
+        "VERDICT: PASS, explanation",
+        "VERDICT: PASS/REVISE",
+        "VERDICT: REVISE/PASS",
         "Reason\nVERDICT: PASS",
         "",
-    ):
-        assert parse_consensus_verdict(reply) is None
+    ],
+)
+def test_consensus_verdict_parser_rejects_non_boundary_forms(reply: str) -> None:
+    assert parse_consensus_verdict(reply) is None
 
 
 def test_consensus_json_serialization_prevents_source_from_closing_boundary() -> None:
@@ -2960,6 +2980,30 @@ def test_consensus_runs_blind_barrier_shared_votes_and_unanimous_final(tmp_path:
     assert review.mode == "consensus"
     assert review.terminal_outcome == "completed"
     assert messages[-1]["meta"]["terminal_outcome"] == "completed"
+
+
+def test_consensus_grok_style_same_line_pass_is_unanimous(tmp_path: Path) -> None:
+    client = ConsensusClient(
+        votes={
+            "claude-peer": "VERDICT: PASS",
+            "grok-peer": "VERDICT: PASS The candidate final token is exactly ORCHID.",
+        }
+    )
+    transcript = Transcript(tmp_path, "grok-same-line-pass-room")
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer", "grok": "grok-peer"},
+        client,
+        synthesizer="pi",
+    )
+
+    chat.consensus("@claude,@grok Ratify the candidate final token")
+
+    status = next(item for item in transcript.read() if item["kind"] == "consensus_status")
+    assert status["meta"]["verdicts"] == {"claude": "PASS", "grok": "PASS"}
+    assert status["meta"]["unanimous"] is True
+    final_prompt = next(prompt for _, prompt in client.calls if CONSENSUS_FINAL_MARKER in prompt)
+    assert '"unanimous":true' in final_prompt
 
 
 def test_consensus_scope_excludes_nonparticipant_from_later_ordinary_prompt(

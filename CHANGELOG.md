@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Accept a same-line explanation after an anchored consensus verdict token while
+  continuing to reject token lookalikes, punctuation suffixes, and alternatives.
 - Add `/consensus [@reviewers] QUESTION`: concurrent blind reviews, one
   provisional contention synthesis, concurrent strict PASS/REVISE ratification,
   a deterministic unanimity ledger, and one advisory final synthesis. The mode
