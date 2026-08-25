@@ -2904,7 +2904,7 @@ def make_council_round(**overrides: object) -> object:
         states={},
     )
     base.update(overrides)
-    return namespace["ReviewRound"](**base)  # type: ignore[arg-type]
+    return namespace["ReviewRound"](**base)
 
 
 def test_council_manifest_exact_shape_and_hashes() -> None:
@@ -3550,7 +3550,9 @@ def test_council_final_requires_completed_terminal_metadata(tmp_path: Path) -> N
         derive_council_ledger([*records, terminal])
 
 
-def test_council_export_rejects_bad_parents_and_lstat_errors(tmp_path: Path) -> None:
+def test_council_export_rejects_bad_parents_and_lstat_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "adv-export-room")
     run_council(chat)
     records = transcript.read()
@@ -3571,13 +3573,9 @@ def test_council_export_rejects_bad_parents_and_lstat_errors(tmp_path: Path) -> 
     def failing_lstat(path: object, **kwargs: object) -> object:
         raise PermissionError("simulated lstat denial")
 
-    original_lstat = os.lstat
-    os.lstat = failing_lstat  # type: ignore[assignment]
-    try:
-        with pytest.raises(ChatError, match="cannot inspect"):
-            export_council_ledger(records, tmp_path / "denied.json")
-    finally:
-        os.lstat = original_lstat  # type: ignore[assignment]
+    monkeypatch.setattr(os, "lstat", failing_lstat)
+    with pytest.raises(ChatError, match="cannot inspect"):
+        export_council_ledger(records, tmp_path / "denied.json")
     assert not (tmp_path / "denied.json").exists()
 
 
