@@ -131,6 +131,7 @@ class ReviewRound:
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     attempt_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     pending_attempts: dict[tuple[str, str], dict[str, str]] = field(default_factory=dict)
+    recovery_pending: bool = False
 
 
 def utc_now() -> str:
@@ -2787,15 +2788,44 @@ class GroupChat:
             f"{outcome.replace('_', ' ')} during {phase}",
         )
 
-    def _consensus_continue(
+    def _review_blind_pool(
         self,
         review: ReviewRound,
         on_state: Callable[[str, str], None] | None,
+        reviewers: Sequence[str],
     ) -> None:
-        with review.lock:
-            if review.cancel_event.is_set():
-                return
-        provisional = self._execute_phase(
+        with ThreadPoolExecutor(
+            max_workers=max(1, len(reviewers)), thread_name_prefix="hgchat-review"
+        ) as pool:
+            futures = {
+                pool.submit(self._run_reviewer, review, agent, on_state): agent
+                for agent in reviewers
+            }
+            for future in as_completed(futures):
+                self._record_reviewer_result(review, futures[future], future, on_state)
+
+    def _consensus_close_blind_shortfall(self, review: ReviewRound) -> None:
+        states = [review.states.get(name, "failed") for name in review.reviewers]
+        if "refused" in states:
+            outcome = "refused"
+        elif "timed_out" in states:
+            outcome = "timed_out"
+        elif "blocked" in states:
+            outcome = "blocked"
+        else:
+            outcome = "failed"
+        self._commit_consensus_terminal(
+            review,
+            outcome,
+            f"{outcome.replace('_', ' ')} before provisional synthesis",
+        )
+
+    def _consensus_provisional_stage(
+        self,
+        review: ReviewRound,
+        on_state: Callable[[str, str], None] | None,
+    ) -> str | None:
+        return self._execute_phase(
             review,
             review.synthesizer,
             build_consensus_provisional_prompt(
@@ -2813,32 +2843,40 @@ class GroupChat:
             store_synthesis=True,
             require_nonempty=True,
         )
-        if provisional is None:
-            self._finish_consensus_phase_failure(review, "provisional synthesis")
-            return
+
+    def _consensus_vote_pool(
+        self,
+        review: ReviewRound,
+        on_state: Callable[[str, str], None] | None,
+        voters: Sequence[str],
+    ) -> None:
         shared_material = consensus_shared_material(review, uuid.uuid4().hex)
         prompts = {
             agent: build_consensus_vote_prompt(
                 review, agent, shared_material, uuid.uuid4().hex, self.host_label
             )
-            for agent in review.reviewers
+            for agent in voters
         }
         with ThreadPoolExecutor(
-            max_workers=len(review.reviewers), thread_name_prefix="hgchat-consensus-vote"
+            max_workers=max(1, len(voters)), thread_name_prefix="hgchat-consensus-vote"
         ) as pool:
             futures = {
                 pool.submit(
                     self._run_consensus_vote, review, agent, prompts[agent], on_state
                 ): agent
-                for agent in review.reviewers
+                for agent in voters
             }
             for future in as_completed(futures):
                 self._record_consensus_vote(review, futures[future], future, on_state)
-        with review.lock:
-            if review.cancel_event.is_set():
-                return
-            verdicts, unanimous = self._record_consensus_ledger(review)
-        final = self._execute_phase(
+
+    def _consensus_final_stage(
+        self,
+        review: ReviewRound,
+        on_state: Callable[[str, str], None] | None,
+        verdicts: Mapping[str, str],
+        unanimous: bool,
+    ) -> str | None:
+        return self._execute_phase(
             review,
             review.synthesizer,
             build_consensus_final_prompt(
@@ -2859,7 +2897,25 @@ class GroupChat:
             terminal_outcome="completed",
             terminal_detail="completed",
         )
-        if final is None:
+
+    def _consensus_continue(
+        self,
+        review: ReviewRound,
+        on_state: Callable[[str, str], None] | None,
+    ) -> None:
+        with review.lock:
+            if review.cancel_event.is_set():
+                return
+        provisional = self._consensus_provisional_stage(review, on_state)
+        if provisional is None:
+            self._finish_consensus_phase_failure(review, "provisional synthesis")
+            return
+        self._consensus_vote_pool(review, on_state, review.reviewers)
+        with review.lock:
+            if review.cancel_event.is_set():
+                return
+            verdicts, unanimous = self._record_consensus_ledger(review)
+        if self._consensus_final_stage(review, on_state, verdicts, unanimous) is None:
             self._finish_consensus_phase_failure(review, "final synthesis")
 
     @contextmanager
@@ -2919,15 +2975,7 @@ class GroupChat:
     ) -> ReviewRound:
         if review.question_seq is None and not self._activate_review(review):
             return review
-        with ThreadPoolExecutor(
-            max_workers=len(review.reviewers), thread_name_prefix="hgchat-review"
-        ) as pool:
-            futures = {
-                pool.submit(self._run_reviewer, review, agent, on_state): agent
-                for agent in review.reviewers
-            }
-            for future in as_completed(futures):
-                self._record_reviewer_result(review, futures[future], future, on_state)
+        self._review_blind_pool(review, on_state, review.reviewers)
         with review.lock:
             if review.cancel_event.is_set():
                 if review.mode == "consensus":
@@ -2952,20 +3000,7 @@ class GroupChat:
                 )
                 return review
             if review.mode == "consensus" and len(review.responses) < len(review.reviewers):
-                states = [review.states.get(name, "failed") for name in review.reviewers]
-                if "refused" in states:
-                    outcome = "refused"
-                elif "timed_out" in states:
-                    outcome = "timed_out"
-                elif "blocked" in states:
-                    outcome = "blocked"
-                else:
-                    outcome = "failed"
-                self._commit_consensus_terminal(
-                    review,
-                    outcome,
-                    f"{outcome.replace('_', ' ')} before provisional synthesis",
-                )
+                self._consensus_close_blind_shortfall(review)
                 return review
         if review.mode == "consensus":
             self._consensus_continue(review, on_state)
@@ -3062,8 +3097,216 @@ class GroupChat:
         self._synthesize_review(review, on_state)
         return review
 
+    # --- wave-2 council resume -------------------------------------------------
+
+    def _hydrate_resume_review(
+        self,
+        review: ReviewRound,
+        ledger: Mapping[str, Any],
+        records: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Hydrate the controller placeholder from the validated transcript.
+
+        Runs under review.lock; the caller clears recovery_pending in the same
+        critical section so controller cancellation always targets either the
+        untouched placeholder (append-free) or the real hydrated object
+        (normal semantics).
+        """
+        by_seq = {item["seq"]: item for item in records}
+        question_seq = next(
+            item["seq"]
+            for item in records
+            if item.get("kind") == COUNCIL_QUESTION_KIND
+            and item.get("round_id") == ledger["round_id"]
+        )
+        responses = {
+            entry["reviewer"]: by_seq[entry["seq"]]["body"] for entry in ledger["responses"]
+        }
+        provisional_seq = (
+            ledger["provisional"]["seq"] if ledger["provisional"] is not None else None
+        )
+        synthesis = by_seq[provisional_seq]["body"] if provisional_seq is not None else None
+        votes = {entry["reviewer"]: by_seq[entry["seq"]]["body"] for entry in ledger["votes"]}
+        verdicts = {entry["reviewer"]: entry["verdict"] for entry in ledger["votes"]}
+        participants = tuple(dict.fromkeys((*ledger["reviewers"], ledger["synthesizer"])))
+        states: dict[str, str] = {}
+        for name in participants:
+            if name == ledger["synthesizer"]:
+                states[name] = "done" if synthesis is not None else "queued"
+            else:
+                states[name] = "done" if name in responses else "queued"
+        review.id = ledger["round_id"]
+        review.question = ledger["objective"]
+        review.reviewers = tuple(ledger["reviewers"])
+        review.synthesizer = ledger["synthesizer"]
+        review.question_seq = question_seq
+        review.responses = responses
+        review.synthesis = synthesis
+        review.votes = votes
+        review.verdicts = verdicts
+        review.states = states
+        review.terminal_outcome = ledger["terminal_outcome"]
+        review.terminal_detail = ledger["terminal_detail"]
+
+    def _resume_review_attempt(
+        self,
+        review: ReviewRound,
+        on_state: Callable[[str, str], None] | None,
+        records: Sequence[Mapping[str, Any]],
+        ledger: Mapping[str, Any],
+    ) -> ReviewRound:
+        """Dispatch only (phase, agent) work with no prior attempt, in order."""
+        attempted = {
+            (item["meta"]["phase"], item["meta"]["agent"])
+            for item in records
+            if item.get("kind") == COUNCIL_ATTEMPT_KIND and item.get("round_id") == review.id
+        }
+        verdict_status_exists = ledger["phase"] in {"ratified", "closed"}
+        synthesizer = review.synthesizer
+
+        missing_blind = [
+            name
+            for name in review.reviewers
+            if name not in review.responses and ("blind", name) not in attempted
+        ]
+        if missing_blind:
+            for agent in missing_blind:
+                review.prompts[agent] = build_consensus_blind_prompt(
+                    agent,
+                    review.question,
+                    uuid.uuid4().hex,
+                    review.reviewers,
+                    review.synthesizer,
+                    self.host_label,
+                )
+            self._review_blind_pool(review, on_state, missing_blind)
+            with review.lock:
+                if review.cancel_event.is_set():
+                    return review
+                if len(review.responses) < len(review.reviewers):
+                    self._consensus_close_blind_shortfall(review)
+                    return review
+
+        if review.synthesis is None and ("provisional", synthesizer) not in attempted:
+            with review.lock:
+                if review.cancel_event.is_set():
+                    return review
+            if self._consensus_provisional_stage(review, on_state) is None:
+                self._finish_consensus_phase_failure(review, "provisional synthesis")
+                return review
+
+        missing_voters = [
+            name
+            for name in review.reviewers
+            if name not in review.votes and ("vote", name) not in attempted
+        ]
+        if missing_voters and review.synthesis is not None:
+            with review.lock:
+                if review.cancel_event.is_set():
+                    return review
+            self._consensus_vote_pool(review, on_state, missing_voters)
+            with review.lock:
+                if review.cancel_event.is_set():
+                    return review
+
+        with review.lock:
+            if review.cancel_event.is_set() or review.terminal_outcome is not None:
+                return review
+            all_votes = all(name in review.votes for name in review.reviewers)
+        if all_votes and not verdict_status_exists:
+            # Deterministic verdict status after every vote is already durable.
+            self._record_consensus_ledger(review)
+            verdict_status_exists = True
+        if all_votes and ("final", synthesizer) not in attempted:
+            verdicts, unanimous = self._consensus_verdict_ledger(review)
+            if self._consensus_final_stage(review, on_state, verdicts, unanimous) is None:
+                self._finish_consensus_phase_failure(review, "final synthesis")
+        return review
+
+    def _resume_review_round(
+        self,
+        review: ReviewRound,
+        on_state: Callable[[str, str], None] | None,
+        records: Sequence[Mapping[str, Any]],
+        ledger: Mapping[str, Any],
+    ) -> ReviewRound:
+        with self._review_attempt(review):
+            try:
+                return self._resume_review_attempt(review, on_state, records, ledger)
+            except Exception as error:
+                # An unexpected post-hydration failure closes truthfully, once.
+                if not review.cancel_event.is_set():
+                    with review.lock:
+                        started = review.question_seq is not None
+                        terminal_unset = review.terminal_outcome is None
+                    if started and terminal_unset:
+                        self._commit_consensus_terminal(
+                            review,
+                            "failed",
+                            f"failed unexpectedly: {error}",
+                        )
+                raise
+
+    def resume_council(
+        self,
+        review: ReviewRound,
+        on_state: Callable[[str, str], None] | None = None,
+    ) -> ReviewRound:
+        """Resume the latest durable council round by checkpoint replay.
+
+        The first authoritative read, derive, eligibility, and liveness checks
+        happen under the room-wide council execution lock, so no unlocked
+        preflight can drive dispatch or refusal. Every refusal path appends
+        nothing; a resumable round hydrates the controller placeholder under
+        review.lock and then replays only (phase, agent) work with no prior
+        attempt, never redispatching a completed leaf call.
+        """
+        if review.mode != "consensus" or not review.recovery_pending:
+            raise ChatError("resume targets a recovery-pending council placeholder")
+        with self.transcript.council_execution_lock():
+            records = self.transcript.read()
+            ledger = derive_council_ledger(records)
+            label = ledger["round_id"][:8]
+            if ledger["schema_version"] != COUNCIL_SCHEMA_V2:
+                raise ChatError(
+                    f"council round {label} is legacy schema v{ledger['schema_version']}; "
+                    "legacy rounds cannot resume"
+                )
+            if ledger["recovery_state"] == "closed":
+                raise ChatError(f"council round {label} is closed and cannot resume")
+            if ledger["recovery_state"] == "unresolved":
+                raise ChatError(
+                    f"council round {label} has unresolved attempts; the call may have "
+                    "executed, so a new council is required"
+                )
+            unknown = [name for name in ledger["participants"] if name not in self.agents]
+            if unknown:
+                labels = ", ".join(f"@{name}" for name in unknown)
+                raise ChatError(
+                    f"council manifest participant not configured in this room: {labels}"
+                )
+            self._ensure_live(ledger["participants"])
+            with review.lock:
+                if review.cancel_event.is_set() and review.recovery_pending:
+                    raise ChatError(
+                        "council resume was cancelled before recovery; nothing was resumed"
+                    )
+                self._hydrate_resume_review(review, ledger, records)
+                review.recovery_pending = False
+            return self._resume_review_round(review, on_state, records, ledger)
+
     def cancel_review(self, review: ReviewRound) -> bool:
         with review.lock:
+            if review.recovery_pending:
+                # Pre-hydration cancellation only stops the local worker. The
+                # durable round is untouched because nothing has been resumed
+                # yet, so no terminal status is appended and resume refuses
+                # append-free when it observes the event.
+                review.cancel_event.set()
+                for name, state in review.states.items():
+                    if state == "queued":
+                        review.states[name] = "cancelled"
+                return True
             if review.mode == "consensus" and review.terminal_outcome is not None:
                 return False
             review.cancel_event.set()
@@ -3502,6 +3745,27 @@ class ReviewController:
         reviewers = ", @".join(review.reviewers)
         return f"Consensus started with @{reviewers}; @{review.synthesizer} synthesizes."
 
+    def start_resume(self) -> str:
+        with self._lock:
+            if self._active is not None:
+                raise ChatError("a review is already running")
+            # One placeholder object carries the identity of this resume; the
+            # same object is hydrated under the council execution lock, so a
+            # /cancel always targets the real round once recovery starts.
+            review = ReviewRound(
+                id="",
+                question="",
+                reviewers=(),
+                synthesizer=self.chat.synthesizer,
+                prompts={},
+                question_seq=None,
+                states={},
+                mode="consensus",
+                recovery_pending=True,
+            )
+            self._launch(lambda: self.chat.resume_council(review, self._on_state), review)
+        return "Council resume started; replaying only council work with no completed attempt."
+
     def retry(self, target: str) -> str:
         name = target.removeprefix("@").strip().lower()
         with self._lock:
@@ -3620,6 +3884,10 @@ def handle_local_command(
         command = stripped.removeprefix("/council").strip()
         if command == "status":
             return council_status_message(chat.transcript.read())
+        if command == "resume":
+            if reviews is None:
+                return "Review control is unavailable."
+            return reviews.start_resume()
         if command == "export" or command.startswith("export "):
             target = command.removeprefix("export").strip()
             if not target:
@@ -3629,12 +3897,12 @@ def handle_local_command(
             except ChatError as error:
                 return f"Council export failed: {error}"
             return f"Exported council ledger to {exported}"
-        return "Usage: /council status · /council export PATH"
+        return "Usage: /council status · /council export PATH · /council resume"
     if stripped == "/help":
         return (
             "Commands: /review [@agents] QUESTION · /anneal @author,@critic QUESTION · "
             "/consensus [@agents] QUESTION · /retry <agent|synthesis> · /cancel · /agents · "
-            "/council status · /council export PATH · "
+            "/council status · /council export PATH · /council resume · "
             "/show <agent> · /inbox · /room · PgUp/PgDn · @ opens a mention picker "
             "(Tab completes, Esc closes)"
         )
@@ -3957,6 +4225,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if not question:
                     raise ChatError("usage: --once '/consensus [@agents] QUESTION'")
                 chat.consensus(question)
+                created = transcript.read()[before:]
+            elif args.once.strip() == "/council resume":
+                chat.resume_council(
+                    ReviewRound(
+                        id="",
+                        question="",
+                        reviewers=(),
+                        synthesizer=chat.synthesizer,
+                        prompts={},
+                        question_seq=None,
+                        states={},
+                        mode="consensus",
+                        recovery_pending=True,
+                    )
+                )
                 created = transcript.read()[before:]
             else:
                 created = chat.dispatch(args.once)

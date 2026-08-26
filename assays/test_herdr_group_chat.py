@@ -3234,7 +3234,9 @@ def test_council_status_command_is_read_only(tmp_path: Path) -> None:
     assert transcript.read() == before
     no_round = handle_local_command("/council status", chat)
     assert no_round
-    assert handle_local_command("/council", chat) == "Usage: /council status · /council export PATH"
+    assert handle_local_command("/council", chat) == (
+        "Usage: /council status · /council export PATH · /council resume"
+    )
     assert handle_local_command("/council export", chat) == "Usage: /council export PATH"
 
 
@@ -5521,3 +5523,777 @@ def test_sol_fable_grok_exact_roster_records_the_verified_receipt_once(
         assert needle in body, needle
     # The stored sol-fable room stays default-able: its profile is unchanged.
     assert namespace["PROFILE_ROLES"]["sol-fable"] == ("sol", "fable")
+
+
+# --- wave-2 council resume: reconstruction, /council resume, CLI and controller -----
+
+
+ReviewRound = namespace["ReviewRound"]
+
+
+class ResumeClient(FakeClient):
+    """Deterministic single-flight consensus client without blind barriers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.blind: dict[str, str] = {}
+        self.votes: dict[str, str] = {}
+        self.provisional = "resumed provisional packet"
+
+    def turn(
+        self,
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, str]:
+        self.calls.append((target, prompt))
+        self.timeouts.append(timeout_ms)
+        if cancel_event is not None and cancel_event.is_set():
+            raise ChatError("review cancelled")
+        if CONSENSUS_BLIND_MARKER in prompt:
+            return "done", self.blind.get(target, f"blind from {target}")
+        if CONSENSUS_VOTE_MARKER in prompt:
+            return "done", self.votes.get(target, "VERDICT: PASS\nRatified on resume.")
+        if CONSENSUS_FINAL_MARKER in prompt:
+            return "done", f"final from {target}"
+        if CONSENSUS_PROVISIONAL_MARKER in prompt:
+            return "done", self.provisional
+        return super().turn(target, prompt, timeout_ms, cancel_event)
+
+
+class GateResumeClient(ResumeClient):
+    """Blocks every blind call on a gate, honouring cancellation while parked."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = threading.Event()
+
+    def turn(
+        self,
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, str]:
+        if CONSENSUS_BLIND_MARKER in prompt:
+            self.calls.append((target, prompt))
+            self.timeouts.append(timeout_ms)
+            while not self.gate.wait(0.02):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ChatError("review cancelled")
+            return "done", f"blind from {target}"
+        return super().turn(target, prompt, timeout_ms, cancel_event)
+
+
+def make_resume_placeholder(synthesizer: str = "pi") -> object:
+    return ReviewRound(
+        id="",
+        question="",
+        reviewers=(),
+        synthesizer=synthesizer,
+        prompts={},
+        question_seq=None,
+        states={},
+        mode="consensus",
+        recovery_pending=True,
+    )
+
+
+def replay_records(tmp_path: Path, room: str, records: list[dict[str, object]]) -> object:
+    transcript = Transcript(tmp_path, room)
+    for item in records:
+        transcript.append(
+            item["sender"],
+            item["recipients"],
+            item["body"],
+            kind=item["kind"],
+            round_id=item.get("round_id"),
+            provisional=bool(item.get("provisional")),
+            meta=item.get("meta"),
+        )
+    return transcript
+
+
+def pick_record(
+    records: list[dict[str, object]], kind: str, sender: str | None = None
+) -> dict[str, object]:
+    return next(
+        item
+        for item in records
+        if item["kind"] == kind and (sender is None or item["sender"] == sender)
+    )
+
+
+def attempt_of(records: list[dict[str, object]], phase: str, agent: str) -> dict[str, object]:
+    return next(
+        item
+        for item in records
+        if item["kind"] == "council_attempt"
+        and item["meta"]["phase"] == phase
+        and item["meta"]["agent"] == agent
+    )
+
+
+def prefix_through(
+    records: list[dict[str, object]], phase: str, agent: str, kind: str, sender: str | None = None
+) -> list[dict[str, object]]:
+    """Attempt plus its settled artifact, in journal order."""
+    return [attempt_of(records, phase, agent), pick_record(records, kind, sender or agent)]
+
+
+def completed_council_records(tmp_path: Path, room: str) -> list[dict[str, object]]:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), room)
+    run_council(chat)
+    return transcript.read()
+
+
+def blind_settled_prefix(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    """A resumable checkpoint with every blind response durable and nothing else."""
+    prefix = [pick_record(records, "review_question")]
+    prefix += prefix_through(records, "blind", "claude", "review_response")
+    prefix += prefix_through(records, "blind", "codex", "review_response")
+    return prefix
+
+
+def resume_call_phases(client: FakeClient) -> list[tuple[str, str]]:
+    def phase_of(prompt: str) -> str:
+        if CONSENSUS_BLIND_MARKER in prompt:
+            return "blind"
+        if CONSENSUS_PROVISIONAL_MARKER in prompt:
+            return "provisional"
+        if CONSENSUS_VOTE_MARKER in prompt:
+            return "vote"
+        if CONSENSUS_FINAL_MARKER in prompt:
+            return "final"
+        return "other"
+
+    return sorted((phase_of(prompt), target) for target, prompt in client.calls)
+
+
+def terminal_statuses(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        item
+        for item in records
+        if item["kind"] == "consensus_status" and item.get("meta", {}).get("terminal_outcome")
+    ]
+
+
+def test_council_resume_replays_only_missing_work_at_every_checkpoint(
+    tmp_path: Path,
+) -> None:
+    source = completed_council_records(tmp_path, "resume-source-room")
+    question = pick_record(source, "review_question")
+
+    blind_settled = blind_settled_prefix(source)
+    prov = prefix_through(source, "provisional", "pi", "consensus_provisional")
+    vote_claude = prefix_through(source, "vote", "claude", "consensus_vote")
+    vote_codex = prefix_through(source, "vote", "codex", "consensus_vote")
+    verdict_status = pick_record(source, "consensus_status")
+
+    checkpoints: dict[str, tuple[list[dict[str, object]], list[tuple[str, str]]]] = {
+        # Crash before any dispatch: everything is missing.
+        "prepared": (
+            [question],
+            [
+                ("blind", "claude-peer"),
+                ("blind", "codex-peer"),
+                ("final", "pi-peer"),
+                ("provisional", "pi-peer"),
+                ("vote", "claude-peer"),
+                ("vote", "codex-peer"),
+            ],
+        ),
+        # One blind reviewer settled; the other was never attempted.
+        "one-blind-settled": (
+            [
+                question,
+                *prefix_through(source, "blind", "claude", "review_response"),
+            ],
+            [
+                ("blind", "codex-peer"),
+                ("final", "pi-peer"),
+                ("provisional", "pi-peer"),
+                ("vote", "claude-peer"),
+                ("vote", "codex-peer"),
+            ],
+        ),
+        # All blind responses durable: provisional, votes, status, final remain.
+        "blind-complete": (
+            blind_settled,
+            [
+                ("final", "pi-peer"),
+                ("provisional", "pi-peer"),
+                ("vote", "claude-peer"),
+                ("vote", "codex-peer"),
+            ],
+        ),
+        # Provisional durable: only votes, the status, and the final remain.
+        "provisional-settled": (
+            [*blind_settled, *prov],
+            [
+                ("final", "pi-peer"),
+                ("vote", "claude-peer"),
+                ("vote", "codex-peer"),
+            ],
+        ),
+        # One vote settled: the missing vote, the status, and the final remain.
+        "one-vote-settled": (
+            [*blind_settled, *prov, *vote_claude],
+            [("final", "pi-peer"), ("vote", "codex-peer")],
+        ),
+        # All votes durable but the deterministic verdict status is missing.
+        "votes-complete": (
+            [*blind_settled, *prov, *vote_claude, *vote_codex],
+            [("final", "pi-peer")],
+        ),
+        # Verdict status durable: only the final synthesis remains.
+        "ratified": (
+            [*blind_settled, *prov, *vote_claude, *vote_codex, verdict_status],
+            [("final", "pi-peer")],
+        ),
+    }
+
+    for index, (name, (prefix, expected_calls)) in enumerate(checkpoints.items()):
+        client = ResumeClient()
+        transcript = replay_records(tmp_path, f"resume-ck-{index}-{name}", prefix)
+        chat = GroupChat(
+            transcript,
+            {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+            client,
+            synthesizer="pi",
+        )
+        review = chat.resume_council(make_resume_placeholder())
+
+        assert resume_call_phases(client) == expected_calls, name
+        assert review.recovery_pending is False, name
+        assert review.id == prefix[0]["round_id"], name
+        records = transcript.read()
+        ledger = derive_council_ledger(records)
+        assert ledger["phase"] == "closed", name
+        assert ledger["recovery_state"] == "closed", name
+        assert ledger["terminal_outcome"] == "completed", name
+        assert ledger["unanimous"] is True, name
+        assert len(terminal_statuses(records)) == 0, name  # final artifact seals the round
+        assert ledger["unresolved_attempts"] == [], name
+        # Completed artifacts are reconstructed exactly, never redispatched.
+        resumed_attempts = council_attempt_records(records)
+        assert len(resumed_attempts) == len(council_attempt_records(prefix)) + len(expected_calls)
+        assert len(
+            {(item["meta"]["phase"], item["meta"]["agent"]) for item in resumed_attempts}
+        ) == (len(resumed_attempts)), name
+        # The human acceptance gate survives recovery.
+        assert ledger["human_acceptance_required"] is True, name
+        assert "human acceptance required" in council_status_message(records)
+
+
+def test_council_resume_preserves_completed_artifact_bodies_exactly(tmp_path: Path) -> None:
+    source = completed_council_records(tmp_path, "resume-bodies-room")
+    prefix = [
+        *blind_settled_prefix(source),
+        *prefix_through(source, "provisional", "pi", "consensus_provisional"),
+    ]
+    client = ResumeClient()
+    transcript = replay_records(tmp_path, "resume-bodies-resume", prefix)
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        client,
+        synthesizer="pi",
+    )
+    chat.resume_council(make_resume_placeholder())
+
+    records = transcript.read()
+    # Every completed pre-crash artifact is reconstructed byte-identically.
+    prefix_bodies = {item["body"] for item in prefix if item["kind"] != "council_attempt"}
+    record_bodies = [item["body"] for item in records]
+    for body in prefix_bodies:
+        assert body in record_bodies
+    ledger = derive_council_ledger(records)
+    original_responses = {
+        item["sender"]: item["body"] for item in source if item["kind"] == "review_response"
+    }
+    for entry in ledger["responses"]:
+        assert entry["sha256"] == council_sha256_text(original_responses[entry["reviewer"]])
+
+
+def test_council_resume_appends_deterministic_verdict_status_after_durable_votes(
+    tmp_path: Path,
+) -> None:
+    source = completed_council_records(tmp_path, "resume-verdict-room")
+    prefix = blind_settled_prefix(source)
+    prefix += prefix_through(source, "provisional", "pi", "consensus_provisional")
+    prefix += prefix_through(source, "vote", "claude", "consensus_vote")
+    prefix += prefix_through(source, "vote", "codex", "consensus_vote")
+
+    client = ResumeClient()
+    transcript = replay_records(tmp_path, "resume-verdict-resume", prefix)
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        client,
+        synthesizer="pi",
+    )
+    chat.resume_council(make_resume_placeholder())
+
+    # Exactly one deterministic verdict status was appended, without a model call.
+    statuses = [item for item in transcript.read() if item["kind"] == "consensus_status"]
+    assert len(statuses) == 1
+    assert "terminal_outcome" not in statuses[0]["meta"]
+    assert statuses[0]["meta"]["verdicts"] == {"claude": "PASS", "codex": "PASS"}
+    assert statuses[0]["meta"]["unanimous"] is True
+    assert statuses[0]["meta"]["human_acceptance_required"] is True
+
+
+def test_council_resume_manifest_roster_overrides_process_defaults(tmp_path: Path) -> None:
+    transcript = Transcript(tmp_path, "resume-manifest-source")
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        ConsensusClient(
+            blind_replies={"claude-peer": "CL_MAN", "pi-peer": "PI_MAN"},
+            provisional="MAN_PROV",
+        ),
+        synthesizer="codex",
+    )
+    run_council(chat)
+    records = transcript.read()
+    prefix = [pick_record(records, "review_question")]
+    prefix += prefix_through(records, "blind", "claude", "review_response")
+    prefix += prefix_through(records, "blind", "codex", "review_response")
+
+    client = ResumeClient()
+    resume_transcript = replay_records(tmp_path, "resume-manifest-resume", prefix)
+    resume_chat = GroupChat(
+        resume_transcript,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        client,
+        synthesizer="pi",  # process default; the manifest synthesizer must win
+    )
+    review = resume_chat.resume_council(make_resume_placeholder())
+
+    assert review.synthesizer == "codex"
+    calls = resume_call_phases(client)
+    assert calls == [
+        ("final", "codex-peer"),
+        ("provisional", "codex-peer"),
+        ("vote", "claude-peer"),
+        ("vote", "codex-peer"),
+    ]
+    ledger = derive_council_ledger(resume_transcript.read())
+    assert ledger["synthesizer"] == "codex"
+    assert ledger["terminal_outcome"] == "completed"
+
+
+def test_council_resume_refusals_append_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = completed_council_records(tmp_path, "resume-refuse-source")
+
+    cases: list[tuple[str, list[dict[str, object]], str, object]] = []
+
+    # Legacy schema-v1 rounds cannot resume.
+    legacy = []
+    for item in source:
+        duplicate = dict(item)
+        meta = dict(item.get("meta", {}))
+        manifest = meta.get("council_manifest")
+        if manifest is not None:
+            manifest = dict(manifest)
+            manifest["schema_version"] = 1
+            del manifest["recovery_protocol"]
+            meta["council_manifest"] = manifest
+        meta.pop("council_attempt_settlement", None)
+        duplicate["meta"] = meta
+        if duplicate["kind"] != "council_attempt":
+            legacy.append(duplicate)
+    cases.append(("legacy", legacy, "legacy schema v1", ResumeClient()))
+
+    # A closed round cannot resume.
+    cases.append(("closed", source, "closed and cannot resume", ResumeClient()))
+
+    # A started-but-unsettled attempt fails closed: a new council is required.
+    first_attempt = next(
+        index for index, item in enumerate(source) if item["kind"] == "council_attempt"
+    )
+    cases.append(
+        (
+            "unresolved",
+            source[: first_attempt + 1],
+            "unresolved attempts; the call may have executed, so a new council is required",
+            ResumeClient(),
+        )
+    )
+
+    for index, (name, records, message, client) in enumerate(cases):
+        transcript = replay_records(tmp_path, f"resume-refuse-{index}-{name}", records)
+        before = transcript.read()
+        chat = GroupChat(
+            transcript,
+            {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+            client,
+            synthesizer="pi",
+        )
+        with pytest.raises(ChatError, match=re.escape(message)):
+            chat.resume_council(make_resume_placeholder())
+        assert transcript.read() == before, name
+        assert client.calls == [], name
+
+
+def test_council_resume_refuses_without_any_round_or_unconfigured_or_not_live(
+    tmp_path: Path,
+) -> None:
+    # No council rounds at all.
+    transcript = Transcript(tmp_path, "resume-empty-room")
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        ResumeClient(),
+        synthesizer="pi",
+    )
+    with pytest.raises(ChatError, match="no council rounds are recorded"):
+        chat.resume_council(make_resume_placeholder())
+    assert transcript.read() == []
+
+    # Manifest participants that this process does not configure.
+    wide = Transcript(tmp_path, "resume-wide-source")
+    wide_chat = GroupChat(
+        wide,
+        {
+            "pi": "pi-peer",
+            "claude": "claude-peer",
+            "codex": "codex-peer",
+            "grok": "grok-peer",
+        },
+        ConsensusClient(),
+        synthesizer="pi",
+    )
+    wide_chat.consensus("@claude,@grok Wide council")
+    records = wide.read()
+    prefix = [pick_record(records, "review_question")]
+    prefix += prefix_through(records, "blind", "claude", "review_response")
+    prefix += prefix_through(records, "blind", "grok", "review_response")
+    narrow = replay_records(tmp_path, "resume-narrow-resume", prefix)
+    narrow_before = narrow.read()
+    narrow_client = ResumeClient()
+    narrow_chat = GroupChat(
+        narrow,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        narrow_client,
+        synthesizer="pi",
+    )
+    with pytest.raises(ChatError, match="not configured in this room: @grok"):
+        narrow_chat.resume_council(make_resume_placeholder())
+    assert narrow.read() == narrow_before
+    assert narrow_client.calls == []
+
+    # Every manifest participant must be live before any dispatch.
+    offline_prefix = [pick_record(records, "review_question")]
+    offline_prefix += prefix_through(records, "blind", "claude", "review_response")
+    offline_prefix += prefix_through(records, "blind", "grok", "review_response")
+    offline = replay_records(tmp_path, "resume-offline-resume", offline_prefix)
+    offline_before = offline.read()
+
+    class OfflineClient(ResumeClient):
+        def live_targets(self) -> set[str]:
+            return {"pi-peer", "claude-peer"}  # codex-peer... grok target missing
+
+    offline_client = OfflineClient()
+    offline_chat = GroupChat(
+        offline,
+        {"pi": "pi-peer", "claude": "claude-peer", "grok": "grok-peer"},
+        offline_client,
+        synthesizer="pi",
+    )
+    with pytest.raises(ChatError, match="participant not live"):
+        offline_chat.resume_council(make_resume_placeholder())
+    assert offline.read() == offline_before
+    assert offline_client.calls == []
+
+
+def test_council_resume_lock_contention_and_concurrent_resume_append_nothing(
+    tmp_path: Path,
+) -> None:
+    source = completed_council_records(tmp_path, "resume-lock-source")
+    transcript = replay_records(
+        tmp_path, "resume-lock-resume", [pick_record(source, "review_question")]
+    )
+    client = GateResumeClient()
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        client,
+        synthesizer="pi",
+    )
+    before = transcript.read()
+
+    errors: list[Exception] = []
+
+    def contender() -> None:
+        try:
+            chat.resume_council(make_resume_placeholder())
+        except ChatError as error:
+            errors.append(error)
+
+    with transcript.council_execution_lock():
+        thread = threading.Thread(target=contender)
+        thread.start()
+        thread.join(10)
+    assert len(errors) == 1
+    assert "another council execution" in str(errors[0])
+    assert transcript.read() == before
+    assert client.calls == []
+
+    # A concurrent live resume loses the lock without appending or dispatching.
+    first = threading.Thread(
+        target=chat.resume_council, args=(make_resume_placeholder(),), daemon=True
+    )
+    first.start()
+    assert _wait_until(lambda: len(client.calls) > 0)
+    try:
+        chat.resume_council(make_resume_placeholder())
+        raise AssertionError("the concurrent resume should have failed on the lock")
+    except ChatError as error:
+        assert "another council execution" in str(error)
+    # The loser appended nothing: only the winner's two started blind attempts grew.
+    assert len(transcript.read()) == len(before) + 2
+    client.gate.set()
+    first.join(10)
+    assert derive_council_ledger(transcript.read())["terminal_outcome"] == "completed"
+
+
+def _wait_until(predicate: object, timeout: float = 5.0) -> bool:
+    import time as _time
+
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if predicate():
+            return True
+        _time.sleep(0.02)
+    return False
+
+
+def test_council_resume_cancel_before_hydration_appends_nothing(tmp_path: Path) -> None:
+    source = completed_council_records(tmp_path, "resume-early-cancel-source")
+    transcript = replay_records(tmp_path, "resume-early-cancel", blind_settled_prefix(source))
+    client = ResumeClient()
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        client,
+        synthesizer="pi",
+    )
+    before = transcript.read()
+
+    placeholder = make_resume_placeholder()
+    assert chat.cancel_review(placeholder) is True
+    assert placeholder.cancel_event.is_set()
+    assert transcript.read() == before
+
+    with pytest.raises(ChatError, match="cancelled before recovery; nothing was resumed"):
+        chat.resume_council(placeholder)
+    assert transcript.read() == before
+    assert client.calls == []
+    assert placeholder.recovery_pending is True
+
+
+def test_council_resume_cancel_after_hydration_uses_normal_semantics(
+    tmp_path: Path,
+) -> None:
+    source = completed_council_records(tmp_path, "resume-late-cancel-source")
+    transcript = replay_records(
+        tmp_path, "resume-late-cancel", [pick_record(source, "review_question")]
+    )
+    client = GateResumeClient()
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        client,
+        synthesizer="pi",
+    )
+    controller = ReviewController(chat)
+    assert controller.start_resume() == (
+        "Council resume started; replaying only council work with no completed attempt."
+    )
+    # Wait until hydration is real: the resumed blind dispatch is in flight.
+    assert _wait_until(lambda: len(client.calls) > 0)
+    assert controller.cancel() == (
+        "Local cancellation requested; participants may continue working."
+    )
+    client.gate.set()
+    assert controller.wait(timeout=5)
+    assert "cancelled locally" in controller.status()
+
+    records = transcript.read()
+    terminals = terminal_statuses(records)
+    assert [item["meta"]["terminal_outcome"] for item in terminals] == ["cancelled"]
+    ledger = derive_council_ledger(records)
+    assert ledger["phase"] == "closed"
+    assert ledger["recovery_state"] == "closed"
+
+
+def test_council_resume_controller_occupancy_and_stale_refusal(tmp_path: Path) -> None:
+    source = completed_council_records(tmp_path, "resume-occupancy-source")
+    gated = replay_records(
+        tmp_path, "resume-occupancy-gated", [pick_record(source, "review_question")]
+    )
+    gate_client = GateResumeClient()
+    gate_chat = GroupChat(
+        gated,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        gate_client,
+        synthesizer="pi",
+    )
+    controller = ReviewController(gate_chat)
+    controller.start_resume()
+    assert _wait_until(lambda: len(gate_client.calls) > 0)
+    with pytest.raises(ChatError, match="a review is already running"):
+        controller.start_resume()
+    with pytest.raises(ChatError, match="a review is already running"):
+        controller.start("@claude also review")
+    gate_client.gate.set()
+    assert controller.wait(timeout=5)
+    assert derive_council_ledger(gated.read())["terminal_outcome"] == "completed"
+
+    # A stale resume of an already-closed round refuses without appending.
+    closed = replay_records(tmp_path, "resume-occupancy-closed", source)
+    closed_client = ResumeClient()
+    closed_chat = GroupChat(
+        closed,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        closed_client,
+        synthesizer="pi",
+    )
+    closed_controller = ReviewController(closed_chat)
+    closed_controller.start_resume()
+    assert closed_controller.wait(timeout=5)
+    status = closed_controller.status()
+    assert status.startswith("Consensus failed:")
+    assert "closed and cannot resume" in status
+    assert closed.read() == source
+    assert closed_client.calls == []
+
+
+def test_council_resume_unexpected_post_hydration_failure_closes_truthfully(
+    tmp_path: Path,
+) -> None:
+    source = completed_council_records(tmp_path, "resume-crash-source")
+
+    class BoomClient(ResumeClient):
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            if CONSENSUS_PROVISIONAL_MARKER in prompt:
+                self.calls.append((target, prompt))
+                raise RuntimeError("boom")
+            return super().turn(target, prompt, timeout_ms, cancel_event)
+
+    client = BoomClient()
+    transcript = replay_records(tmp_path, "resume-crash-resume", blind_settled_prefix(source))
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        client,
+        synthesizer="pi",
+    )
+    chat.resume_council(make_resume_placeholder())
+
+    records = transcript.read()
+    terminals = terminal_statuses(records)
+    assert [item["meta"]["terminal_outcome"] for item in terminals] == ["failed"]
+    ledger = derive_council_ledger(records)
+    assert ledger["phase"] == "closed"
+    assert ledger["terminal_detail"] == "failed during provisional synthesis"
+    # Exactly one model call was made; no duplicate terminal, no votes, no final.
+    assert resume_call_phases(client) == [("provisional", "pi-peer")]
+    assert not [item for item in records if item["kind"] in {"consensus_vote", "consensus_final"}]
+
+
+def test_council_resume_command_wiring_and_usage(tmp_path: Path) -> None:
+    source = completed_council_records(tmp_path, "resume-wiring-source")
+    chat, transcript = make_consensus_chat(tmp_path, ResumeClient(), "resume-wiring-room")
+    replay = replay_records(
+        tmp_path, "resume-wiring-resume", [pick_record(source, "review_question")]
+    )
+    gate_client = GateResumeClient()
+    resume_chat = GroupChat(
+        replay,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        gate_client,
+        synthesizer="pi",
+    )
+
+    assert handle_local_command("/council resume", chat) == "Review control is unavailable."
+    controller = ReviewController(resume_chat)
+    message = handle_local_command("/council resume", resume_chat, controller)
+    assert message == (
+        "Council resume started; replaying only council work with no completed attempt."
+    )
+    with pytest.raises(ChatError, match="a review is already running"):
+        controller.start_consensus("@claude,@codex Again")
+    # Wait until recovery is real (dispatch in flight) so cancel lands post-hydration.
+    assert _wait_until(lambda: len(gate_client.calls) > 0)
+    assert controller.cancel() == "Local cancellation requested; participants may continue working."
+    assert controller.wait(timeout=5)
+    assert transcript.read() == []
+    cancelled_records = replay.read()
+    assert [item["meta"]["terminal_outcome"] for item in terminal_statuses(cancelled_records)] == [
+        "cancelled"
+    ]
+    assert len([item for item in cancelled_records if item["kind"] == "review_response"]) == 0
+
+
+def test_council_resume_once_cli_success_and_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = completed_council_records(tmp_path, "resume-cli-source")
+    client = ResumeClient()
+    monkeypatch.setattr(module, "HerdrClient", lambda **kwargs: client)
+    monkeypatch.delenv("HERDR_GROUP_CHAT_SETUP_FAILURES", raising=False)
+
+    replay_records(tmp_path, "resume-cli-room", blind_settled_prefix(source))
+    code = main(
+        [
+            "--room",
+            "resume-cli-room",
+            "--state-dir",
+            str(tmp_path),
+            "--once",
+            "/council resume",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "final from pi-peer" in out
+    ledger = derive_council_ledger(Transcript(tmp_path, "resume-cli-room").read())
+    assert ledger["terminal_outcome"] == "completed"
+    assert ledger["human_acceptance_required"] is True
+    assert resume_call_phases(client) == [
+        ("final", "pi-peer"),
+        ("provisional", "pi-peer"),
+        ("vote", "claude-peer"),
+        ("vote", "codex-peer"),
+    ]
+
+    # A closed round refuses through the same CLI path with exit code 2.
+    closed_client = ResumeClient()
+    monkeypatch.setattr(module, "HerdrClient", lambda **kwargs: closed_client)
+    replay_records(tmp_path, "resume-cli-closed", source)
+    code = main(
+        [
+            "--room",
+            "resume-cli-closed",
+            "--state-dir",
+            str(tmp_path),
+            "--once",
+            "/council resume",
+        ]
+    )
+    assert code == 2
+    captured = capsys.readouterr()
+    assert "closed and cannot resume" in captured.err
+    assert closed_client.calls == []
