@@ -2234,9 +2234,7 @@ class GroupChat:
                 return settlement
             state = review.states.get(agent)
             if state == active_state:
-                raise ChatError(
-                    f"council {phase} settlement for @{agent} lost its pending attempt"
-                )
+                raise ChatError(f"council {phase} settlement for @{agent} lost its pending attempt")
             if review.cancel_event.is_set() and state == "cancelled":
                 return None
             if review.mode == "consensus" and review.terminal_outcome is not None:
