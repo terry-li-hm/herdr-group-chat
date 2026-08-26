@@ -18,18 +18,41 @@
    `./new-room --launch`; `open` runs `./new-room --open`.
 4. Commit the release candidate and create the annotated release tag.
 
-## Publication gate
+## Standing publication authority
 
-Publication requires explicit approval. After approval:
+Terry granted standing release authority for the existing public personal
+repository `terry-li-hm/herdr-group-chat` on 26 August 2026. After every local
+release gate above passes, the cockpit may publish and install a non-major
+SemVer release without seeking repeated per-release approval. This authority
+covers only a clean fast-forward push of `main`, creation and push of a new
+annotated version tag, creation of the matching GitHub release, and replacement
+of the current local managed plugin with that exact tag.
 
-1. Confirm the existing public `terry-li-hm/herdr-group-chat` repository is
-   present with `main` as its default branch and an accurate description, then
-   push `main` plus the release tag.
-2. Unlink the local development copy, install that exact tag with
-   `herdr plugin install terry-li-hm/herdr-group-chat --ref <tag>`, and rerun
-   both the verified default three-agent (sol-fable-grok) smoke test and the
-   classic four-agent smoke test from the managed checkout.
-3. Confirm GitHub private vulnerability reporting remains enabled.
-4. Confirm the `herdr-plugin` repository topic remains present and Herdr's
-   marketplace listing remains accurate (the marketplace is an automatic,
-   unreviewed index), then restore the desired local installation.
+The standing authority does not cover a major release, repository creation,
+force push or any history rewrite, movement or replacement of an existing tag,
+visibility or security-setting changes, credentials or secrets, workflow or
+secret-permission escalation, a new registry or distribution lane, deletion,
+cross-host installation, or any release with a failed or incomplete gate.
+Workers and reviewers provide evidence but never inherit this authority.
+
+For an eligible release:
+
+1. Confirm the existing public repository has `main` as its default branch,
+   the expected description and `herdr-plugin` topic, private vulnerability
+   reporting enabled, no existing target tag or release, and a remote `main`
+   that can fast-forward to the verified release commit.
+2. Push `main`, create and push the new annotated release tag, then create the
+   matching non-draft, non-prerelease GitHub release. Never replace or move an
+   existing remote object.
+3. Install that exact tag with
+   `herdr plugin install terry-li-hm/herdr-group-chat --ref <tag> --yes`. Read
+   back the requested ref and resolved commit, compare the managed checkout's
+   tracked hashes with the tagged source, and verify all four actions and both
+   pane entrypoints.
+4. Rerun the verified default three-agent (sol-fable-grok) smoke test and the
+   classic four-agent smoke test from the managed checkout. Read back the
+   remote branch, annotated tag target, GitHub release, repository metadata,
+   vulnerability-reporting state, and installed plugin before calling the
+   release complete. If post-publication verification fails, preserve every
+   remote object, restore the previously verified managed tag, record the
+   failure, and stop.
