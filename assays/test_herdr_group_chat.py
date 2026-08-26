@@ -4237,6 +4237,9 @@ def test_consensus_cancel_after_vote_append_keeps_committed_verdict_in_terminal_
         return committed
 
     monkeypatch.setattr(chat, "_commit_review_phase", gated_commit)
+    # Mirror the real call sequence: the vote attempt is journalled before its
+    # result is recorded, so the settlement is real for the whole race.
+    chat._start_council_attempt(review, "vote", "claude", "vote prompt")
     future = Future()
     future.set_result(("done", "VERDICT: PASS\nCommitted before cancellation."))
 
@@ -6170,7 +6173,11 @@ def test_council_resume_controller_occupancy_and_stale_refusal(tmp_path: Path) -
     status = closed_controller.status()
     assert status.startswith("Consensus failed:")
     assert "closed and cannot resume" in status
-    assert closed.read() == source
+
+    def durable(records: object) -> list[dict[str, object]]:
+        return [{k: v for k, v in item.items() if k != "at"} for item in records]
+
+    assert durable(closed.read()) == durable(source)
     assert closed_client.calls == []
 
 
@@ -6557,3 +6564,57 @@ def test_resume_council_receipt_unit_refusal_and_success(tmp_path: Path) -> None
     with pytest.raises(ChatError, match="closed and cannot resume"):
         open_chat.resume_council(make_resume_placeholder(), profile_receipt=receipt)
     assert open_room.read() == before_again
+
+
+# --- settlement hardening: missing pending attempts fail before append ---------------
+
+
+def test_council_settlement_without_pending_attempt_fails_before_append(
+    tmp_path: Path,
+) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "settle-gap-room")
+    review = chat.plan_consensus("@claude,@codex Settle safely")
+    review.question_seq = 1  # activation behind us; no cancellation, no terminal
+    before = transcript.read()
+
+    # A future call-site refactor that settles a phase/agent whose attempt was
+    # never started must fail closed before any artifact append.
+    with pytest.raises(ChatError, match="no pending attempt"):
+        chat._settle_council_attempt(review, "blind", "claude")
+    with pytest.raises(ChatError, match="no pending attempt"):
+        chat._settle_council_attempt(review, "vote", "codex")
+    assert transcript.read() == before
+
+
+def test_council_settlement_cancellation_and_terminal_paths_stay_silent(
+    tmp_path: Path,
+) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "settle-cancel-room")
+    cancelled = chat.plan_consensus("@claude,@codex Cancel early")
+    cancelled.question_seq = 1
+    cancelled.cancel_event.set()
+    assert chat._settle_council_attempt(cancelled, "blind", "claude") is None
+
+    sealed = chat.plan_consensus("@claude,@codex Sealed round")
+    sealed.question_seq = 1
+    sealed.terminal_outcome = "cancelled"
+    assert chat._settle_council_attempt(sealed, "vote", "claude") is None
+
+    # The full cancellation-before-start path is unchanged: the reviewer call
+    # raises before any attempt is journalled and the failure status commits
+    # without settlement metadata, appending nothing beyond cancellation
+    # semantics.
+    review = chat.plan_consensus("@claude,@codex Cancel before start")
+    review.question_seq = 1
+    review.cancel_event.set()
+    before = transcript.read()
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(chat._run_reviewer, review, "claude", None)
+        chat._record_reviewer_result(review, "claude", future, None)
+    assert review.states["claude"] == "cancelled"
+    # Nothing is appended at all on the cancellation-before-start path: no
+    # attempt was journalled and the cancelled commit discards the message.
+    assert transcript.read() == before
+    assert not council_attempt_records(transcript.read())

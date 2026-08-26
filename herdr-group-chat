@@ -2202,8 +2202,24 @@ class GroupChat:
         phase: str,
         agent: str,
     ) -> dict[str, str] | None:
+        """Pop and return one pending settlement, or None on the cancel/terminal path.
+
+        A missing settlement with neither cancellation nor a consensus terminal
+        is a caller bug that must fail closed before any artifact append could
+        produce an invalid schema-v2 ledger; the legitimate path where
+        `_begin_review_call` exited before `_start_council_attempt` under
+        cancellation returns None and appends nothing beyond cancellation
+        semantics.
+        """
         with review.lock:
-            return review.pending_attempts.pop((phase, agent), None)
+            settlement = review.pending_attempts.pop((phase, agent), None)
+            if settlement is not None:
+                return settlement
+            if review.cancel_event.is_set() or (
+                review.mode == "consensus" and review.terminal_outcome is not None
+            ):
+                return None
+        raise ChatError(f"council {phase} settlement for @{agent} has no pending attempt")
 
     def _commit_review_phase(
         self,
