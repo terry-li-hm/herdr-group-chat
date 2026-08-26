@@ -1146,6 +1146,16 @@ COUNCIL_FINAL_KIND = "consensus_final"
 COUNCIL_ATTEMPT_KIND = "council_attempt"
 COUNCIL_ATTEMPT_PHASES = frozenset({"blind", "provisional", "vote", "final"})
 COUNCIL_ATTEMPT_SETTLEMENT_KEY = "council_attempt_settlement"
+
+# The live state an agent occupies while a phase's model call is in flight; a
+# missing settlement for an agent in this state means dispatch began and the
+# journal entry was lost, which must fail closed.
+_COUNCIL_ACTIVE_STATES = {
+    "blind": "working",
+    "provisional": "provisional",
+    "vote": "voting",
+    "final": "finalizing",
+}
 # Map of artifact kinds to the model-call phase whose attempt they settle.
 COUNCIL_KIND_PHASES = {
     "review_response": "blind",
@@ -2204,20 +2214,28 @@ class GroupChat:
     ) -> dict[str, str] | None:
         """Pop and return one pending settlement, or None on the cancel/terminal path.
 
-        A missing settlement with neither cancellation nor a consensus terminal
-        is a caller bug that must fail closed before any artifact append could
-        produce an invalid schema-v2 ledger; the legitimate path where
-        `_begin_review_call` exited before `_start_council_attempt` under
-        cancellation returns None and appends nothing beyond cancellation
-        semantics.
+        A missing settlement returns None only when the call is proven never to
+        have started: cancellation where `_begin_review_call` already recorded
+        the agent as cancelled, or an already-terminal consensus round whose
+        agent is not in the phase's active state. If the agent is still in the
+        active state for the phase, dispatch began and the missing settlement
+        is a lost journal entry that must fail closed even under cancellation
+        or a terminal outcome, before any artifact append could produce an
+        invalid schema-v2 ledger.
         """
+        active_state = _COUNCIL_ACTIVE_STATES.get(phase, phase)
         with review.lock:
             settlement = review.pending_attempts.pop((phase, agent), None)
             if settlement is not None:
                 return settlement
-            if review.cancel_event.is_set() or (
-                review.mode == "consensus" and review.terminal_outcome is not None
-            ):
+            state = review.states.get(agent)
+            if state == active_state:
+                raise ChatError(
+                    f"council {phase} settlement for @{agent} lost its pending attempt"
+                )
+            if review.cancel_event.is_set() and state == "cancelled":
+                return None
+            if review.mode == "consensus" and review.terminal_outcome is not None:
                 return None
         raise ChatError(f"council {phase} settlement for @{agent} has no pending attempt")
 

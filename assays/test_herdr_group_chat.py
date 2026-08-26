@@ -6590,15 +6590,42 @@ def test_council_settlement_cancellation_and_terminal_paths_stay_silent(
     tmp_path: Path,
 ) -> None:
     chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "settle-cancel-room")
+
+    # Real cancellation-before-start: `_begin_review_call` observes the cancel
+    # event, records the agent as cancelled, and refuses to start, so the
+    # settlement correctly returns None with nothing journalled.
     cancelled = chat.plan_consensus("@claude,@codex Cancel early")
     cancelled.question_seq = 1
     cancelled.cancel_event.set()
+    assert not chat._begin_review_call(cancelled, "claude", "working", None)
     assert chat._settle_council_attempt(cancelled, "blind", "claude") is None
 
+    # An already-terminal round whose agent never began the vote phase stays
+    # silent rather than failing on a settlement that was never started.
     sealed = chat.plan_consensus("@claude,@codex Sealed round")
     sealed.question_seq = 1
+    sealed.states["claude"] = "cancelled"
     sealed.terminal_outcome = "cancelled"
     assert chat._settle_council_attempt(sealed, "vote", "claude") is None
+
+    # An agent still in a phase's active state proves dispatch began: a missing
+    # attempt is a lost journal entry and must raise even under cancellation.
+    active_cancel = chat.plan_consensus("@claude,@codex Lost under cancel")
+    active_cancel.question_seq = 1
+    active_cancel.states["claude"] = "working"
+    active_cancel.cancel_event.set()
+    before = transcript.read()
+    with pytest.raises(ChatError, match="lost its pending attempt"):
+        chat._settle_council_attempt(active_cancel, "blind", "claude")
+
+    # Same fail-closed rule under an already-terminal round.
+    active_terminal = chat.plan_consensus("@claude,@codex Lost under terminal")
+    active_terminal.question_seq = 1
+    active_terminal.states["codex"] = "voting"
+    active_terminal.terminal_outcome = "no_consensus"
+    with pytest.raises(ChatError, match="lost its pending attempt"):
+        chat._settle_council_attempt(active_terminal, "vote", "codex")
+    assert transcript.read() == before
 
     # The full cancellation-before-start path is unchanged: the reviewer call
     # raises before any attempt is journalled and the failure status commits
