@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-26
+
 - Add the schema-v2 council attempt journal, recovery ledger, and execution
   lock: every consensus model call is preceded by a scoped append-only
   `council_attempt` (unique id, phase, exact agent, prompt SHA-256) and settled

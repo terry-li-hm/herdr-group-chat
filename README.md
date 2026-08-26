@@ -28,7 +28,7 @@ executable uses `uv` to run Python 3.13.
 Install the pinned release from GitHub:
 
 ```bash
-herdr plugin install terry-li-hm/herdr-group-chat --ref v0.7.0
+herdr plugin install terry-li-hm/herdr-group-chat --ref v0.8.0
 herdr plugin action invoke new --plugin terry.herdr-group-chat
 ```
 
