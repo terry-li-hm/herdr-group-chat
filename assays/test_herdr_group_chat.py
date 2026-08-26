@@ -6297,3 +6297,263 @@ def test_council_resume_once_cli_success_and_refusal(
     captured = capsys.readouterr()
     assert "closed and cannot resume" in captured.err
     assert closed_client.calls == []
+
+
+# --- wave-3 append-free once-resume hardening ----------------------------------------
+
+
+class SolFableResumeClient(FakeClient):
+    def live_targets(self) -> set[str]:
+        return {"sol-peer", "fable-peer"}
+
+    def states(self) -> dict[str, str]:
+        return {"sol-peer": "idle", "fable-peer": "idle"}
+
+    def turn(
+        self,
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, str]:
+        self.calls.append((target, prompt))
+        self.timeouts.append(timeout_ms)
+        if cancel_event is not None and cancel_event.is_set():
+            raise ChatError("review cancelled")
+        if CONSENSUS_PROVISIONAL_MARKER in prompt:
+            return "done", "sol resumed provisional"
+        if CONSENSUS_VOTE_MARKER in prompt:
+            return "done", "VERDICT: PASS\nRatified on resume."
+        if CONSENSUS_FINAL_MARKER in prompt:
+            return "done", f"final from {target}"
+        return super().turn(target, prompt, timeout_ms, cancel_event)
+
+
+def profile_resume_records(tmp_path: Path, room: str) -> list[dict[str, object]]:
+    """Build a resumable sol-fable checkpoint: question only, no attempts."""
+    source_room = f"{room}-source"
+    transcript = Transcript(tmp_path, source_room)
+    chat = GroupChat(
+        transcript,
+        {"sol": "sol-peer", "fable": "fable-peer"},
+        SolFableResumeClient(),
+        synthesizer="sol",
+    )
+    chat.consensus("@fable Profile council")
+    records = transcript.read()
+    return [pick_record(records, "review_question")]
+
+
+def test_once_resume_refusal_appends_nothing_despite_setup_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = completed_council_records(tmp_path, "once-refuse-setup-source")
+    client = ResumeClient()
+    monkeypatch.setattr(module, "HerdrClient", lambda **kwargs: client)
+    monkeypatch.setenv("HERDR_GROUP_CHAT_SETUP_FAILURES", "sol setup exploded\nfable setup too")
+    monkeypatch.delenv(namespace["PROFILE_RECEIPT_ENV"], raising=False)
+
+    replay_records(tmp_path, "once-refuse-setup-room", source)  # a closed round
+    code = main(
+        [
+            "--room",
+            "once-refuse-setup-room",
+            "--state-dir",
+            str(tmp_path),
+            "--once",
+            "/council resume",
+        ]
+    )
+    assert code == 2
+    assert "closed and cannot resume" in capsys.readouterr().err
+    records = Transcript(tmp_path, "once-refuse-setup-room").read()
+    assert records == source
+    assert not [item for item in records if item["body"].startswith("setup:")]
+    assert client.calls == []
+
+
+def test_once_profile_resume_refusal_records_neither_setup_nor_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = SolFableResumeClient()
+    monkeypatch.setattr(module, "HerdrClient", lambda **kwargs: client)
+    monkeypatch.setenv("HERDR_GROUP_CHAT_SETUP_FAILURES", "late setup failure")
+    monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], valid_receipt_json)
+
+    # A closed profile round: the refusal must stay byte-for-byte append-free.
+    closed_source = Transcript(tmp_path, "once-refuse-receipt-source")
+    closed_chat = GroupChat(
+        closed_source,
+        {"sol": "sol-peer", "fable": "fable-peer"},
+        SolFableResumeClient(),
+        synthesizer="sol",
+    )
+    closed_chat.consensus("@fable Profile council")
+    closed_records = closed_source.read()
+
+    code = main(
+        [
+            "--room",
+            "once-refuse-receipt-source",
+            "--state-dir",
+            str(tmp_path),
+            "--profile",
+            "sol-fable",
+            "--agent",
+            "sol=sol-peer",
+            "--agent",
+            "fable=fable-peer",
+            "--once",
+            "/council resume",
+        ]
+    )
+    assert code == 2
+    assert "closed and cannot resume" in capsys.readouterr().err
+    records = Transcript(tmp_path, "once-refuse-receipt-source").read()
+    assert records == closed_records
+    assert not [item for item in records if item["kind"] == namespace["PROFILE_RECEIPT_KIND"]]
+    assert not [item for item in records if item["body"].startswith("setup:")]
+    assert client.calls == []
+
+
+def test_once_profile_resume_records_receipt_before_first_new_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = SolFableResumeClient()
+    monkeypatch.setattr(module, "HerdrClient", lambda **kwargs: client)
+    monkeypatch.setenv("HERDR_GROUP_CHAT_SETUP_FAILURES", "ignored on once-resume")
+    monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], valid_receipt_json)
+
+    checkpoint = profile_resume_records(tmp_path, "once-receipt-resume")
+    replay_records(tmp_path, "once-receipt-resume", checkpoint)
+    code = main(
+        [
+            "--room",
+            "once-receipt-resume",
+            "--state-dir",
+            str(tmp_path),
+            "--profile",
+            "sol-fable",
+            "--agent",
+            "sol=sol-peer",
+            "--agent",
+            "fable=fable-peer",
+            "--once",
+            "/council resume",
+        ]
+    )
+    assert code == 0
+    assert "final from sol-peer" in capsys.readouterr().out
+
+    records = Transcript(tmp_path, "once-receipt-resume").read()
+    receipt = [item for item in records if item["kind"] == namespace["PROFILE_RECEIPT_KIND"]]
+    assert len(receipt) == 1
+    receipt_index = records.index(receipt[0])
+    # The receipt lands after the durable checkpoint and before the first new
+    # model-call attempt.
+    assert receipt_index > max(records.index(item) for item in checkpoint)
+    first_new_attempt = next(
+        item for item in records if item["kind"] == "council_attempt" and item not in checkpoint
+    )
+    assert receipt_index < records.index(first_new_attempt)
+    ledger = derive_council_ledger(records)
+    assert ledger["terminal_outcome"] == "completed"
+    assert ledger["human_acceptance_required"] is True
+    # Setup failures stay silent on the once-resume path even on success.
+    assert not [item for item in records if item["body"].startswith("setup:")]
+
+
+def test_non_resume_once_paths_still_record_setup_failures_and_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = FakeClient()
+    monkeypatch.setattr(module, "HerdrClient", lambda **kwargs: client)
+    monkeypatch.setenv("HERDR_GROUP_CHAT_SETUP_FAILURES", "plain setup failure")
+
+    code = main(
+        [
+            "--room",
+            "plain-once-room",
+            "--state-dir",
+            str(tmp_path),
+            "--once",
+            "@pi plain once message",
+        ]
+    )
+    assert code == 0
+    records = Transcript(tmp_path, "plain-once-room").read()
+    assert [item["body"] for item in records if item["body"].startswith("setup:")] == [
+        "setup: plain setup failure"
+    ]
+
+    # A profile room's non-resume once path still records the startup receipt.
+    monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], valid_receipt_json)
+    profile_client = SolFableResumeClient()
+    monkeypatch.setattr(module, "HerdrClient", lambda **kwargs: profile_client)
+    code = main(
+        [
+            "--room",
+            "plain-once-profile-room",
+            "--state-dir",
+            str(tmp_path),
+            "--profile",
+            "sol-fable",
+            "--agent",
+            "sol=sol-peer",
+            "--agent",
+            "fable=fable-peer",
+            "--once",
+            "hello profile room",
+        ]
+    )
+    assert code == 0
+    profile_records = Transcript(tmp_path, "plain-once-profile-room").read()
+    assert [
+        item["kind"]
+        for item in profile_records
+        if item["kind"] == namespace["PROFILE_RECEIPT_KIND"]
+    ] == [namespace["PROFILE_RECEIPT_KIND"]]
+
+
+def test_resume_council_receipt_unit_refusal_and_success(tmp_path: Path) -> None:
+    source = completed_council_records(tmp_path, "receipt-unit-source")
+    receipt = dict(VALID_RECEIPT)
+
+    # Refusal (closed) records no receipt and appends nothing.
+    closed = replay_records(tmp_path, "receipt-unit-closed", source)
+    before = closed.read()
+    client = ResumeClient()
+    closed_chat = GroupChat(
+        closed,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        client,
+        synthesizer="pi",
+    )
+    with pytest.raises(ChatError, match="closed and cannot resume"):
+        closed_chat.resume_council(make_resume_placeholder(), profile_receipt=receipt)
+    assert closed.read() == before
+    assert client.calls == []
+
+    # Success records the receipt exactly once, after hydration, before dispatch.
+    open_room = replay_records(
+        tmp_path, "receipt-unit-open", [pick_record(source, "review_question")]
+    )
+    open_client = ResumeClient()
+    open_chat = GroupChat(
+        open_room,
+        {"pi": "pi-peer", "claude": "claude-peer", "codex": "codex-peer"},
+        open_client,
+        synthesizer="pi",
+    )
+    open_chat.resume_council(make_resume_placeholder(), profile_receipt=receipt)
+    records = open_room.read()
+    receipts = [item for item in records if item["kind"] == namespace["PROFILE_RECEIPT_KIND"]]
+    assert len(receipts) == 1
+    receipt_index = records.index(receipts[0])
+    first_attempt = next(item for item in records if item["kind"] == "council_attempt")
+    assert receipt_index < records.index(first_attempt)
+    # A second resume of the now-closed round never duplicates the receipt.
+    before_again = open_room.read()
+    with pytest.raises(ChatError, match="closed and cannot resume"):
+        open_chat.resume_council(make_resume_placeholder(), profile_receipt=receipt)
+    assert open_room.read() == before_again

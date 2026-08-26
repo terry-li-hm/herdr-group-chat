@@ -4,6 +4,40 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Add the schema-v2 council attempt journal, recovery ledger, and execution
+  lock: every consensus model call is preceded by a scoped append-only
+  `council_attempt` (unique id, phase, exact agent, prompt SHA-256) and settled
+  atomically with its artifact or failure status by exact id and echoed prompt
+  hash. Strict validation rejects duplicate ids and phase/agent attempts,
+  foreign agents, invalid phases, mismatched hashes, orphan and duplicate
+  settlements, and mismatched artifacts. A room-wide nonblocking council
+  execution flock serializes every schema-v2 run; contention fails without
+  appending. Schema-v2 status/export report `recovery_state` as `resumable`,
+  `unresolved`, or `closed` plus ordered unresolved attempts; a started but
+  unsettled attempt, or a settled failure with no usable artifact, fails closed
+  as unresolved — it is never redispatched and a new council is required.
+  Schema-v1 export stays byte-identical.
+- Add transcript reconstruction and `/council resume`: journal replay of only
+  `(phase, agent)` work with no prior attempt, in order — missing blind
+  reviewers, provisional, missing voters, the deterministic verdict status
+  after all votes are durable, then the final. Completed artifacts are
+  reconstructed byte-identically and never redispatched. The first authoritative
+  read, derivation, roster, and liveness checks run under the execution lock,
+  so every refusal (legacy schema-v1, closed, unresolved, unconfigured or
+  not-live participant, lock contention, cancellation before recovery) appends
+  nothing. The manifest roster and synthesizer override process defaults.
+  `/council resume` is asynchronous in the TUI (rejected while any review is
+  active) and synchronous through `--once '/council resume'`. Recovery stays
+  advisory: the human acceptance gate survives, votes are never retried or
+  superseded, and unexpected post-hydration failures close truthfully with one
+  terminal.
+- Keep the exact `--once '/council resume'` path append-free on every refusal:
+  setup-failure and startup profile-receipt writes are skipped for that path,
+  and the validated profile receipt is recorded (deduplicated) under the
+  council lock only after all checks pass and recovery hydrates, immediately
+  before the first new dispatch. Non-resume once paths and TUI startup behave
+  unchanged.
+
 ## [0.7.0] - 2026-08-26
 
 - Persist a durable council manifest and shared-material hash: every consensus

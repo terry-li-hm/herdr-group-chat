@@ -3251,6 +3251,8 @@ class GroupChat:
         self,
         review: ReviewRound,
         on_state: Callable[[str, str], None] | None = None,
+        *,
+        profile_receipt: Mapping[str, Any] | None = None,
     ) -> ReviewRound:
         """Resume the latest durable council round by checkpoint replay.
 
@@ -3293,6 +3295,11 @@ class GroupChat:
                     )
                 self._hydrate_resume_review(review, ledger, records)
                 review.recovery_pending = False
+            # Recovery is real and every refusal path is behind us: the current
+            # non-secret route receipt is recorded (deduplicated) immediately
+            # before the first new phase dispatch, never before the checks.
+            if profile_receipt is not None:
+                record_profile_receipt(self.transcript, profile_receipt)
             return self._resume_review_round(review, on_state, records, ledger)
 
     def cancel_review(self, review: ReviewRound) -> bool:
@@ -4203,9 +4210,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             synthesizer=synthesizer,
             agent_timeouts=agent_timeouts,
         )
-        record_setup_failures(transcript)
-        if receipt is not None:
-            record_profile_receipt(transcript, receipt)
+        # An exact once-resume must stay append-free on every refusal path, so
+        # it is detected before any launch-time transcript write and skips both
+        # setup-failure and startup receipt records; the validated receipt is
+        # carried into resume_council and recorded only after recovery is real.
+        once_resume = args.once is not None and args.once.strip() == "/council resume"
+        if not once_resume:
+            record_setup_failures(transcript)
+            if receipt is not None:
+                record_profile_receipt(transcript, receipt)
         if args.once is not None:
             before = len(transcript.read())
             if args.once.strip() == "/review" or args.once.strip().startswith("/review "):
@@ -4226,7 +4239,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise ChatError("usage: --once '/consensus [@agents] QUESTION'")
                 chat.consensus(question)
                 created = transcript.read()[before:]
-            elif args.once.strip() == "/council resume":
+            elif once_resume:
                 chat.resume_council(
                     ReviewRound(
                         id="",
@@ -4238,7 +4251,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         states={},
                         mode="consensus",
                         recovery_pending=True,
-                    )
+                    ),
+                    profile_receipt=receipt,
                 )
                 created = transcript.read()[before:]
             else:

@@ -129,6 +129,64 @@ parent, creates the leaf exclusively with mode 0600, fsyncs the complete
 write, and removes a partial leaf on any write error. With no council round
 recorded, status prints a clear message while export fails.
 
+### Resumable councils
+
+Every schema-v2 consensus round (manifest `recovery_protocol:
+checkpoint-replay-v1`) journals a strict, append-only, council-scoped
+`council_attempt` record immediately before each model call: a unique attempt
+id, the phase (`blind`, `provisional`, `vote`, or `final`), the exact agent,
+and the prompt SHA-256. The resulting response, vote, provisional, final, or
+phase-failure status settles that attempt by exact id and echoes the prompt
+hash in the same atomic artifact append. The journal rejects duplicate
+attempt ids, duplicate phase/agent attempts, foreign agents, invalid phases,
+mismatched prompt hashes, settlements without attempts, duplicate
+settlements, and artifacts whose phase or agent do not match.
+
+Schema-v2 status and export report a `recovery_state`:
+
+- `resumable` — the round is not terminal and every journaled attempt is
+  settled with a usable artifact or there is no attempt at all.
+- `unresolved` — an attempt started but never settled, or settled as a
+  failure with no usable artifact. Because the call may have executed,
+  such work fails closed: it is never redispatched, tombstoned, or rolled
+  back, and a new council is required.
+- `closed` — the round reached a terminal outcome (including `completed`);
+  terminal rounds still report any unresolved attempts.
+
+After a process restart, `/council resume` replays the latest durable round
+as journal replay of completed leaf calls, not conversational continuation.
+In the TUI it is asynchronous and is rejected while any review is active;
+`/cancel` before recovery begins appends nothing, and after recovery starts
+cancellation keeps the ordinary consensus semantics. The standalone CLI runs
+the same command synchronously:
+
+```bash
+./herdr-group-chat --once '/council resume'
+```
+
+Resume takes the round id, objective, ordered reviewers, and synthesizer
+only from the validated manifest and transcript — process defaults never
+substitute — and requires every manifest participant name to be configured
+and live. Under the room-wide nonblocking council execution lock it performs
+the first authoritative read, derivation, eligibility, and liveness checks;
+every refusal (legacy schema-v1 round, closed or unresolved round, unknown
+or not-live participant, lock contention, or cancellation before recovery)
+appends nothing. A resumable round is reconstructed exactly — completed
+responses, provisional, and votes keep their byte-identical bodies — and
+resume dispatches only `(phase, agent)` work with no prior attempt, at the
+safe checkpoints: missing blind reviewers, the provisional, missing voters,
+the deterministic verdict status once every vote is durable, then the final.
+A completed call is never redispatched. In a profile room the current
+non-secret route receipt is recorded (deduplicated) immediately before the
+first new dispatch, never on a refusal path. Unexpected post-hydration
+failures close the round truthfully with exactly one terminal status.
+
+Recovery never grants authority: the resumed final synthesis stays advisory,
+the deterministic verdict ledger stays authoritative, and human acceptance
+remains required. Votes are never retried or superseded — an interrupted or
+failed vote requires a new council, and schema-v1 legacy rounds cannot
+resume.
+
 The same surfaces work offline from the standalone CLI, before any agent or
 profile setup:
 
