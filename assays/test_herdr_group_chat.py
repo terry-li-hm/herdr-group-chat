@@ -2911,7 +2911,8 @@ def test_council_manifest_exact_shape_and_hashes() -> None:
     review = make_council_round()
 
     assert council_manifest(review) == {
-        "schema_version": COUNCIL_SCHEMA_VERSION,
+        "schema_version": namespace["COUNCIL_SCHEMA_V2"],
+        "recovery_protocol": namespace["COUNCIL_RECOVERY_PROTOCOL"],
         "round_id": "roundid01",
         "objective_sha256": council_sha256_text(" hashed objective "),
         "reviewers": ["claude", "codex"],
@@ -2920,6 +2921,8 @@ def test_council_manifest_exact_shape_and_hashes() -> None:
         "human_acceptance_required": True,
     }
     assert COUNCIL_SCHEMA_VERSION == 1
+    assert namespace["COUNCIL_SCHEMA_V2"] == 2
+    assert namespace["COUNCIL_RECOVERY_PROTOCOL"] == "checkpoint-replay-v1"
     assert council_canonical_json({"b": 1, "a": "é"}) == '{"a":"é","b":1}'
     assert council_sha256_text("abc") == (
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -3033,11 +3036,23 @@ def test_council_status_derives_completed_unanimous_ledger(tmp_path: Path) -> No
 
     ledger = derive_council_ledger(transcript.read())
     messages = transcript.read()
+    kinds = [item["kind"] for item in messages]
+    # Every model call is now preceded by a scoped council_attempt journal entry.
+    assert kinds.count("council_attempt") == 6
+    assert [kind for kind in kinds if kind != "council_attempt"][-4:] == [
+        "consensus_vote",
+        "consensus_vote",
+        "consensus_status",
+        "consensus_final",
+    ]
     provisional = next(item for item in messages if item["kind"] == "consensus_provisional")
     votes = {item["sender"]: item for item in messages if item["kind"] == "consensus_vote"}
     shared = votes["claude"]["meta"]["shared_material_sha256"]
     assert ledger == {
-        "schema_version": 1,
+        "schema_version": 2,
+        "recovery_protocol": "checkpoint-replay-v1",
+        "recovery_state": "closed",
+        "unresolved_attempts": [],
         "round_id": review.id,
         "objective": "Choose safely",
         "objective_sha256": council_sha256_text("Choose safely"),
@@ -3145,7 +3160,9 @@ def test_council_status_partial_phases(
     assert ledger["unresolved_recovery"] is unresolved
     if phase != "closed":
         assert ledger["terminal_outcome"] is None
-    assert "unresolved recovery" in council_status_message(prefix) if unresolved else True
+    if unresolved:
+        # Schema-v2 wording replaces the legacy recovery label.
+        assert f"recovery: {ledger['recovery_state']}" in council_status_message(prefix)
 
 
 def test_council_status_selects_latest_and_named_round(tmp_path: Path) -> None:
@@ -3166,7 +3183,7 @@ def test_council_status_selects_latest_and_named_round(tmp_path: Path) -> None:
     ["objective", "scope", "shared_hash", "status_verdicts", "status_unanimous"],
 )
 def test_council_status_rejects_tampering(tmp_path: Path, tamper: str) -> None:
-    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), f"tamper-{tamper}-room")
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "tamper-room")
     run_council(chat)
     records = transcript.read()
     if tamper == "objective":
@@ -3449,7 +3466,8 @@ def test_council_rejects_nonreviewer_senders_and_treats_refusal_as_unusable(
         derive_council_ledger([*records, rogue_vote])
 
     # A refusal response without a terminal status keeps the round blind and
-    # unresolved instead of counting as a usable blind response.
+    # unresolved instead of counting as a usable blind response. The v2
+    # journal subset must keep each settled response's attempt record.
     question = next(item for item in records if item["kind"] == "review_question")
     response = next(
         item for item in records if item["kind"] == "review_response" and item["sender"] == "claude"
@@ -3459,7 +3477,12 @@ def test_council_rejects_nonreviewer_senders_and_treats_refusal_as_unusable(
     )
     refused = dict(refused)
     refused["meta"] = {**dict(refused.get("meta", {})), "share_refused": True}
-    ledger = derive_council_ledger([question, response, refused])
+    attempts = [
+        item
+        for item in records
+        if item["kind"] == "council_attempt" and item["seq"] < min(response["seq"], refused["seq"])
+    ]
+    ledger = derive_council_ledger([question, *attempts, response, refused])
     assert ledger["phase"] == "blind"
     assert ledger["unresolved_recovery"] is True
     assert ledger["responses"] == [
@@ -3504,11 +3527,11 @@ def test_council_final_requires_completed_terminal_metadata(tmp_path: Path) -> N
     records = transcript.read()
     final = next(item for item in records if item["kind"] == "consensus_final")
 
-    # Wrong sender.
+    # Wrong sender: the v2 settlement binding rejects the phase/agent mismatch.
     rogue_final = dict(final)
     rogue_final["sender"] = "claude"
     replaced = [rogue_final if item is final else item for item in records]
-    with pytest.raises(ChatError, match="synthesizer"):
+    with pytest.raises(ChatError, match=r"settlement artifact phase or agent mismatch|synthesizer"):
         derive_council_ledger(replaced)
 
     # Missing or non-completed terminal metadata on the final.
@@ -3841,7 +3864,8 @@ def test_consensus_runs_blind_barrier_shared_votes_and_unanimous_final(tmp_path:
 
     messages = transcript.read()
     assert [item["kind"] for item in messages].count("review_response") == 2
-    assert [item["kind"] for item in messages][-4:] == [
+    assert [item["kind"] for item in messages].count("council_attempt") == 6
+    assert [item["kind"] for item in messages if item["kind"] != "council_attempt"][-4:] == [
         "consensus_vote",
         "consensus_vote",
         "consensus_status",
@@ -4506,6 +4530,314 @@ def test_once_consensus_runs_synchronously_through_group_chat(
     )
     assert code == 0
     assert recorded["text"] == "@pi,@claude decide once"
+
+
+# --- wave-1 resumable council foundations -------------------------------------------------
+
+
+def council_attempt_records(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [item for item in records if item["kind"] == "council_attempt"]
+
+
+def test_council_attempt_journal_settles_every_schema_v2_model_call(tmp_path: Path) -> None:
+    client = ConsensusClient()
+    chat, transcript = make_consensus_chat(tmp_path, client, "journal-settle-room")
+    run_council(chat)
+
+    records = transcript.read()
+    attempts = council_attempt_records(records)
+    assert len(attempts) == 6
+    assert {item["meta"]["phase"] for item in attempts} == {"blind", "provisional", "vote", "final"}
+    assert {item["meta"]["agent"] for item in attempts} == {"claude", "codex", "pi"}
+    # Every attempt is unique by id and by phase/agent.
+    ids = [item["meta"]["attempt_id"] for item in attempts]
+    assert len(set(ids)) == 6
+    assert len({(item["meta"]["phase"], item["meta"]["agent"]) for item in attempts}) == 6
+    # Each attempt hashes the exact prompt that was dispatched to its agent.
+    prompt_hashes = {council_sha256_text(prompt) for _, prompt in client.calls}
+    assert all(item["meta"]["prompt_sha256"] in prompt_hashes for item in attempts)
+
+    settled: dict[str, dict[str, object]] = {}
+    for item in records:
+        meta = item.get("meta", {})
+        settlement = meta.get("council_attempt_settlement")
+        if settlement is not None:
+            assert settlement["attempt_id"] not in settled
+            settled[settlement["attempt_id"]] = item
+    assert set(settled) == set(ids)
+    by_id = {item["meta"]["attempt_id"]: item for item in attempts}
+    for attempt_id, artifact in settled.items():
+        assert (
+            artifact["meta"]["council_attempt_settlement"]["prompt_sha256"]
+            == by_id[attempt_id]["meta"]["prompt_sha256"]
+        )
+
+    ledger = derive_council_ledger(records)
+    assert ledger["schema_version"] == 2
+    assert ledger["recovery_protocol"] == "checkpoint-replay-v1"
+    assert ledger["recovery_state"] == "closed"
+    assert ledger["unresolved_attempts"] == []
+    assert ledger["unresolved_recovery"] is False
+    assert "recovery: closed" in council_status_message(records)
+
+
+def test_council_every_crash_checkpoint_derives_and_started_never_settles(
+    tmp_path: Path,
+) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "crash-prefix-room")
+    run_council(chat)
+    records = transcript.read()
+
+    # Deterministic crash at every append boundary still derives a valid ledger.
+    states = []
+    for cut in range(1, len(records) + 1):
+        ledger = derive_council_ledger(records[:cut])
+        states.append((ledger["phase"], ledger["recovery_state"]))
+    assert states[-1] == ("closed", "closed")
+
+    # Cut immediately after a started blind attempt, before its response: the
+    # attempt stays started, is reported unresolved, and is never settled.
+    first_attempt = next(
+        index for index, item in enumerate(records) if item["kind"] == "council_attempt"
+    )
+    ledger = derive_council_ledger(records[: first_attempt + 1])
+    assert ledger["recovery_state"] == "unresolved"
+    assert ledger["unresolved_attempts"] == [
+        {
+            "attempt_id": records[first_attempt]["meta"]["attempt_id"],
+            "phase": "blind",
+            "agent": records[first_attempt]["meta"]["agent"],
+            "state": "started",
+        }
+    ]
+    assert ledger["unresolved_recovery"] is False  # prepared phase stays legacy-calm
+    assert "recovery: unresolved" in council_status_message(records[: first_attempt + 1])
+    assert "unresolved attempts: 1" in council_status_message(records[: first_attempt + 1])
+
+    # A settled failure with no usable artifact also fails closed unresolved.
+    failing = ConsensusClient(blind_replies={"claude-peer": "", "codex-peer": "ok"})
+    chat2, transcript2 = make_consensus_chat(tmp_path, failing, "crash-fail-room")
+    run_council(chat2)
+    failed = derive_council_ledger(transcript2.read())
+    assert failed["recovery_state"] == "closed"
+    assert failed["unresolved_attempts"] == [
+        {"attempt_id": item["attempt_id"], "phase": "blind", "agent": "claude", "state": "failed"}
+        for item in failed["unresolved_attempts"]
+    ]
+    assert all(item["state"] == "failed" for item in failed["unresolved_attempts"])
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "duplicate_id",
+        "duplicate_phase_agent",
+        "foreign_agent",
+        "invalid_phase",
+        "settlement_without_attempt",
+        "duplicate_settlement",
+        "hash_mismatch",
+        "artifact_without_settlement",
+        "artifact_phase_mismatch",
+    ],
+)
+def test_council_tampered_attempt_journal_fails(tmp_path: Path, tamper: str) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "tamper-room")
+    run_council(chat)
+    records = transcript.read()
+    attempts = council_attempt_records(records)
+    attempt = next(item for item in attempts if item["meta"]["phase"] == "blind")
+
+    def clone(item: dict[str, object]) -> dict[str, object]:
+        duplicate = dict(item)
+        duplicate["meta"] = dict(item["meta"])
+        return duplicate
+
+    def settlement_of(item: dict[str, object]) -> dict[str, object]:
+        return item["meta"]["council_attempt_settlement"]
+
+    if tamper == "duplicate_id":
+        extra = clone(attempt)
+        extra["seq"] = 9300
+        records = [*records, extra]
+    elif tamper == "duplicate_phase_agent":
+        extra = clone(attempt)
+        extra["meta"]["attempt_id"] = "fresh-id-0001"
+        extra["seq"] = 9301
+        records.append(extra)
+    elif tamper == "foreign_agent":
+        rogue = clone(attempt)
+        rogue["meta"]["agent"] = "grok"
+        records = [rogue if item is attempt else item for item in records]
+    elif tamper == "invalid_phase":
+        rogue = clone(attempt)
+        rogue["meta"]["phase"] = "ratify"
+        records = [rogue if item is attempt else item for item in records]
+    elif tamper == "settlement_without_attempt":
+        records = [item for item in records if item is not attempt]
+    elif tamper == "duplicate_settlement":
+        response = next(
+            item
+            for item in records
+            if item["kind"] == "review_response" and item["sender"] == attempt["meta"]["agent"]
+        )
+        echo = {
+            "seq": 9302,
+            "at": "2026-08-26T00:00:00+00:00",
+            "sender": "system",
+            "recipients": ["human"],
+            "body": "duplicate settlement echo",
+            "kind": "review_status",
+            "round_id": response["round_id"],
+            "meta": {
+                "council_participants": response["meta"]["council_participants"],
+                "council_attempt_settlement": settlement_of(response),
+            },
+        }
+        records = [*records, echo]
+    elif tamper == "hash_mismatch":
+        response = next(
+            item
+            for item in records
+            if item["kind"] == "review_response" and item["sender"] == attempt["meta"]["agent"]
+        )
+        rogue = clone(response)
+        rogue["meta"]["council_attempt_settlement"] = {
+            **settlement_of(response),
+            "prompt_sha256": "0" * 64,
+        }
+        records = [rogue if item is response else item for item in records]
+    elif tamper == "artifact_without_settlement":
+        vote = next(item for item in records if item["kind"] == "consensus_vote")
+        rogue = clone(vote)
+        del rogue["meta"]["council_attempt_settlement"]
+        records = [rogue if item is vote else item for item in records]
+    else:
+        vote = next(item for item in records if item["kind"] == "consensus_vote")
+        provisional_attempt = next(
+            item for item in attempts if item["meta"]["phase"] == "provisional"
+        )
+        rogue = clone(vote)
+        rogue["meta"]["council_attempt_settlement"] = {
+            "attempt_id": provisional_attempt["meta"]["attempt_id"],
+            "prompt_sha256": provisional_attempt["meta"]["prompt_sha256"],
+        }
+        records = [rogue if item is vote else item for item in records]
+
+    with pytest.raises(ChatError, match=r"council attempt|settlement"):
+        derive_council_ledger(records)
+
+
+def test_council_schema_v1_synthetic_ledger_and_export_stay_exact(tmp_path: Path) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "legacy-v1-room")
+    run_council(chat)
+    records = transcript.read()
+
+    # Downgrade to a synthetic schema-v1 round: manifest without recovery
+    # protocol, no attempt records, and no settlement metadata anywhere.
+    legacy = []
+    for item in records:
+        duplicate = dict(item)
+        meta = dict(item.get("meta", {}))
+        manifest = meta.get("council_manifest")
+        if manifest is not None:
+            manifest = dict(manifest)
+            manifest["schema_version"] = 1
+            del manifest["recovery_protocol"]
+            meta["council_manifest"] = manifest
+        meta.pop("council_attempt_settlement", None)
+        duplicate["meta"] = meta
+        if duplicate["kind"] != "council_attempt":
+            legacy.append(duplicate)
+
+    ledger = derive_council_ledger(legacy)
+    assert ledger["schema_version"] == 1
+    assert set(ledger) == {
+        "schema_version",
+        "round_id",
+        "objective",
+        "objective_sha256",
+        "reviewers",
+        "synthesizer",
+        "participants",
+        "phase",
+        "responses",
+        "provisional",
+        "votes",
+        "verdicts",
+        "unanimous",
+        "terminal_outcome",
+        "terminal_detail",
+        "human_acceptance_required",
+        "unresolved_recovery",
+    }
+    assert ledger["phase"] == "closed"
+    assert ledger["unresolved_recovery"] is False
+    status = council_status_message(legacy)
+    assert "recovery:" not in status
+
+    target = tmp_path / "legacy-export.json"
+    assert export_council_ledger(legacy, target) == target
+    exported = json.loads(target.read_text())
+    assert exported == ledger
+
+
+def test_council_execution_lock_contention_fails_without_appending(tmp_path: Path) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "lock-contention-room")
+
+    # Reentrancy on the owning thread stays cooperative.
+    with transcript.council_execution_lock(), transcript.council_execution_lock():
+        pass
+
+    errors: list[Exception] = []
+
+    def contender() -> None:
+        try:
+            chat.consensus("@claude,@codex contended")
+        except ChatError as error:
+            errors.append(error)
+
+    with transcript.council_execution_lock():
+        thread = threading.Thread(target=contender)
+        thread.start()
+        thread.join(10)
+    assert len(errors) == 1
+    assert "another council execution" in str(errors[0])
+    # Contention appended nothing: no question, no attempt, no round at all.
+    assert transcript.read() == []
+
+
+def council_lock_holder(state_dir: str, room: str, start: object, release: object) -> None:
+    transcript = Transcript(Path(state_dir), room)
+    with transcript.council_execution_lock():
+        start.set()
+        assert release.wait(30)
+
+
+def test_council_cross_process_lock_loser_appends_nothing(tmp_path: Path) -> None:
+    start = multiprocessing.Event()
+    release = multiprocessing.Event()
+    holder = multiprocessing.get_context("fork").Process(
+        target=council_lock_holder,
+        args=(str(tmp_path), "cross-lock-room", start, release),
+    )
+    holder.start()
+    assert start.wait(10)
+
+    client = ConsensusClient()
+    chat, transcript = make_consensus_chat(tmp_path, client, "cross-lock-room")
+    with pytest.raises(ChatError, match="another council execution"):
+        chat.consensus("@claude,@codex cross process")
+    # The loser dispatched no model call and appended no record at all.
+    assert client.calls == []
+    assert transcript.read() == []
+
+    release.set()
+    holder.join(10)
+    assert holder.exitcode == 0
+    # With the lock released the same process can run a council.
+    chat.consensus("@claude,@codex after release")
+    assert council_attempt_records(transcript.read())
 
 
 # --- bounded sol-fable model profile -------------------------------------------------
