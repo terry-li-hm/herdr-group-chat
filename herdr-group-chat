@@ -24,7 +24,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from fcntl import LOCK_EX, LOCK_UN, flock
+from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import quote
@@ -49,6 +49,8 @@ PROFILE_SYNTHESIZER = {"sol-fable": "sol", "sol-fable-grok": "sol"}
 PROFILE_RECEIPT_KIND = "profile_receipt"
 PROFILE_RECEIPT_ENV = "HERDR_GROUP_CHAT_PROFILE_RECEIPT"
 COUNCIL_SCHEMA_VERSION = 1
+COUNCIL_SCHEMA_V2 = 2
+COUNCIL_RECOVERY_PROTOCOL = "checkpoint-replay-v1"
 DEFAULT_STATE_DIR = Path("~/.local/state/herdr-group-chat")
 ROOM_ENV = "HERDR_GROUP_CHAT_ROOM"
 AGENTS_WORKSPACE_ENV = "HERDR_GROUP_CHAT_AGENTS_WORKSPACE_ID"
@@ -128,6 +130,7 @@ class ReviewRound:
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     attempt_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    pending_attempts: dict[tuple[str, str], dict[str, str]] = field(default_factory=dict)
 
 
 def utc_now() -> str:
@@ -225,6 +228,9 @@ class Transcript:
                 os.close(directory_descriptor)
         self.path = self.state_dir / f"{room}.jsonl"
         self.lock_path = self.state_dir / f"{room}.lock"
+        self.council_lock_path = self.state_dir / f"{room}.council.lock"
+        self._council_lock_depth = 0
+        self._council_lock_owner: int | None = None
         self.cursor_path = self.state_dir / f"{room}.state.json"
         self.delivery_lock_path = self.state_dir / f"{room}.delivery.lock"
 
@@ -348,6 +354,53 @@ class Transcript:
                 yield
             finally:
                 flock(stream.fileno(), LOCK_UN)
+
+    @contextmanager
+    def council_execution_lock(self) -> Iterator[None]:
+        """Room-wide nonblocking council execution lock.
+
+        Contention fails fast without any transcript append. The lock is
+        always taken before any transcript authority inside a council run, so
+        the lock order is council-then-transcript.
+        """
+        current = threading.get_ident()
+        with self._lock:
+            reentrant = self._council_lock_owner == current
+            if reentrant:
+                self._council_lock_depth += 1
+        if reentrant:
+            try:
+                yield
+            finally:
+                with self._lock:
+                    self._council_lock_depth -= 1
+            return
+        descriptor = self._open_regular(self.council_lock_path, os.O_RDWR | os.O_CREAT)
+        stream = os.fdopen(descriptor, "a+b")
+        try:
+            try:
+                flock(stream.fileno(), LOCK_EX | LOCK_NB)
+            except OSError as error:
+                raise ChatError(
+                    "another council execution is already running in this room"
+                ) from error
+            with self._lock:
+                if self._council_lock_owner is not None:
+                    # Another thread won the OS flock first; this thread is a
+                    # distinct contender within one process.
+                    flock(stream.fileno(), LOCK_UN)
+                    raise ChatError("another council execution is already running in this room")
+                self._council_lock_owner = threading.get_ident()
+                self._council_lock_depth = 1
+            try:
+                yield
+            finally:
+                with self._lock:
+                    self._council_lock_depth = 0
+                    self._council_lock_owner = None
+                flock(stream.fileno(), LOCK_UN)
+        finally:
+            stream.close()
 
     @contextmanager
     def _process_lock(self) -> Iterator[None]:
@@ -1044,7 +1097,8 @@ def council_sha256_text(text: str) -> str:
 def council_manifest(review: ReviewRound) -> dict[str, Any]:
     """Deterministic manifest describing the council round itself."""
     return {
-        "schema_version": COUNCIL_SCHEMA_VERSION,
+        "schema_version": COUNCIL_SCHEMA_V2,
+        "recovery_protocol": COUNCIL_RECOVERY_PROTOCOL,
         "round_id": review.id,
         "objective_sha256": council_sha256_text(review.question),
         "reviewers": list(review.reviewers),
@@ -1088,6 +1142,16 @@ COUNCIL_PROVISIONAL_KIND = "consensus_provisional"
 COUNCIL_VOTE_KIND = "consensus_vote"
 COUNCIL_STATUS_KIND = "consensus_status"
 COUNCIL_FINAL_KIND = "consensus_final"
+COUNCIL_ATTEMPT_KIND = "council_attempt"
+COUNCIL_ATTEMPT_PHASES = frozenset({"blind", "provisional", "vote", "final"})
+COUNCIL_ATTEMPT_SETTLEMENT_KEY = "council_attempt_settlement"
+# Map of artifact kinds to the model-call phase whose attempt they settle.
+COUNCIL_KIND_PHASES = {
+    "review_response": "blind",
+    "consensus_provisional": "provisional",
+    "consensus_vote": "vote",
+    "consensus_final": "final",
+}
 COUNCIL_VALID_VOTE_VERDICTS = frozenset({"PASS", "REVISE", "INVALID"})
 
 
@@ -1172,12 +1236,21 @@ def derive_council_ledger(
         "participants",
         "human_acceptance_required",
     }
+    if manifest["schema_version"] == COUNCIL_SCHEMA_V2:
+        expected_keys = expected_keys | {"recovery_protocol"}
     if set(manifest) != expected_keys:
         raise ChatError(f"council manifest for round {selected_id} has unexpected shape")
-    if manifest["schema_version"] != COUNCIL_SCHEMA_VERSION:
+    if manifest["schema_version"] not in (COUNCIL_SCHEMA_VERSION, COUNCIL_SCHEMA_V2):
         raise ChatError(
             f"council manifest schema {manifest['schema_version']!r} is not "
-            f"{COUNCIL_SCHEMA_VERSION}"
+            f"{COUNCIL_SCHEMA_VERSION} or {COUNCIL_SCHEMA_V2}"
+        )
+    if manifest["schema_version"] == COUNCIL_SCHEMA_V2 and (
+        manifest["recovery_protocol"] != COUNCIL_RECOVERY_PROTOCOL
+    ):
+        raise ChatError(
+            f"council manifest recovery protocol {manifest['recovery_protocol']!r} is not "
+            f"{COUNCIL_RECOVERY_PROTOCOL}"
         )
     if manifest["round_id"] != selected_id:
         raise ChatError("council manifest round id does not match its transcript round")
@@ -1209,6 +1282,20 @@ def derive_council_ledger(
     votes = _council_scoped(records, selected_id, COUNCIL_VOTE_KIND, participants)
     statuses = _council_scoped(records, selected_id, COUNCIL_STATUS_KIND, participants)
     finals = _council_scoped(records, selected_id, COUNCIL_FINAL_KIND, participants)
+    schema_version = manifest["schema_version"]
+    if schema_version == COUNCIL_SCHEMA_VERSION:
+        # A legacy schema-v1 round never carries attempt journal records; their
+        # presence next to v1 authority is foreign material and fails loudly.
+        if any(
+            item.get("kind") == COUNCIL_ATTEMPT_KIND and item.get("round_id") == selected_id
+            for item in records
+        ):
+            raise ChatError(f"schema-v1 council round {selected_id} carries attempt records")
+        attempts: list[dict[str, Any]] = []
+    else:
+        attempts = _council_scoped(records, selected_id, COUNCIL_ATTEMPT_KIND, participants)
+    # Failure settlements land on round-scoped review_status records.
+    phase_statuses = _council_scoped(records, selected_id, "review_status", participants)
     if len(provisionals) > 1:
         raise ChatError(f"multiple provisional syntheses for round {selected_id}")
     if len(finals) > 1:
@@ -1249,6 +1336,87 @@ def derive_council_ledger(
         vote_by_reviewer[reviewer] = item
     if len(shared_hashes) > 1:
         raise ChatError("council votes disagree about the shared-material hash")
+
+    # Schema-v2 attempt journal: strict, append-only, council-scoped. Every
+    # attempt must be unique by id and by phase/agent, name a manifest
+    # participant allowed for its phase, and carry a valid prompt hash. Every
+    # settlement must reference exactly one unsettled attempt, echo its prompt
+    # hash, and land on an artifact or status whose phase and agent match.
+    settled_by_id: dict[str, dict[str, Any]] = {}
+    attempt_by_id: dict[str, dict[str, Any]] = {}
+    attempt_by_phase_agent: set[tuple[str, str]] = set()
+
+    def _valid_hash_str(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value)
+        )
+
+    for item in attempts:
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else None
+        if meta is None:
+            raise ChatError(f"council attempt seq {item.get('seq')} lacks structured metadata")
+        attempt_id = meta.get("attempt_id")
+        phase = meta.get("phase")
+        agent = meta.get("agent")
+        prompt_hash = meta.get("prompt_sha256")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise ChatError(f"council attempt seq {item.get('seq')} lacks an attempt id")
+        if phase not in COUNCIL_ATTEMPT_PHASES:
+            raise ChatError(f"council attempt {attempt_id} has invalid phase {phase!r}")
+        allowed_agents = reviewers if phase in {"blind", "vote"} else [synthesizer]
+        if agent not in allowed_agents:
+            raise ChatError(f"council attempt {attempt_id} names foreign agent {agent!r}")
+        if attempt_id in attempt_by_id:
+            raise ChatError(f"duplicate council attempt id {attempt_id}")
+        if (phase, agent) in attempt_by_phase_agent:
+            raise ChatError(f"duplicate council attempt for phase {phase} agent {agent!r}")
+        if not _valid_hash_str(prompt_hash):
+            raise ChatError(f"council attempt {attempt_id} lacks a valid prompt hash")
+        attempt_by_id[attempt_id] = item
+        attempt_by_phase_agent.add((phase, agent))
+
+    for item in [*responses, *provisionals, *votes, *statuses, *finals, *phase_statuses]:
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        settlement = meta.get(COUNCIL_ATTEMPT_SETTLEMENT_KEY)
+        if settlement is None:
+            if schema_version == COUNCIL_SCHEMA_V2 and item.get("kind") in COUNCIL_KIND_PHASES:
+                raise ChatError(
+                    f"{item.get('kind')} seq {item.get('seq')} lacks a council attempt settlement"
+                )
+            continue
+        if (
+            not isinstance(settlement, dict)
+            or set(settlement) != {"attempt_id", "prompt_sha256"}
+            or not isinstance(settlement.get("attempt_id"), str)
+            or not _valid_hash_str(settlement.get("prompt_sha256"))
+        ):
+            raise ChatError(
+                f"{item.get('kind')} seq {item.get('seq')} carries a malformed attempt settlement"
+            )
+        attempt = attempt_by_id.get(settlement["attempt_id"])
+        if attempt is None:
+            raise ChatError(
+                f"{item.get('kind')} seq {item.get('seq')} settles an unknown council attempt"
+            )
+        attempt_id = settlement["attempt_id"]
+        if attempt_id in settled_by_id:
+            raise ChatError(f"duplicate settlement for council attempt {attempt_id}")
+        attempt_meta = attempt["meta"]
+        if settlement["prompt_sha256"] != attempt_meta["prompt_sha256"]:
+            raise ChatError(f"council attempt {attempt_id} settlement prompt hash is mismatched")
+        kind = item.get("kind")
+        if kind in COUNCIL_KIND_PHASES:
+            if COUNCIL_KIND_PHASES[kind] != attempt_meta["phase"] or (
+                item.get("sender") != attempt_meta["agent"]
+            ):
+                raise ChatError(
+                    f"council attempt {attempt_id} settlement artifact phase or agent mismatch"
+                )
+        elif kind != "review_status":
+            raise ChatError(f"{kind} seq {item.get('seq')} carries an unexpected settlement")
+        settled_by_id[attempt_id] = item
 
     # Recompute the authoritative shared-material hash from the exact stored
     # bodies so body tampering is detected even when every persisted hash stays
@@ -1423,8 +1591,38 @@ def derive_council_ledger(
         terminal_detail = None
 
     provisional = provisionals[-1] if provisionals else None
-    return {
-        "schema_version": COUNCIL_SCHEMA_VERSION,
+    unresolved_attempts: list[dict[str, Any]] = []
+    for item in attempts:
+        attempt_meta = item["meta"]
+        attempt_id = attempt_meta["attempt_id"]
+        settling = settled_by_id.get(attempt_id)
+        if settling is None:
+            state = "started"
+        elif settling.get("kind") == "review_status":
+            state = "failed"
+        elif (
+            isinstance(settling.get("meta"), dict) and settling["meta"].get("share_refused") is True
+        ):
+            state = "refused"
+        else:
+            continue
+        unresolved_attempts.append(
+            {
+                "attempt_id": attempt_id,
+                "phase": attempt_meta["phase"],
+                "agent": attempt_meta["agent"],
+                "state": state,
+            }
+        )
+    terminal = terminal_status is not None or final is not None
+    if terminal:
+        recovery_state = "closed"
+    elif unresolved_attempts:
+        recovery_state = "unresolved"
+    else:
+        recovery_state = "resumable"
+    ledger: dict[str, Any] = {
+        "schema_version": schema_version,
         "round_id": selected_id,
         "objective": objective,
         "objective_sha256": manifest["objective_sha256"],
@@ -1469,6 +1667,11 @@ def derive_council_ledger(
         "human_acceptance_required": True,
         "unresolved_recovery": unresolved_recovery,
     }
+    if schema_version == COUNCIL_SCHEMA_V2:
+        ledger["recovery_protocol"] = manifest["recovery_protocol"]
+        ledger["recovery_state"] = recovery_state
+        ledger["unresolved_attempts"] = unresolved_attempts
+    return ledger
 
 
 def council_status_message(records: Sequence[Mapping[str, Any]]) -> str:
@@ -1486,7 +1689,13 @@ def council_status_message(records: Sequence[Mapping[str, Any]]) -> str:
     )
     if ledger["terminal_outcome"] is not None:
         line += f" · terminal: {ledger['terminal_outcome']}"
-    if ledger["unresolved_recovery"]:
+    if ledger["schema_version"] == COUNCIL_SCHEMA_V2:
+        # Schema-v2 wording replaces the legacy unresolved-recovery label
+        # without duplicating it.
+        line += f" · recovery: {ledger['recovery_state']}"
+        if ledger["unresolved_attempts"]:
+            line += f" · unresolved attempts: {len(ledger['unresolved_attempts'])}"
+    elif ledger["unresolved_recovery"]:
         line += " · unresolved recovery"
     line += " · human acceptance required"
     return line
@@ -1927,7 +2136,10 @@ class GroupChat:
         text: str,
         on_state: Callable[[str, str], None] | None = None,
     ) -> ReviewRound:
-        return self.execute_review(self.plan_consensus(text), on_state)
+        # The room-wide council lock is taken before planning so contention
+        # fails before any transcript authority is touched.
+        with self.transcript.council_execution_lock():
+            return self.execute_review(self.plan_consensus(text), on_state)
 
     def prepare_review(self, text: str) -> ReviewRound:
         review = self.plan_review(text)
@@ -1942,12 +2154,55 @@ class GroupChat:
     ) -> tuple[str, str]:
         if not self._begin_review_call(review, agent, "working", on_state):
             raise ChatError("review cancelled")
+        if review.mode == "consensus":
+            self._start_council_attempt(review, "blind", agent, review.prompts[agent])
         return self.client.turn(
             self.agents[agent],
             review.prompts[agent],
             self._timeout_for(agent),
             review.cancel_event,
         )
+
+    def _start_council_attempt(
+        self,
+        review: ReviewRound,
+        phase: str,
+        agent: str,
+        prompt: str,
+    ) -> dict[str, str]:
+        """Journal one scoped model-call attempt immediately before dispatch."""
+        settlement = {
+            "attempt_id": uuid.uuid4().hex,
+            "prompt_sha256": council_sha256_text(prompt),
+        }
+        self.transcript.append(
+            "system",
+            ("human",),
+            f"council {phase} attempt for @{agent} started",
+            kind=COUNCIL_ATTEMPT_KIND,
+            round_id=review.id,
+            meta=consensus_item_meta(
+                review,
+                {
+                    "attempt_id": settlement["attempt_id"],
+                    "phase": phase,
+                    "agent": agent,
+                    "prompt_sha256": settlement["prompt_sha256"],
+                },
+            ),
+        )
+        with review.lock:
+            review.pending_attempts[(phase, agent)] = settlement
+        return settlement
+
+    def _settle_council_attempt(
+        self,
+        review: ReviewRound,
+        phase: str,
+        agent: str,
+    ) -> dict[str, str] | None:
+        with review.lock:
+            return review.pending_attempts.pop((phase, agent), None)
 
     def _commit_review_phase(
         self,
@@ -1962,6 +2217,7 @@ class GroupChat:
         store_synthesis: bool = False,
         message_meta: Mapping[str, Any] | None = None,
         consensus_vote: tuple[str, str] | None = None,
+        settle_attempt: Mapping[str, str] | None = None,
         terminal_outcome: str | None = None,
         terminal_detail: str | None = None,
     ) -> bool:
@@ -1981,6 +2237,10 @@ class GroupChat:
                         if review.mode == "consensus"
                         else message_meta
                     )
+                    if settle_attempt is not None:
+                        merged_meta = dict(stored_meta or {})
+                        merged_meta[COUNCIL_ATTEMPT_SETTLEMENT_KEY] = dict(settle_attempt)
+                        stored_meta = merged_meta
                     self.transcript.append(
                         sender,
                         recipients,
@@ -2015,6 +2275,11 @@ class GroupChat:
         future: Future[tuple[str, str]],
         on_state: Callable[[str, str], None] | None,
     ) -> None:
+        settlement = (
+            self._settle_council_attempt(review, "blind", agent)
+            if review.mode == "consensus"
+            else None
+        )
         try:
             status, reply = future.result()
         except ChatError as error:
@@ -2031,6 +2296,7 @@ class GroupChat:
                     "review_status",
                     False,
                 ),
+                settle_attempt=settlement,
             )
             return
         except Exception as error:
@@ -2051,6 +2317,7 @@ class GroupChat:
                     "review_status",
                     False,
                 ),
+                settle_attempt=settlement,
             )
             return
         if status == "blocked":
@@ -2066,6 +2333,7 @@ class GroupChat:
                     "review_status",
                     False,
                 ),
+                settle_attempt=settlement,
             )
             return
         if review.mode == "consensus" and consensus_share_refused(reply):
@@ -2082,6 +2350,7 @@ class GroupChat:
                     False,
                 ),
                 message_meta={"share_refused": True},
+                settle_attempt=settlement,
             )
             return
         if review.mode == "consensus" and not reply.strip():
@@ -2097,6 +2366,7 @@ class GroupChat:
                     "review_status",
                     False,
                 ),
+                settle_attempt=settlement,
             )
             return
         self._commit_review_phase(
@@ -2107,6 +2377,7 @@ class GroupChat:
             message=(agent, ("human", "all"), reply, "review_response", False),
             reply=reply,
             store_response=True,
+            settle_attempt=settlement,
         )
 
     def _synthesize_review(
@@ -2179,6 +2450,9 @@ class GroupChat:
         """Run one single-participant phase (synthesis, challenge, or final) to completion."""
         if not begun and not self._begin_review_call(review, agent, state, on_state):
             return None
+        pending: Mapping[str, str] | None = None
+        if review.mode == "consensus" and kind in COUNCIL_KIND_PHASES:
+            pending = self._start_council_attempt(review, COUNCIL_KIND_PHASES[kind], agent, prompt)
         try:
             status, reply = self.client.turn(
                 self.agents[agent], prompt, self._timeout_for(agent), review.cancel_event
@@ -2197,6 +2471,7 @@ class GroupChat:
                     "review_status",
                     False,
                 ),
+                settle_attempt=pending,
             )
             return None
         except Exception as error:
@@ -2212,6 +2487,7 @@ class GroupChat:
                     "review_status",
                     False,
                 ),
+                settle_attempt=pending,
             )
             return None
         if status == "blocked":
@@ -2227,6 +2503,7 @@ class GroupChat:
                     "review_status",
                     False,
                 ),
+                settle_attempt=pending,
             )
             return None
         if require_nonempty and not reply.strip():
@@ -2242,6 +2519,7 @@ class GroupChat:
                     "review_status",
                     False,
                 ),
+                settle_attempt=pending,
             )
             return None
         committed = self._commit_review_phase(
@@ -2253,6 +2531,7 @@ class GroupChat:
             reply=reply,
             store_synthesis=store_synthesis,
             message_meta=message_meta,
+            settle_attempt=pending,
             terminal_outcome=terminal_outcome,
             terminal_detail=terminal_detail,
         )
@@ -2353,6 +2632,7 @@ class GroupChat:
     ) -> tuple[str, str]:
         if not self._begin_review_call(review, agent, "voting", on_state):
             raise ChatError("review cancelled")
+        self._start_council_attempt(review, "vote", agent, prompt)
         return self.client.turn(
             self.agents[agent], prompt, self._timeout_for(agent), review.cancel_event
         )
@@ -2364,6 +2644,7 @@ class GroupChat:
         future: Future[tuple[str, str]],
         on_state: Callable[[str, str], None] | None,
     ) -> None:
+        settlement = self._settle_council_attempt(review, "vote", agent)
         try:
             status, reply = future.result()
         except ChatError as error:
@@ -2380,6 +2661,7 @@ class GroupChat:
                     "review_status",
                     False,
                 ),
+                settle_attempt=settlement,
             )
             return
         except Exception as error:
@@ -2395,6 +2677,7 @@ class GroupChat:
                     "review_status",
                     False,
                 ),
+                settle_attempt=settlement,
             )
             return
         if status == "blocked":
@@ -2410,6 +2693,7 @@ class GroupChat:
                     "review_status",
                     False,
                 ),
+                settle_attempt=settlement,
             )
             return
         parsed = parse_consensus_verdict(reply)
@@ -2427,6 +2711,7 @@ class GroupChat:
             message=(agent, ("human", "all"), reply, "consensus_vote", False),
             message_meta=vote_meta,
             consensus_vote=(reply, verdict),
+            settle_attempt=settlement,
         )
 
     @staticmethod
@@ -2587,6 +2872,16 @@ class GroupChat:
             review.attempt_lock.release()
 
     def execute_review(
+        self,
+        review: ReviewRound,
+        on_state: Callable[[str, str], None] | None = None,
+    ) -> ReviewRound:
+        if review.mode == "consensus":
+            with self.transcript.council_execution_lock():
+                return self._execute_review_round(review, on_state)
+        return self._execute_review_round(review, on_state)
+
+    def _execute_review_round(
         self,
         review: ReviewRound,
         on_state: Callable[[str, str], None] | None = None,
