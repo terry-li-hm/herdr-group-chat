@@ -2221,9 +2221,13 @@ class GroupChat:
         active state for the phase, dispatch began and the missing settlement
         is a lost journal entry that must fail closed even under cancellation
         or a terminal outcome, before any artifact append could produce an
-        invalid schema-v2 ledger.
+        invalid schema-v2 ledger. An unknown phase is a caller bug that must
+        fail closed before any state inspection, mutation of
+        `pending_attempts`, or artifact append.
         """
-        active_state = _COUNCIL_ACTIVE_STATES.get(phase, phase)
+        if phase not in _COUNCIL_ACTIVE_STATES:
+            raise ChatError(f"council {phase} settlement for @{agent} has unknown phase")
+        active_state = _COUNCIL_ACTIVE_STATES[phase]
         with review.lock:
             settlement = review.pending_attempts.pop((phase, agent), None)
             if settlement is not None:

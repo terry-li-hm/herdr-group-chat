@@ -6627,6 +6627,28 @@ def test_council_settlement_cancellation_and_terminal_paths_stay_silent(
         chat._settle_council_attempt(active_terminal, "vote", "codex")
     assert transcript.read() == before
 
+
+def test_council_settlement_unknown_phase_fails_closed_before_pop(
+    tmp_path: Path,
+) -> None:
+    chat, transcript = make_consensus_chat(tmp_path, ConsensusClient(), "settle-unknown-phase")
+    review = chat.plan_consensus("@claude,@codex Unknown phase")
+    review.question_seq = 1
+    review.cancel_event.set()
+    review.terminal_outcome = "no_consensus"
+    sentinel = {"attempt_id": "keep-me", "prompt_sha256": "sha"}
+    review.pending_attempts[("vote", "claude")] = sentinel
+    before = transcript.read()
+
+    # An unknown phase raises even under cancellation and terminal, and never
+    # touches pending_attempts: a canonical same-key settlement survives.
+    with pytest.raises(ChatError, match="unknown phase"):
+        chat._settle_council_attempt(review, "finalise", "claude")
+    with pytest.raises(ChatError, match="unknown phase"):
+        chat._settle_council_attempt(review, "votes", "claude")
+    assert review.pending_attempts[("vote", "claude")] is sentinel
+    assert transcript.read() == before
+
     # The full cancellation-before-start path is unchanged: the reviewer call
     # raises before any attempt is journalled and the failure status commits
     # without settlement metadata, appending nothing beyond cancellation
