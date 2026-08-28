@@ -68,6 +68,13 @@ inbox_messages = namespace["inbox_messages"]
 inbox_rendered_lines = namespace["inbox_rendered_lines"]
 visible_message_lines = namespace["visible_message_lines"]
 
+# Harness-wide budget for waiting on deterministic internal test events
+# (controller completion, worker entry latches, release gates, blind-phase
+# barriers). Generous enough for a loaded multi-tenant host, bounded so a
+# genuine deadlock still fails instead of hanging the suite. This bounds only
+# test-side waits; product timeouts are never weakened.
+HARNESS_WAIT_S = 30
+
 
 class FakeClient:
     def __init__(self) -> None:
@@ -1171,7 +1178,7 @@ class ParallelReviewClient(FakeClient):
             self.calls.append((target, prompt))
             self.timeouts.append(timeout_ms)
         if "Question for independent review" in prompt:
-            self.barrier.wait(timeout=30)
+            self.barrier.wait(timeout=HARNESS_WAIT_S)
             return "done", f"independent reply from {target}"
         return "done", f"synthesis from {target}"
 
@@ -1445,11 +1452,11 @@ def test_review_controller_cancel_stops_only_local_orchestration(tmp_path: Path)
 
     notice = controller.start("@claude Check this")
     assert notice == "Review started with @claude; @pi synthesizes."
-    assert client.started.wait(timeout=1)
+    assert client.started.wait(timeout=HARNESS_WAIT_S)
     assert controller.is_active()
     assert "@claude working" in controller.status()
     assert controller.cancel() == "Local cancellation requested; participants may continue working."
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
 
     assert client.cancelled == []
     assert controller.status() == "Review cancelled locally; participants may continue working."
@@ -1473,7 +1480,7 @@ def test_review_completion_wins_and_cancel_rejects_after_terminal_commit(
             cancel_event: threading.Event | None = None,
         ) -> tuple[str, str]:
             self.started.set()
-            assert self.release.wait(timeout=2)
+            assert self.release.wait(timeout=HARNESS_WAIT_S)
             return super().turn(target, prompt, timeout_ms, cancel_event)
 
     transcript = Transcript(tmp_path, "completion-wins-room")
@@ -1482,9 +1489,9 @@ def test_review_completion_wins_and_cancel_rejects_after_terminal_commit(
         GroupChat(transcript, {"claude": "claude-peer"}, client, synthesizer="claude")
     )
     controller.start("@claude Complete this")
-    assert client.started.wait(timeout=1)
+    assert client.started.wait(timeout=HARNESS_WAIT_S)
     client.release.set()
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
 
     assert controller.status() == "Review complete."
     with pytest.raises(ChatError, match="no active review"):
@@ -1509,7 +1516,7 @@ def test_review_cancellation_wins_and_discards_late_success(
             cancel_event: threading.Event | None = None,
         ) -> tuple[str, str]:
             self.started.set()
-            assert self.release.wait(timeout=2)
+            assert self.release.wait(timeout=HARNESS_WAIT_S)
             return "done", "late successful reply"
 
     transcript = Transcript(tmp_path, "cancellation-wins-room")
@@ -1518,10 +1525,10 @@ def test_review_cancellation_wins_and_discards_late_success(
         GroupChat(transcript, {"claude": "claude-peer"}, client, synthesizer="claude")
     )
     controller.start("@claude Cancel this")
-    assert client.started.wait(timeout=1)
+    assert client.started.wait(timeout=HARNESS_WAIT_S)
     assert controller.cancel() == "Local cancellation requested; participants may continue working."
     client.release.set()
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
 
     assert controller.status() == "Review cancelled locally; participants may continue working."
     assert not any(item["kind"] == "review_response" for item in transcript.read())
@@ -1552,7 +1559,7 @@ def test_cancelled_review_keeps_occupancy_until_worker_drains_before_retry(
                 self.review_calls += 1
                 if self.review_calls == 1:
                     self.first_started.set()
-                    assert self.release_first.wait(timeout=2)
+                    assert self.release_first.wait(timeout=HARNESS_WAIT_S)
                     return "done", "late first reply"
                 return "done", "retry reply"
             return "done", "one synthesis"
@@ -1562,7 +1569,7 @@ def test_cancelled_review_keeps_occupancy_until_worker_drains_before_retry(
     chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client)
     controller = ReviewController(chat)
     controller.start("@claude Check overlap")
-    assert client.first_started.wait(timeout=1)
+    assert client.first_started.wait(timeout=HARNESS_WAIT_S)
 
     assert controller.cancel() == "Local cancellation requested; participants may continue working."
     assert controller.is_active()
@@ -1572,10 +1579,10 @@ def test_cancelled_review_keeps_occupancy_until_worker_drains_before_retry(
         controller.retry("claude")
 
     client.release_first.set()
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
     assert not controller.is_active()
     assert controller.retry("claude") == "Retrying @claude."
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
 
     items = transcript.read()
     assert [item["kind"] for item in items].count("review_response") == 1
@@ -1595,7 +1602,7 @@ def test_review_start_does_not_block_on_liveness_and_immediate_cancel_writes_not
 
         def live_targets(self) -> set[str]:
             self.check_started.set()
-            assert self.release_check.wait(timeout=2)
+            assert self.release_check.wait(timeout=HARNESS_WAIT_S)
             return super().live_targets()
 
     transcript = Transcript(tmp_path, "pending-cancel-room")
@@ -1604,11 +1611,11 @@ def test_review_start_does_not_block_on_liveness_and_immediate_cancel_writes_not
     controller = ReviewController(chat)
 
     assert controller.start("@claude Check this").startswith("Review started")
-    assert client.check_started.wait(timeout=1)
+    assert client.check_started.wait(timeout=HARNESS_WAIT_S)
     assert controller.cancel() == "Local cancellation requested; participants may continue working."
     assert "@claude cancelled" in controller.status()
     client.release_check.set()
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
 
     assert client.calls == []
     assert client.cancelled == []
@@ -1634,7 +1641,7 @@ def test_interrupted_synthesis_is_cancelled_without_failure_entry(tmp_path: Path
             self.timeouts.append(timeout_ms)
             self.synthesis_started.set()
             assert cancel_event is not None
-            assert cancel_event.wait(timeout=2)
+            assert cancel_event.wait(timeout=HARNESS_WAIT_S)
             raise ChatError("review cancelled")
 
     transcript = Transcript(tmp_path, "synthesis-cancel-room")
@@ -1643,9 +1650,9 @@ def test_interrupted_synthesis_is_cancelled_without_failure_entry(tmp_path: Path
     controller = ReviewController(chat)
 
     controller.start("@claude Check this")
-    assert client.synthesis_started.wait(timeout=1)
+    assert client.synthesis_started.wait(timeout=HARNESS_WAIT_S)
     assert controller.cancel() == "Local cancellation requested; participants may continue working."
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
 
     assert client.cancelled == []
     assert controller.status() == "Review cancelled locally; participants may continue working."
@@ -1676,7 +1683,7 @@ def test_direct_group_chat_retry_waits_for_cancelled_attempt_to_drain(
                 self.review_calls += 1
                 if self.review_calls == 1:
                     self.first_started.set()
-                    assert self.release_first.wait(timeout=2)
+                    assert self.release_first.wait(timeout=HARNESS_WAIT_S)
                     return "done", "late direct reply"
                 return "done", "direct retry reply"
             return "done", "direct synthesis"
@@ -1695,7 +1702,7 @@ def test_direct_group_chat_retry_waits_for_cancelled_attempt_to_drain(
 
     worker = threading.Thread(target=run_review)
     worker.start()
-    assert client.first_started.wait(timeout=1)
+    assert client.first_started.wait(timeout=HARNESS_WAIT_S)
     chat.cancel_review(review)
 
     with pytest.raises(ChatError, match="review attempt is already running"):
@@ -1704,7 +1711,7 @@ def test_direct_group_chat_retry_waits_for_cancelled_attempt_to_drain(
         chat.retry_synthesis(review)
 
     client.release_first.set()
-    worker.join(timeout=2)
+    worker.join(timeout=HARNESS_WAIT_S)
     assert not worker.is_alive()
     assert errors == []
     assert review.responses == {}
@@ -1764,7 +1771,7 @@ def test_completed_review_notice_can_be_cleared_for_later_chat_status(tmp_path: 
     chat, _, _ = make_chat(tmp_path)
     controller = ReviewController(chat)
     controller.start("@claude Check this")
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
     assert controller.status() == "Review complete."
     controller.clear_notice()
     assert controller.status() == ""
@@ -1797,7 +1804,7 @@ def test_immediate_cancel_before_retry_worker_start_targets_fresh_token(
     chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client)
     controller = ReviewController(chat)
     controller.start("@claude Prepare retry")
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
 
     worker_entered = threading.Event()
     release_worker = threading.Event()
@@ -1805,15 +1812,15 @@ def test_immediate_cancel_before_retry_worker_start_targets_fresh_token(
 
     def gated_retry(*args: object, **kwargs: object) -> object:
         worker_entered.set()
-        assert release_worker.wait(timeout=2)
+        assert release_worker.wait(timeout=HARNESS_WAIT_S)
         return original_retry(*args, **kwargs)
 
     monkeypatch.setattr(chat, "retry_review", gated_retry)
     assert controller.retry("claude") == "Retrying @claude."
-    assert worker_entered.wait(timeout=1)
+    assert worker_entered.wait(timeout=HARNESS_WAIT_S)
     assert controller.cancel() == "Local cancellation requested; participants may continue working."
     release_worker.set()
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
 
     assert controller.status() == "Review cancelled locally; participants may continue working."
     assert not any(item["kind"] == "review_response" for item in transcript.read())
@@ -1832,7 +1839,7 @@ def test_cancel_during_retry_liveness_is_not_erased(tmp_path: Path) -> None:
             self.live_checks += 1
             if self.live_checks == 2:
                 self.retry_check_started.set()
-                assert self.release_retry_check.wait(timeout=2)
+                assert self.release_retry_check.wait(timeout=HARNESS_WAIT_S)
             return super().live_targets()
 
         def turn(
@@ -1853,14 +1860,14 @@ def test_cancel_during_retry_liveness_is_not_erased(tmp_path: Path) -> None:
     chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client)
     controller = ReviewController(chat)
     controller.start("@claude Check this")
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
     assert len(client.calls) == 1
 
     assert controller.retry("claude") == "Retrying @claude."
-    assert client.retry_check_started.wait(timeout=1)
+    assert client.retry_check_started.wait(timeout=HARNESS_WAIT_S)
     assert controller.cancel() == "Local cancellation requested; participants may continue working."
     client.release_retry_check.set()
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
 
     assert len(client.calls) == 1
     assert controller.status() == "Review cancelled locally; participants may continue working."
@@ -2498,7 +2505,7 @@ class AnnealClient(FakeClient):
                 self.fail_next_review_blind = False
                 raise ChatError("temporary blind failure")
             if not self.single_blind:
-                self.blind.wait(timeout=30)
+                self.blind.wait(timeout=HARNESS_WAIT_S)
             return "done", f"blind from {target}"
         if "Independent reviews:" in prompt:
             return "done", f"synthesis from {target}"
@@ -2613,7 +2620,7 @@ def test_anneal_missing_blind_reply_stops_without_synthesis_or_final(tmp_path: P
         ) -> tuple[str, str]:
             if target == "grok-peer" and "Question for independent review" in prompt:
                 self._record(target, prompt, timeout_ms)
-                self.blind.wait(timeout=30)
+                self.blind.wait(timeout=HARNESS_WAIT_S)
                 raise ChatError("simulated blind failure")
             return super().turn(target, prompt, timeout_ms, cancel_event)
 
@@ -2650,7 +2657,7 @@ def test_one_controller_prevents_review_and_anneal_overlap(tmp_path: Path) -> No
             if "Question for independent review" in prompt:
                 self._record(target, prompt, timeout_ms)
                 self.blind_started.set()
-                assert self.release.wait(timeout=5)
+                assert self.release.wait(timeout=HARNESS_WAIT_S)
                 return "done", f"blind from {target}"
             return super().turn(target, prompt, timeout_ms, cancel_event)
 
@@ -2662,7 +2669,7 @@ def test_one_controller_prevents_review_and_anneal_overlap(tmp_path: Path) -> No
             controller.start_anneal("@claude,@grok Harden this plan")
             == "Anneal started: @claude authors, @grok critiques."
         )
-        assert client.blind_started.wait(timeout=1)
+        assert client.blind_started.wait(timeout=HARNESS_WAIT_S)
         with pytest.raises(ChatError, match="already running"):
             controller.start("@claude ordinary review")
         with pytest.raises(ChatError, match="already running"):
@@ -2671,7 +2678,7 @@ def test_one_controller_prevents_review_and_anneal_overlap(tmp_path: Path) -> No
         assert "Anneal:" in controller.status()
     finally:
         client.release.set()
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
     assert controller.status() == "Anneal complete."
 
 
@@ -2710,12 +2717,12 @@ def test_cancel_stops_anneal_at_each_phase(tmp_path: Path, phase: str, marker: s
     controller = ReviewController(chat)
     try:
         controller.start_anneal("@claude,@grok Harden this plan")
-        assert client.phase_started.wait(timeout=2)
+        assert client.phase_started.wait(timeout=HARNESS_WAIT_S)
         assert (
             controller.cancel()
             == "Local cancellation requested; participants may continue working."
         )
-        assert controller.wait(timeout=2)
+        assert controller.wait(timeout=HARNESS_WAIT_S)
     finally:
         client.phase_started.set()
 
@@ -2733,7 +2740,7 @@ def test_retry_is_rejected_after_anneal_until_a_later_review(tmp_path: Path) -> 
     chat, _ = make_anneal_chat(tmp_path, client, "retry-room")
     controller = ReviewController(chat)
     controller.start_anneal("@claude,@grok Harden this plan")
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
     for target in ("claude", "grok", "synthesis"):
         with pytest.raises(ChatError, match="review-only"):
             controller.retry(target)
@@ -2741,9 +2748,9 @@ def test_retry_is_rejected_after_anneal_until_a_later_review(tmp_path: Path) -> 
     client.fail_next_review_blind = True
     client.single_blind = True
     controller.start("@claude ordinary review")
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
     assert controller.retry("claude") == "Retrying @claude."
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
     assert controller.status() == "Review complete."
 
 
@@ -2864,7 +2871,7 @@ class ConsensusClient(FakeClient):
             self.calls.append((target, prompt))
             self.timeouts.append(timeout_ms)
         if CONSENSUS_BLIND_MARKER in prompt:
-            self.blind_barrier.wait(timeout=30)
+            self.blind_barrier.wait(timeout=HARNESS_WAIT_S)
             return "done", self.blind_replies.get(target, f"blind from {target}")
         if CONSENSUS_VOTE_MARKER in prompt:
             return "done", self.votes[target]
@@ -4154,7 +4161,7 @@ def test_consensus_missing_blind_stops_before_provisional(tmp_path: Path) -> Non
             if CONSENSUS_BLIND_MARKER in prompt and target == "codex-peer":
                 with self.call_lock:
                     self.calls.append((target, prompt))
-                self.blind_barrier.wait(timeout=30)
+                self.blind_barrier.wait(timeout=HARNESS_WAIT_S)
                 raise ChatError("blind failed")
             return super().turn(target, prompt, *args, **kwargs)
 
@@ -4238,7 +4245,7 @@ def test_consensus_cancel_after_vote_append_keeps_committed_verdict_in_terminal_
         message = kwargs.get("message")
         if isinstance(message, tuple) and message[3] == "consensus_vote":
             vote_appended.set()
-            assert release_vote_commit.wait(timeout=2)
+            assert release_vote_commit.wait(timeout=HARNESS_WAIT_S)
         return committed
 
     monkeypatch.setattr(chat, "_commit_review_phase", gated_commit)
@@ -4254,10 +4261,10 @@ def test_consensus_cancel_after_vote_append_keeps_committed_verdict_in_terminal_
 
     worker = threading.Thread(target=record_vote)
     worker.start()
-    assert vote_appended.wait(timeout=2)
+    assert vote_appended.wait(timeout=HARNESS_WAIT_S)
     assert chat.cancel_review(review)
     release_vote_commit.set()
-    worker.join(timeout=2)
+    worker.join(timeout=HARNESS_WAIT_S)
     assert record_finished.is_set()
 
     messages = transcript.read()
@@ -4298,7 +4305,7 @@ def test_cancel_stops_consensus_at_each_phase(
                     self.calls.append((target, prompt))
                 self.started.set()
                 assert cancel_event is not None
-                assert cancel_event.wait(timeout=2)
+                assert cancel_event.wait(timeout=HARNESS_WAIT_S)
                 raise ChatError("review cancelled")
             return super().turn(target, prompt, timeout_ms, cancel_event)
 
@@ -4306,9 +4313,9 @@ def test_cancel_stops_consensus_at_each_phase(
     chat, transcript = make_consensus_chat(tmp_path, client, f"cancel-consensus-{phase}")
     controller = ReviewController(chat)
     controller.start_consensus("@claude,@codex Choose safely")
-    assert client.started.wait(timeout=2)
+    assert client.started.wait(timeout=HARNESS_WAIT_S)
     assert controller.cancel() == "Local cancellation requested; participants may continue working."
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
 
     messages = transcript.read()
     assert forbidden not in [item["kind"] for item in messages]
@@ -4342,16 +4349,16 @@ def test_immediate_consensus_cancel_before_activation_records_only_terminal_stat
 
     def gated_activate(review: object) -> bool:
         activation_started.set()
-        assert release_activation.wait(timeout=2)
+        assert release_activation.wait(timeout=HARNESS_WAIT_S)
         return original_activate(review)
 
     monkeypatch.setattr(chat, "_activate_review", gated_activate)
     controller.start_consensus("@claude,@codex Choose safely")
-    assert activation_started.wait(timeout=2)
+    assert activation_started.wait(timeout=HARNESS_WAIT_S)
 
     assert controller.cancel() == "Local cancellation requested; participants may continue working."
     release_activation.set()
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
 
     messages = transcript.read()
     terminal = [
@@ -4383,7 +4390,7 @@ def test_consensus_controller_wiring_retry_picker_help_and_rendering(tmp_path: P
     assert controller.start_consensus("@claude,@codex Choose safely").startswith(
         "Consensus started"
     )
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
     with pytest.raises(ChatError, match="review-only"):
         controller.retry("claude")
     lines = message_lines(transcript.read(), 100)
@@ -4447,7 +4454,7 @@ def test_controller_exposes_consensus_phase_failure_outcome(
     chat, transcript = make_consensus_chat(tmp_path, client, f"ctl-{phase[0]}-{failure[:4]}")
     controller = ReviewController(chat)
     controller.start_consensus("@claude,@codex Choose safely")
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
 
     assert controller.status() == f"Consensus {terminal_outcome.replace('_', ' ')}."
     terminal = [
@@ -4471,17 +4478,17 @@ def test_cancel_after_committed_consensus_final_cannot_overwrite_completion(
     def gated_execute(review: object, on_state: object = None) -> object:
         result = original_execute(review, on_state)
         final_committed.set()
-        assert release.wait(timeout=2)
+        assert release.wait(timeout=HARNESS_WAIT_S)
         return result
 
     monkeypatch.setattr(chat, "execute_review", gated_execute)
     controller = ReviewController(chat)
     controller.start_consensus("@claude,@codex Choose safely")
-    assert final_committed.wait(timeout=2)
+    assert final_committed.wait(timeout=HARNESS_WAIT_S)
     with pytest.raises(ChatError, match="already completed"):
         controller.cancel()
     release.set()
-    assert controller.wait(timeout=2)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
 
     assert controller.status() == "Consensus complete."
     terminal = [item for item in transcript.read() if item.get("meta", {}).get("terminal_outcome")]
@@ -6296,7 +6303,7 @@ def test_council_resume_cancel_after_hydration_uses_normal_semantics(
         "Local cancellation requested; participants may continue working."
     )
     client.gate.set()
-    assert controller.wait(timeout=5)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
     assert "cancelled locally" in controller.status()
 
     records = transcript.read()
@@ -6327,7 +6334,7 @@ def test_council_resume_controller_occupancy_and_stale_refusal(tmp_path: Path) -
     with pytest.raises(ChatError, match="a review is already running"):
         controller.start("@claude also review")
     gate_client.gate.set()
-    assert controller.wait(timeout=5)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
     assert derive_council_ledger(gated.read())["terminal_outcome"] == "completed"
 
     # A stale resume of an already-closed round refuses without appending.
@@ -6341,7 +6348,7 @@ def test_council_resume_controller_occupancy_and_stale_refusal(tmp_path: Path) -
     )
     closed_controller = ReviewController(closed_chat)
     closed_controller.start_resume()
-    assert closed_controller.wait(timeout=5)
+    assert closed_controller.wait(timeout=HARNESS_WAIT_S)
     status = closed_controller.status()
     assert status.startswith("Consensus failed:")
     assert "closed and cannot resume" in status
@@ -6417,7 +6424,7 @@ def test_council_resume_command_wiring_and_usage(tmp_path: Path) -> None:
     # Wait until recovery is real (dispatch in flight) so cancel lands post-hydration.
     assert _wait_until(lambda: len(gate_client.calls) > 0)
     assert controller.cancel() == "Local cancellation requested; participants may continue working."
-    assert controller.wait(timeout=5)
+    assert controller.wait(timeout=HARNESS_WAIT_S)
     assert transcript.read() == []
     cancelled_records = replay.read()
     assert [item["meta"]["terminal_outcome"] for item in terminal_statuses(cancelled_records)] == [
