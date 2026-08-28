@@ -4,6 +4,25 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Add the bounded `sol-fable-glm` three-role profile and the `new-sol-fable-glm`
+  action (`New Sol + Fable + GLM chat`, or `./new-room --launch --profile
+  sol-fable-glm`). The room composes the existing `@sol`/`@fable` participants
+  unchanged plus `@glm` (Pi as `glm-peer` with the exact native arguments
+  `--provider bigmodel-coding --model glm-5.3 --thinking high`, no fallback).
+  Before `@glm` becomes routable the launcher requires the exact
+  `bigmodel-coding  glm-5.3` catalog row from `pi --list-models glm-5.3` plus
+  the bounded `glm-5.3` bullet `high` pane token sequence; a live canary
+  confirmed Pi keeps `glm-5.3 • high` on its status and footer lines after the
+  first turn, so the same pane proof applies on reopen and, like Sol, no
+  foreground-process argv evidence is required. Lookalikes such as `glm-5.3.1`
+  or split `glm 5.3` tokens never verify. The room stays atomic — any role
+  failure aborts the launch or reopen with no room and no receipt — and the
+  non-secret receipt carries harness `pi`, provider `bigmodel-coding`, model
+  `glm-5.3`, effort `high`. Sol synthesizes, `@glm` works in mentions, the
+  mention picker, `/review`, `/anneal`, and `/consensus` selection, and the
+  stored `sol-fable`, `sol-fable-grok`, and classic rooms keep their own
+  profiles.
+
 ## [0.8.0] - 2026-08-26
 
 - Add the schema-v2 council attempt journal, recovery ledger, and execution

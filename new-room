@@ -47,6 +47,12 @@ PROFILE_RECEIPT_ENV = "HERDR_GROUP_CHAT_PROFILE_RECEIPT"
 # punctuation stripped), so suffixed or prefixed lookalikes never match.
 PANE_BULLETS = ("•", "·")
 SOL_PANE_PROOF = (("gpt-5.6-sol",), PANE_BULLETS, ("high",))
+# Observed live (pi v0.84.4, --provider bigmodel-coding --model glm-5.3
+# --thinking high): the startup status line and the input-box footer both keep
+# `glm-5.3 • high`, and the footer still shows `╰ glm-5.3 • high … ctx 2% ╯`
+# after the first turn, so the fresh pane proof stays on screen across turns
+# and no separate reopen proof is needed — mirroring Sol.
+GLM_PANE_PROOF = (("glm-5.3",), PANE_BULLETS, ("high",))
 FABLE_PANE_PROOFS = (("fable",), ("5",)), (("high",), ("effort",))
 GROK_START_ARGS = (
     "--model",
@@ -135,11 +141,30 @@ GROK_PARTICIPANT = Participant(
     effort="high",
 )
 
+GLM_PARTICIPANT = Participant(
+    role="glm",
+    kind="pi",
+    name="glm-peer",
+    start_args=(
+        "--provider",
+        "bigmodel-coding",
+        "--model",
+        "glm-5.3",
+        "--thinking",
+        "high",
+    ),
+    pane_proofs=(GLM_PANE_PROOF,),
+    catalog_command=("pi", "--list-models", "glm-5.3"),
+    provider="bigmodel-coding",
+    model="glm-5.3",
+    effort="high",
+)
 # The single profile definition: participants, native launch argv, and the
 # canonical matched evidence the receipt carries. No other source exists.
 PROFILE_PARTICIPANTS: dict[str, tuple[Participant, ...]] = {
     "sol-fable": (SOL_PARTICIPANT, FABLE_PARTICIPANT),
     "sol-fable-grok": (SOL_PARTICIPANT, FABLE_PARTICIPANT, GROK_PARTICIPANT),
+    "sol-fable-glm": (SOL_PARTICIPANT, FABLE_PARTICIPANT, GLM_PARTICIPANT),
 }
 
 

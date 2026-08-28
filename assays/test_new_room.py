@@ -3334,3 +3334,318 @@ def test_room_reopen_reverifies_sol_fable_grok_and_execs_with_receipt(
         call[call.index("--pane") + 1] for call in calls if call[:2] == ["pane", "process-info"]
     }
     assert process_panes == {"w-agents:p-fable", "w-agents:p-grok"}
+
+
+# --- sol-fable-glm profile ------------------------------------------------------------
+
+# Derived from a live scratch run of `pi --provider bigmodel-coding --model
+# glm-5.3 --thinking high` (pi v0.84.4): the startup status line shows
+# `glm-5.3 • high`, and after the first turn the input-box footer keeps
+# `╰ glm-5.3 • high … ctx 2% ╯`.
+GLM_SCREEN = "Pi\nprovider bigmodel-coding\nmodel glm-5.3 • high\n"
+GLM_POST_TURN_SCREEN = "Pi\nturn complete\n╰ glm-5.3 • high ─────────────────────── ctx 2% ╯\n"
+SFGLM_LIVE_AGENTS = [
+    {
+        "name": "sol-peer",
+        "kind": "pi",
+        "workspace_id": "w-agents",
+        "cwd": None,
+        "pane_id": "w-agents:p-sol",
+        "tab_id": "w-agents:t-sol",
+    },
+    {
+        "name": "fable-peer",
+        "kind": "claude",
+        "workspace_id": "w-agents",
+        "cwd": None,
+        "pane_id": "w-agents:p-fable",
+        "tab_id": "w-agents:t-fable",
+    },
+    {
+        "name": "glm-peer",
+        "kind": "pi",
+        "workspace_id": "w-agents",
+        "cwd": None,
+        "pane_id": "w-agents:p-glm",
+        "tab_id": "w-agents:t-glm",
+    },
+]
+
+
+def sfglm_room_state(tmp_path: Path, room: str = "chat-sfglm") -> dict:
+    return {
+        "schema_version": 1,
+        "agents_workspace_id": "w-agents",
+        "agents_cwd": str(tmp_path),
+        "participant_pane_ids": {
+            "sol": "w-agents:p-sol",
+            "fable": "w-agents:p-fable",
+            "glm": "w-agents:p-glm",
+        },
+        "participant_tab_ids": {
+            "sol": "w-agents:t-sol",
+            "fable": "w-agents:t-fable",
+            "glm": "w-agents:t-glm",
+        },
+        "pending_room_id": room,
+        "pending_room_operation_id": "operation-test",
+        "pending_room_profile": "sol-fable-glm",
+        "pending_room_started_unix_ms": int(module.time.time() * 1000),
+    }
+
+
+def install_sfglm_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pane_screens: dict[str, str],
+    live_agents: list[dict] | None = None,
+    process_infos: dict[str, list[dict]] | None = None,
+) -> list[list[str]]:
+    """Fake Herdr for the three-role GLM profile with all sessions pre-seeded."""
+    calls: list[list[str]] = []
+    live = live_agents if live_agents is not None else SFGLM_LIVE_AGENTS
+    for agent in live:
+        agent["cwd"] = str(tmp_path)
+    install_profile_host(
+        monkeypatch,
+        calls,
+        pane_screens,
+        live_agents=live,
+        process_infos=process_infos,
+    )
+    return calls
+
+
+def test_sol_fable_glm_composes_reused_participants_in_exact_order() -> None:
+    sol_fable = module.resolve_profile("sol-fable")
+    triple = module.resolve_profile("sol-fable-glm")
+
+    assert [(p.role, p.name, p.kind) for p in triple] == [
+        ("sol", "sol-peer", "pi"),
+        ("fable", "fable-peer", "claude"),
+        ("glm", "glm-peer", "pi"),
+    ]
+    assert triple[0] is sol_fable[0]  # Sol and Fable are reused, not duplicated
+    assert triple[1] is sol_fable[1]
+    assert all(participant is not module.GLM_PARTICIPANT for participant in sol_fable)
+    arguments, receipt = module.profile_room_exec("sol-fable-glm", triple)
+    assert arguments[arguments.index("--synthesizer") + 1] == "sol"
+    glm_entry = json.loads(receipt)["verified"]
+    glm = next(entry for entry in glm_entry if entry["role"] == "glm")
+    assert glm == {
+        "role": "glm",
+        "target": "glm-peer",
+        "harness": "pi",
+        "provider": "bigmodel-coding",
+        "model": "glm-5.3",
+        "effort": "high",
+        "verification": "native-ui verified",
+    }
+    # The stored profiles are unchanged and never pick up the GLM participant.
+    assert sol_fable == (module.SOL_PARTICIPANT, module.FABLE_PARTICIPANT)
+    assert module.resolve_profile("sol-fable-grok") == (
+        module.SOL_PARTICIPANT,
+        module.FABLE_PARTICIPANT,
+        module.GROK_PARTICIPANT,
+    )
+
+
+def test_glm_participant_uses_exact_start_argv() -> None:
+    glm = module.resolve_profile("sol-fable-glm")[2]
+
+    assert glm.start_args == (
+        "--provider",
+        "bigmodel-coding",
+        "--model",
+        "glm-5.3",
+        "--thinking",
+        "high",
+    )
+    assert glm.catalog_command == ("pi", "--list-models", "glm-5.3")
+    assert (glm.provider, glm.model, glm.effort) == ("bigmodel-coding", "glm-5.3", "high")
+    # Like Sol, GLM needs no tab PATH prefix and no reopen process argv: the
+    # pane keeps its `glm-5.3 • high` evidence after the first turn.
+    assert glm.tab_path_prefix == ""
+    assert glm.reopen_pane_proofs == ()
+    assert glm.reopen_process_argv0 == ""
+    assert glm.reopen_process_args == ()
+
+
+def test_glm_fresh_pane_proof_requires_exact_glm_53_and_high(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def proves(screen: str) -> bool:
+        monkeypatch.setattr(module, "run_text", lambda _herdr_bin, _arguments, timeout=30: screen)
+        monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+        glm = module.resolve_profile("sol-fable-glm")[2]
+        return module.pane_proof("herdr", glm, "w-agents:p-glm")
+
+    assert proves(GLM_SCREEN)
+    assert proves("Pi\nmodel: glm-5.3 • high (auto)\nsession active\n")
+    assert not proves("Pi\nmodel glm-5.3.1 • high\n")  # suffixed version
+    assert not proves("Pi\nmodel glm 5.3 • high\n")  # split model token
+    assert not proves("Pi\nmodel glm-5.3 • highest\n")  # suffixed effort
+    assert not proves("Pi\nmodel glm-5.3 • medium\n")  # wrong effort
+    assert not proves("Pi\nmodel glm-5.3 ─ high\n")  # wrong separator token
+    assert not proves("Pi\nmodel glm-5.3\nwaiting for input\n")  # high missing
+    assert not proves("Pi\nthinking high\nwaiting\n")  # model token missing
+    assert not proves("Pi\nwaiting for input\n")  # no evidence at all
+
+
+def test_reopen_glm_uses_persistent_pane_proof_without_process_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        lambda _herdr_bin, arguments, timeout=30: (
+            (_ for _ in ()).throw(AssertionError("GLM reopen must not read process info"))
+            if arguments[:2] == ["pane", "process-info"]
+            else {"result": {"type": "ok"}}
+        ),
+    )
+    monkeypatch.setattr(
+        module, "run_text", lambda _herdr_bin, _arguments, timeout=30: GLM_POST_TURN_SCREEN
+    )
+    monkeypatch.setattr(
+        module,
+        "native_catalog_row_present",
+        lambda command, provider, model: True,
+    )
+    glm = module.resolve_profile("sol-fable-glm")[2]
+
+    assert module.reopen_pane_proof("herdr", glm, "w-agents:p-glm")
+
+
+def test_glm_tab_is_created_without_path_env_and_started_with_exact_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    calls = install_sfglm_host(
+        monkeypatch,
+        tmp_path,
+        {
+            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-fable": FABLE_SCREEN,
+            "w-agents:p-glm": GLM_SCREEN,
+        },
+        live_agents=[],
+    )
+    state: dict = {"schema_version": 1}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=module.resolve_profile("sol-fable-glm"),
+    )
+
+    assert failures == []
+    creates = [call for call in calls if call[:2] == ["tab", "create"]]
+    assert len(creates) == 3
+    for create in creates:  # no GLM (or any) tab gets an environment override
+        assert "--env" not in create
+    starts = {call[2]: call for call in calls if call[:2] == ["agent", "start"]}
+    assert starts["glm-peer"] == [
+        "agent",
+        "start",
+        "glm-peer",
+        "--kind",
+        "pi",
+        "--pane",
+        "w-agents:p-glm",
+        "--timeout",
+        "120000",
+        "--",
+        "--provider",
+        "bigmodel-coding",
+        "--model",
+        "glm-5.3",
+        "--thinking",
+        "high",
+    ]
+    assert state["participant_pane_ids"]["glm"] == "w-agents:p-glm"
+    assert state["participant_tab_ids"]["glm"] == "w-agents:t-glm"
+
+
+def test_main_never_execs_sol_fable_glm_when_glm_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    profile_launch_env(tmp_path, monkeypatch, captured)
+    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable-glm")
+    monkeypatch.setenv(module.ROOM_ENV, "chat-sfglm")
+    calls = install_sfglm_host(
+        monkeypatch,
+        tmp_path,
+        # GLM's pane shows a suffixed version: the existing session mismatches.
+        {
+            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-fable": FABLE_SCREEN,
+            "w-agents:p-glm": "Pi\nmodel glm-5.3.1 • high\n",
+        },
+    )
+    save_launcher_state(tmp_path, sfglm_room_state(tmp_path))
+
+    with pytest.raises(BootstrapError, match="requires every participant"):
+        module.main()
+
+    assert "argv" not in captured
+    assert "selected_profile" not in load_launcher_state(tmp_path)
+    # The mismatched existing GLM session is left open, and nothing else closes.
+    mutations = (("tab", "close"), ("pane", "close"), ("agent", "send-keys"))
+    assert not any(tuple(call[:2]) in mutations for call in calls)
+    # Already-verified earlier peers remain recorded so a retry can reuse them.
+    state = load_launcher_state(tmp_path)
+    assert state["participant_pane_ids"]["sol"] == "w-agents:p-sol"
+    assert state["participant_pane_ids"]["fable"] == "w-agents:p-fable"
+
+
+def test_room_reopen_reverifies_sol_fable_glm_and_execs_with_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    room_reopen_env(tmp_path, monkeypatch, captured, "chat-sfglm")
+    calls = install_sfglm_host(
+        monkeypatch,
+        tmp_path,
+        {
+            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-fable": FABLE_POST_TURN_SCREEN,
+            "w-agents:p-glm": GLM_POST_TURN_SCREEN,
+        },
+        process_infos={"w-agents:p-fable": CLAUDE_FABLE_PROCESS},
+    )
+    state = sfglm_room_state(tmp_path)
+    state.pop("pending_room_id")
+    state.pop("pending_room_operation_id")
+    state.pop("pending_room_profile")
+    state.pop("pending_room_started_unix_ms")
+    state["selected_profile"] = "sol-fable-glm"
+    state["last_room_id"] = "chat-sfglm"
+    save_launcher_state(tmp_path, state)
+
+    module.room_entrypoint()
+
+    argv = captured["argv"]
+    assert argv[argv.index("--profile") + 1] == "sol-fable-glm"
+    mappings = [value for index, value in enumerate(argv) if argv[index - 1] == "--agent"]
+    assert mappings == ["sol=sol-peer", "fable=fable-peer", "glm=glm-peer"]
+    assert argv[argv.index("--synthesizer") + 1] == "sol"
+    receipt = json.loads(os.environ[module.PROFILE_RECEIPT_ENV])
+    assert receipt == module.profile_receipt_payload(
+        "sol-fable-glm", module.resolve_profile("sol-fable-glm")
+    )
+    # Reopen only re-verifies: nothing is started or closed.
+    assert not any(
+        call[:2] in (["agent", "start"], ["tab", "close"], ["pane", "close"]) for call in calls
+    )
+    # GLM, like Sol, verifies from its persistent pane text and needs no
+    # foreground-process argv evidence on reopen.
+    process_panes = {
+        call[call.index("--pane") + 1] for call in calls if call[:2] == ["pane", "process-info"]
+    }
+    assert process_panes == {"w-agents:p-fable"}

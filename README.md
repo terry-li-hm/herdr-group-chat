@@ -23,7 +23,9 @@ this TUI a thin Cumora client, with one backend owner and no dual writes. See
 
 Prerequisites are Herdr 0.8.0 or newer, [`uv`](https://docs.astral.sh/uv/), and
 installed, authenticated Pi, Claude Code, Codex, and Grok Build CLIs. The room
-executable uses `uv` to run Python 3.13.
+executable uses `uv` to run Python 3.13. The `sol-fable-glm` profile
+additionally needs Pi configured and authenticated for its `bigmodel-coding`
+provider (`glm-5.3`).
 
 Install the pinned release from GitHub:
 
@@ -238,9 +240,10 @@ Uninstall a GitHub-managed copy with:
 herdr plugin uninstall terry.herdr-group-chat
 ```
 
-The manifest declares four actions and two managed pane entrypoints: **New group
-chat**, **New Sol + Fable chat**, **New classic four-agent chat**, and **Open
-group chat**, plus the visible setup pane and the room pane. Herdr
+The manifest declares five actions and two managed pane entrypoints: **New group
+chat**, **New Sol + Fable chat**, **New Sol + Fable + GLM chat**, **New classic
+four-agent chat**, and **Open group chat**, plus the visible setup pane and the
+room pane. Herdr
 supplies `HERDR_PLUGIN_STATE_DIR`, so transcripts and the plugin's exact
 workspace and pane identifiers stay in a server-instance-scoped, locked state file. This
 keeps multiple Herdr sessions separate and serializes overlapping launcher and
@@ -350,15 +353,36 @@ remains available. `New classic four-agent chat` (or a direct
 `./new-room --launch` without a profile) still opens the unchanged classic
 Pi/Claude/Codex/Grok four-agent room.
 
+## Sol + Fable + GLM profile
+
+`New Sol + Fable + GLM chat` (or `./new-room --launch --profile sol-fable-glm`)
+opens the bounded three-role `sol-fable-glm` room: the existing `@sol` and
+`@fable` participants unchanged, plus `@glm`, Pi as `glm-peer` with the exact
+native arguments `--provider bigmodel-coding --model glm-5.3 --thinking high`
+and no fallback. Before `@glm` becomes routable, the launcher requires the
+exact `bigmodel-coding  glm-5.3` catalog row from `pi --list-models glm-5.3`
+plus the bounded `glm-5.3` bullet `high` token sequence in its native pane; a
+live canary confirmed Pi keeps `glm-5.3 • high` on its status and footer
+lines after the first turn, so the same pane proof applies on reopen and, like
+Sol, no foreground-process argv evidence is required. Suffixed or split
+lookalikes such as `glm-5.3.1` or `glm 5.3` never verify. The room is atomic:
+if any of the three roles fails verification, the launch or reopen fails
+closed, no room opens, and the non-secret `native-ui verified` receipt —
+carrying harness `pi`, provider `bigmodel-coding`, model `glm-5.3`, effort
+`high` — is emitted only after all three verify. Sol synthesizes reviews by
+default. Every GLM turn is an external BigModel API call, so the room's
+disclosure boundary applies to anything addressed to `@glm`.
+
 ## Limitations
 
 - Ordinary group turns remain serial. `/review`, `/anneal`, and `/consensus`
   blind passes are parallel; consensus votes are also parallel.
 - Every addressed agent must already be live in Herdr.
 - New-room setup starts the four classic participants, the two bounded
-  `sol-fable` profile participants, or the three `sol-fable-grok` profile
-  participants; only these three fixed compositions are selectable, and
-  arbitrary participant selection is not configurable.
+  `sol-fable` profile participants, the three `sol-fable-grok` profile
+  participants, or the three `sol-fable-glm` profile participants; only these
+  four fixed compositions are selectable, and arbitrary participant selection
+  is not configurable.
 - Retry state is kept in the running room process and does not survive a room
   restart. The transcript itself remains durable.
 - Cancellation is local to the room orchestration. The relay never sends

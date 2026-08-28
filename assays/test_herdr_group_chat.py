@@ -2435,6 +2435,7 @@ def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:
     assert [action["id"] for action in manifest["actions"]] == [
         "new",
         "new-sol-fable",
+        "new-sol-fable-glm",
         "new-classic",
         "open",
     ]
@@ -2450,7 +2451,11 @@ def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:
     assert sol_fable["title"] == "New Sol + Fable chat"
     assert sol_fable["command"] == ["./new-room", "--launch", "--profile", "sol-fable"]
     assert sol_fable["contexts"] == ["workspace", "tab", "pane"]
-    new_classic = manifest["actions"][2]
+    sol_fable_glm = manifest["actions"][2]
+    assert sol_fable_glm["title"] == "New Sol + Fable + GLM chat"
+    assert sol_fable_glm["command"] == ["./new-room", "--launch", "--profile", "sol-fable-glm"]
+    assert sol_fable_glm["contexts"] == ["workspace", "tab", "pane"]
+    new_classic = manifest["actions"][3]
     assert new_classic["title"] == "New classic four-agent chat"
     assert new_classic["command"] == ["./new-room", "--launch"]
     assert new_classic["contexts"] == ["workspace", "tab", "pane"]
@@ -5526,6 +5531,173 @@ def test_sol_fable_grok_exact_roster_records_the_verified_receipt_once(
         assert needle in body, needle
     # The stored sol-fable room stays default-able: its profile is unchanged.
     assert namespace["PROFILE_ROLES"]["sol-fable"] == ("sol", "fable")
+
+
+# --- sol-fable-glm profile ------------------------------------------------------------
+
+
+class GlmClient(ProfileClient):
+    def live_targets(self) -> set[str]:
+        return {"sol-peer", "fable-peer", "glm-peer"}
+
+    def states(self) -> dict[str, str]:
+        return {"sol-peer": "idle", "fable-peer": "idle", "glm-peer": "idle"}
+
+
+def make_sol_fable_glm_chat(tmp_path: Path) -> tuple[GroupChat, GlmClient, Transcript]:
+    transcript = Transcript(tmp_path, "sfglm-room")
+    client = GlmClient()
+    chat = GroupChat(
+        transcript,
+        {"sol": "sol-peer", "fable": "fable-peer", "glm": "glm-peer"},
+        client,
+        synthesizer="sol",
+    )
+    return chat, client, transcript
+
+
+VALID_SFGLM_RECEIPT = {
+    "profile": "sol-fable-glm",
+    "verified": [
+        dict(entry)
+        for entry in (
+            *VALID_RECEIPT["verified"][:2],
+            {
+                "role": "glm",
+                "target": "glm-peer",
+                "harness": "pi",
+                "provider": "bigmodel-coding",
+                "model": "glm-5.3",
+                "effort": "high",
+                "verification": "native-ui verified",
+            },
+        )
+    ],
+}
+
+
+def test_sol_fable_glm_profile_has_exact_ordered_roles_and_synthesizer() -> None:
+    assert namespace["PROFILE_ROLES"]["sol-fable-glm"] == ("sol", "fable", "glm")
+    assert namespace["PROFILE_SYNTHESIZER"]["sol-fable-glm"] == "sol"
+    assert namespace["PROFILE_ROLES"]["sol-fable-grok"] == ("sol", "fable", "grok")
+    assert namespace["PROFILE_ROLES"]["sol-fable"] == ("sol", "fable")
+
+
+def test_sol_fable_glm_room_routes_mention_review_anneal_and_consensus(
+    tmp_path: Path,
+) -> None:
+    chat, client, transcript = make_sol_fable_glm_chat(tmp_path)
+
+    created = chat.dispatch("@glm summarize the launch flags")
+    chat.review("challenge this plan")
+    chat.anneal("@sol,@glm harden this plan")
+    planned = chat.plan_consensus("@fable,@glm Decide whether this is ready")
+
+    assert [item["sender"] for item in created] == ["human", "glm"]
+    routed = [target for target, _prompt in client.calls if "group chat" in _prompt]
+    assert routed[0] == "glm-peer"  # the explicit @glm mention
+    assert set(routed[1:4]) == {"sol-peer", "fable-peer", "glm-peer"}  # review round
+    kinds = [(item["sender"], item["kind"]) for item in transcript.read()]
+    assert ("sol", "review_synthesis") in kinds
+    assert ("sol", "anneal_final") in kinds
+    assert ("glm", "anneal_challenge") in kinds
+    # Consensus selection honours @glm addressing in the bounded roster.
+    assert planned.reviewers == ("fable", "glm")
+    assert planned.synthesizer == "sol"
+    # The mention picker offers exactly the three bounded roles, @glm included.
+    assert mention_suggestions("@", tuple(chat.agents)) == (*chat.agents, "all")
+    assert mention_suggestions("@sol,@", tuple(chat.agents)) == ("fable", "glm", "all")
+    assert mention_suggestions("/anneal @sol,@", tuple(chat.agents)) == ("fable", "glm")
+    assert mention_suggestions("@g", tuple(chat.agents)) == ("glm",)
+
+
+def test_sol_fable_glm_requires_exactly_three_explicit_roles_through_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StaticClient(GlmClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(module, "HerdrClient", StaticClient)
+    monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], json.dumps(VALID_SFGLM_RECEIPT))
+    base = ["--state-dir", str(tmp_path), "--room", "strict-sfglm", "--profile", "sol-fable-glm"]
+
+    assert main([*base, "--once", "hi"]) == 2  # zero mappings
+    assert main([*base, "--agent", "glm=glm-peer", "--once", "hi"]) == 2  # partial
+    assert main([*base, "--agent", "zork=zork-peer", "--once", "hi"]) == 2  # unknown role
+    assert main([*base, "--agent", "grok=grok46-peer", "--once", "hi"]) == 2  # foreign role
+    assert (
+        main(
+            [
+                *base,
+                "--agent",
+                "sol=sol-peer",
+                "--agent",
+                "fable=fable-peer",
+                "--agent",
+                "glm=glm-peer",
+                "--agent",
+                "sol=dup-peer",  # duplicate role
+                "--once",
+                "hi",
+            ]
+        )
+        == 2
+    )
+    assert Transcript(tmp_path, "strict-sfglm").read() == []
+
+
+def test_sol_fable_glm_exact_roster_records_the_verified_receipt_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StaticClient(GlmClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(module, "HerdrClient", StaticClient)
+    monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], json.dumps(VALID_SFGLM_RECEIPT))
+    base = [
+        "--state-dir",
+        str(tmp_path),
+        "--room",
+        "receipt-sfglm",
+        "--profile",
+        "sol-fable-glm",
+        "--agent",
+        "sol=sol-peer",
+        "--agent",
+        "fable=fable-peer",
+        "--agent",
+        "glm=glm-peer",
+    ]
+
+    assert main([*base, "--once", "hello from the human"]) == 0
+
+    receipts = [
+        item
+        for item in Transcript(tmp_path, "receipt-sfglm").read()
+        if item["kind"] == namespace["PROFILE_RECEIPT_KIND"]
+    ]
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert receipt["meta"]["profile"] == "sol-fable-glm"
+    assert [entry["role"] for entry in receipt["meta"]["verified"]] == ["fable", "glm", "sol"]
+    glm_entry = next(entry for entry in receipt["meta"]["verified"] if entry["role"] == "glm")
+    assert glm_entry["harness"] == "pi"
+    assert glm_entry["provider"] == "bigmodel-coding"
+    body = receipt["body"]
+    for needle in (
+        "harness pi",
+        "provider bigmodel-coding",
+        "model glm-5.3",
+        "effort high",
+        "target glm-peer",
+        "native-ui verified",
+    ):
+        assert needle in body, needle
+    # The stored sol-fable and sol-fable-grok rooms keep their own profiles.
+    assert namespace["PROFILE_ROLES"]["sol-fable"] == ("sol", "fable")
+    assert namespace["PROFILE_ROLES"]["sol-fable-grok"] == ("sol", "fable", "grok")
 
 
 # --- wave-2 council resume: reconstruction, /council resume, CLI and controller -----
