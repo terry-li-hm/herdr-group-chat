@@ -1171,7 +1171,7 @@ class ParallelReviewClient(FakeClient):
             self.calls.append((target, prompt))
             self.timeouts.append(timeout_ms)
         if "Question for independent review" in prompt:
-            self.barrier.wait(timeout=2)
+            self.barrier.wait(timeout=30)
             return "done", f"independent reply from {target}"
         return "done", f"synthesis from {target}"
 
@@ -2498,7 +2498,7 @@ class AnnealClient(FakeClient):
                 self.fail_next_review_blind = False
                 raise ChatError("temporary blind failure")
             if not self.single_blind:
-                self.blind.wait(timeout=2)
+                self.blind.wait(timeout=30)
             return "done", f"blind from {target}"
         if "Independent reviews:" in prompt:
             return "done", f"synthesis from {target}"
@@ -2613,7 +2613,7 @@ def test_anneal_missing_blind_reply_stops_without_synthesis_or_final(tmp_path: P
         ) -> tuple[str, str]:
             if target == "grok-peer" and "Question for independent review" in prompt:
                 self._record(target, prompt, timeout_ms)
-                self.blind.wait(timeout=2)
+                self.blind.wait(timeout=30)
                 raise ChatError("simulated blind failure")
             return super().turn(target, prompt, timeout_ms, cancel_event)
 
@@ -2864,7 +2864,7 @@ class ConsensusClient(FakeClient):
             self.calls.append((target, prompt))
             self.timeouts.append(timeout_ms)
         if CONSENSUS_BLIND_MARKER in prompt:
-            self.blind_barrier.wait(timeout=2)
+            self.blind_barrier.wait(timeout=30)
             return "done", self.blind_replies.get(target, f"blind from {target}")
         if CONSENSUS_VOTE_MARKER in prompt:
             return "done", self.votes[target]
@@ -4154,7 +4154,7 @@ def test_consensus_missing_blind_stops_before_provisional(tmp_path: Path) -> Non
             if CONSENSUS_BLIND_MARKER in prompt and target == "codex-peer":
                 with self.call_lock:
                     self.calls.append((target, prompt))
-                self.blind_barrier.wait(timeout=2)
+                self.blind_barrier.wait(timeout=30)
                 raise ChatError("blind failed")
             return super().turn(target, prompt, *args, **kwargs)
 
