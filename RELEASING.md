@@ -6,15 +6,17 @@
 2. Run `uv lock --check`, the test suite, Ruff over both executables and all
    assays, and Chaperone.
 3. Export the tracked tree into a temporary directory and link that copy as
-   a Herdr plugin. Verify the manifest has no warnings. Confirm all four
-   actions are present: `new`, `new-sol-fable`, `new-classic`, and `open`.
+   a Herdr plugin. Verify the manifest has no warnings. Confirm all five
+   actions are present: `new`, `new-sol-fable`, `new-sol-fable-glm`,
+   `new-classic`, and `open`.
    Check both pane entrypoints, exact workspace ownership, and reopen
    behavior. Also check named-session isolation and partial-failure retry
    behavior. Run a verified three-agent default (sol-fable-grok) room round
    and a classic four-agent room round.
-   Verify the four actions map to their exact commands: `new` runs
+   Verify the five actions map to their exact commands: `new` runs
    `./new-room --launch --profile sol-fable-grok`; `new-sol-fable` runs
-   `./new-room --launch --profile sol-fable`; `new-classic` runs
+   `./new-room --launch --profile sol-fable`; `new-sol-fable-glm` runs
+   `./new-room --launch --profile sol-fable-glm`; `new-classic` runs
    `./new-room --launch`; `open` runs `./new-room --open`.
 4. Commit the release candidate and create the annotated release tag.
 
@@ -47,7 +49,7 @@ For an eligible release:
 3. Install that exact tag with
    `herdr plugin install terry-li-hm/herdr-group-chat --ref <tag> --yes`. Read
    back the requested ref and resolved commit, compare the managed checkout's
-   tracked hashes with the tagged source, and verify all four actions and both
+   tracked hashes with the tagged source, and verify all five actions and both
    pane entrypoints.
 4. Rerun the verified default three-agent (sol-fable-grok) smoke test and the
    classic four-agent smoke test from the managed checkout. Read back the

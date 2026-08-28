@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [0.9.0] - 2026-08-29
 
 - Add the bounded `sol-fable-glm` three-role profile and the `new-sol-fable-glm`
   action (`New Sol + Fable + GLM chat`, or `./new-room --launch --profile

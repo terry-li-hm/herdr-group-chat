@@ -30,7 +30,7 @@ provider (`glm-5.3`).
 Install the pinned release from GitHub:
 
 ```bash
-herdr plugin install terry-li-hm/herdr-group-chat --ref v0.8.0
+herdr plugin install terry-li-hm/herdr-group-chat --ref v0.9.0
 herdr plugin action invoke new --plugin terry.herdr-group-chat
 ```
 
