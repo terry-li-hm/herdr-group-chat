@@ -6360,7 +6360,11 @@ def test_once_resume_refusal_appends_nothing_despite_setup_failures(
     monkeypatch.setenv("HERDR_GROUP_CHAT_SETUP_FAILURES", "sol setup exploded\nfable setup too")
     monkeypatch.delenv(namespace["PROFILE_RECEIPT_ENV"], raising=False)
 
-    replay_records(tmp_path, "once-refuse-setup-room", source)  # a closed round
+    replayed = replay_records(tmp_path, "once-refuse-setup-room", source)  # a closed round
+    # Baseline the replayed room itself: replay regenerates each record's `at`
+    # timestamp, so the replayed records are not guaranteed dict-equal to the
+    # source records across a wall-clock second boundary.
+    before = replayed.read()
     code = main(
         [
             "--room",
@@ -6374,7 +6378,7 @@ def test_once_resume_refusal_appends_nothing_despite_setup_failures(
     assert code == 2
     assert "closed and cannot resume" in capsys.readouterr().err
     records = Transcript(tmp_path, "once-refuse-setup-room").read()
-    assert records == source
+    assert records == before
     assert not [item for item in records if item["body"].startswith("setup:")]
     assert client.calls == []
 
@@ -6432,7 +6436,12 @@ def test_once_profile_resume_records_receipt_before_first_new_attempt(
     monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], valid_receipt_json)
 
     checkpoint = profile_resume_records(tmp_path, "once-receipt-resume")
-    replay_records(tmp_path, "once-receipt-resume", checkpoint)
+    checkpoint_room = replay_records(tmp_path, "once-receipt-resume", checkpoint)
+    # The durable checkpoint is what the replayed room holds on disk, not the
+    # source-room dicts: replay re-appends through Transcript.append, which
+    # regenerates each record's second-resolution `at` timestamp, so equality
+    # with the source records would only hold within one wall-clock second.
+    before = checkpoint_room.read()
     code = main(
         [
             "--room",
@@ -6458,7 +6467,8 @@ def test_once_profile_resume_records_receipt_before_first_new_attempt(
     receipt_index = records.index(receipt[0])
     # The receipt lands after the durable checkpoint and before the first new
     # model-call attempt.
-    assert receipt_index > max(records.index(item) for item in checkpoint)
+    assert records[: len(before)] == before
+    assert receipt_index >= len(before)
     first_new_attempt = next(
         item for item in records if item["kind"] == "council_attempt" and item not in checkpoint
     )
