@@ -247,7 +247,10 @@ room pane. Herdr
 supplies `HERDR_PLUGIN_STATE_DIR`, so transcripts and the plugin's exact
 workspace and pane identifiers stay in a server-instance-scoped, locked state file. This
 keeps multiple Herdr sessions separate and serializes overlapping launcher and
-setup processes. The launcher never claims a workspace merely because its label
+setup processes. Herdr 0.8.2+ pre-creates that directory under the process
+umask; an empty pre-created directory is tightened to `0700` on first use,
+while a non-empty or foreign-owned directory still fails closed. The launcher
+never claims a workspace merely because its label
 is `agents · group-chat` or `group-chat`. Standalone CLI use retains
 `~/.local/state/herdr-group-chat/`; an explicit `--state-dir` always wins.
 

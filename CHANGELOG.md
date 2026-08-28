@@ -22,6 +22,15 @@ All notable changes to this project are documented here.
   mention picker, `/review`, `/anneal`, and `/consensus` selection, and the
   stored `sol-fable`, `sol-fable-grok`, and classic rooms keep their own
   profiles.
+- Fix the launcher rejecting a pre-created state directory: Herdr 0.8.2
+  pre-creates the directory it exports as `HERDR_PLUGIN_STATE_DIR` under the
+  process umask, so on Linux it arrives as `0775` and every launch action
+  failed with `invalid launcher state directory authority` before doing
+  anything. A pre-existing directory that is a real directory, owned by the
+  current user, and empty is now tightened to `0700` with `fchmod` on the
+  already-open descriptor and the launch continues; a non-empty directory with
+  looser permissions, one not owned by the user, or a symlink still fails
+  closed, and no other authority check is weakened.
 
 ## [0.8.0] - 2026-08-26
 

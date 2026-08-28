@@ -80,6 +80,78 @@ def test_launcher_directory_closes_descriptor_on_validation_failure(
             real_fstat(descriptor)
 
 
+def test_precreated_empty_umask_state_dir_is_tightened_and_launch_proceeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Herdr 0.8.2+ pre-creates the state directory under the process umask.
+
+    An empty owned 0775 directory must be tightened to 0700 on the open
+    descriptor, not rejected, so the launch action still runs.
+    """
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    state_dir.chmod(0o775)
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(state_dir))
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        if arguments == ["workspace", "list"]:
+            return {"result": {"workspaces": []}}
+        if arguments[:2] == ["workspace", "create"]:
+            return {
+                "result": {
+                    "workspace": {"workspace_id": "w-chat"},
+                    "tab": {"tab_id": "w-chat:t-placeholder"},
+                }
+            }
+        if arguments[:3] == ["plugin", "pane", "open"]:
+            return {
+                "result": {
+                    "plugin_pane": {"pane": {"pane_id": "w-chat:p-new", "tab_id": "w-chat:t-new"}}
+                }
+            }
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+
+    assert launch_room(open_existing=False) == 0
+    assert stat.S_IMODE(state_dir.stat().st_mode) == 0o700
+    assert load_launcher_state(state_dir)["room_pane_id"] == "w-chat:p-new"
+
+
+def test_precreated_nonempty_state_dir_still_fails_closed(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    state_dir.chmod(0o775)
+    (state_dir / "foreign.json").write_text("foreign\n", encoding="utf-8")
+
+    with pytest.raises(BootstrapError, match="invalid launcher state directory authority"):
+        load_launcher_state(state_dir)
+
+    assert stat.S_IMODE(state_dir.stat().st_mode) == 0o775
+
+
+def test_precreated_private_state_dir_is_adopted_without_retightening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    state_dir.chmod(0o700)
+    directory_chmods: list[int] = []
+    real_fchmod = module.os.fchmod
+
+    def recording_fchmod(descriptor: int, mode: int) -> None:
+        if stat.S_ISDIR(module.os.fstat(descriptor).st_mode):
+            directory_chmods.append(mode)
+        real_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(module.os, "fchmod", recording_fchmod)
+
+    assert load_launcher_state(state_dir) == {"schema_version": 1}
+    assert directory_chmods == []
+    assert stat.S_IMODE(state_dir.stat().st_mode) == 0o700
+
+
 def test_launcher_state_is_atomic_private_and_versioned(tmp_path: Path) -> None:
     state = {
         "chat_workspace_id": "w-chat",
