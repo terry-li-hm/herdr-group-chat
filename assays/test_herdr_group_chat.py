@@ -35,6 +35,7 @@ Transcript = namespace["Transcript"]
 extract_reply = namespace["extract_reply"]
 extract_grok_session_reply = namespace["extract_grok_session_reply"]
 extract_claude_session_reply = namespace.get("extract_claude_session_reply")
+extract_pi_session_reply = namespace.get("extract_pi_session_reply")
 claude_project_dir_name = namespace.get("claude_project_dir_name")
 build_prompt = namespace["build_prompt"]
 build_review_prompt = namespace["build_review_prompt"]
@@ -1115,6 +1116,255 @@ def test_local_claude_reply_uses_exact_session_and_groks_fall_back(
 
     monkeypatch.setattr(client, "_run", grok_run)
     assert client._local_claude_reply("grok-peer", token) is None
+
+
+def write_pi_session(
+    sessions: Path,
+    turns: list[tuple[str, str]],
+    *,
+    string_content: bool = False,
+) -> Path:
+    """Create a synthetic Pi session JSONL under the given sessions directory.
+
+    Each turn appends the user prompt record and the assistant reply record
+    Pi writes to its append-only session transcript, interleaved with the
+    non-message records and unparsable lines a real file also carries.
+    """
+    sessions.mkdir(parents=True, exist_ok=True)
+    session_file = sessions / "2026-08-29T00-00-00-000Z_0123456789ab-cdef-0123-456789abcdef.jsonl"
+    records: list[str | dict[str, object]] = [
+        {"type": "session", "session": "0123456789ab-cdef-0123-456789abcdef"},
+        "not json at all",
+    ]
+    for token, reply in turns:
+        records.append(
+            {
+                "type": "message",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "relay prompt\n" + token}],
+                },
+            }
+        )
+        body = "HGCHAT_REPLY_BEGIN " + token + "\n" + reply + "\nHGCHAT_REPLY_END " + token
+        content: object
+        if string_content:
+            content = body
+        else:
+            content = [
+                {"type": "thinking", "thinking": "deciding on the reply"},
+                {"type": "text", "text": body},
+            ]
+        records.append({"type": "message", "message": {"role": "assistant", "content": content}})
+    session_file.write_text(
+        "\n".join(record if isinstance(record, str) else json.dumps(record) for record in records)
+        + "\n",
+        encoding="utf-8",
+    )
+    return session_file
+
+
+def test_extract_pi_session_reply_prefers_last_assistant_message(tmp_path: Path) -> None:
+    assert extract_pi_session_reply is not None
+    session_file = write_pi_session(
+        tmp_path / "sessions",
+        [("a" * 32, "first Pi reply"), ("b" * 32, "second Pi reply")],
+        string_content=True,
+    )
+
+    assert extract_pi_session_reply(session_file, "b" * 32) == "second Pi reply"
+    # Once a newer assistant message exists, an earlier turn's markers are
+    # never replayed.
+    with pytest.raises(ChatError):
+        extract_pi_session_reply(session_file, "a" * 32)
+
+
+def test_extract_pi_session_reply_fails_closed_on_missing_or_markerless_sessions(
+    tmp_path: Path,
+) -> None:
+    assert extract_pi_session_reply is not None
+    token = "e" * 32
+    missing = tmp_path / "absent.jsonl"
+    markerless = tmp_path / "markerless.jsonl"
+    markerless.write_text(
+        '{"type":"message","message":{"role":"assistant",'
+        '"content":[{"type":"text","text":"no markers here"}]}}\n',
+        encoding="utf-8",
+    )
+    user_only = tmp_path / "user_only.jsonl"
+    user_only.write_text(
+        '{"type":"message","message":{"role":"user",'
+        '"content":[{"type":"text","text":"HGCHAT_REPLY_BEGIN ' + token + '"}]}}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ChatError):
+        extract_pi_session_reply(missing, token)
+    with pytest.raises(ChatError):
+        extract_pi_session_reply(markerless, token)
+    with pytest.raises(ChatError):
+        extract_pi_session_reply(user_only, token)
+
+
+def pi_agent_meta(session_file: Path) -> dict[str, object]:
+    return {
+        "agent": "pi",
+        "agent_session": {
+            "agent": "pi",
+            "kind": "path",
+            "source": "herdr:pi",
+            "value": str(session_file),
+        },
+    }
+
+
+def test_turn_prefers_exact_pi_session_over_quiet_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pi reports idle before rendering the reply, so the terminal stays
+    quiet; the exact session record must still resolve the turn."""
+    token = "6" * 32
+    session_file = write_pi_session(tmp_path / "sessions", [(token, "clean Pi reply")])
+    statuses = ["working", "idle"]
+    calls: list[list[str]] = []
+
+    class FakeCompleted:
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+            self.stderr = ""
+            self.returncode = 0
+
+    def fake_run(arguments: list[str], timeout: float = 30, **_kwargs: object) -> FakeCompleted:
+        calls.append(list(arguments))
+        if arguments[1:3] == ["agent", "get"]:
+            status = statuses.pop(0) if statuses else "idle"
+            return FakeCompleted(
+                json.dumps(
+                    {"result": {"agent": {"agent_status": status, **pi_agent_meta(session_file)}}}
+                )
+            )
+        if arguments[1:3] == ["agent", "read"]:
+            return FakeCompleted("(quiet pane; the reply has not rendered yet)")
+        raise AssertionError(f"unexpected herdr call: {arguments}")
+
+    client = HerdrClient(runner=fake_run)
+    monkeypatch.setattr(client, "_run_interruptible", lambda arguments, cancel_event, timeout: None)
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    prompt = f"HGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}"
+
+    status, body = client.turn("pi-peer", prompt, timeout_ms=5_000)
+
+    assert (status, body) == ("idle", "clean Pi reply")
+    # The exact session is preferred before the terminal is read at all, so
+    # the quiet pane can never reach the unmarked-stability failure.
+    assert not any(call[1:3] == ["agent", "read"] for call in calls)
+
+
+def test_turn_falls_back_to_terminal_when_pi_session_is_markerless(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "9" * 32
+    session_file = write_pi_session(tmp_path / "sessions", [("c" * 32, "stale reply")])
+    monkeypatch.setenv("HOME", str(tmp_path))
+    terminal = f"HGCHAT_REPLY_BEGIN {token}\nterminal reply\nHGCHAT_REPLY_END {token}\n"
+
+    class FakeCompleted:
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+            self.stderr = ""
+            self.returncode = 0
+
+    def fake_run(arguments: list[str], timeout: float = 30, **_kwargs: object) -> FakeCompleted:
+        if arguments[1:3] == ["agent", "get"]:
+            return FakeCompleted(
+                json.dumps(
+                    {
+                        "result": {
+                            "agent": {
+                                "agent_status": "done",
+                                **pi_agent_meta(session_file),
+                            }
+                        }
+                    }
+                )
+            )
+        if arguments[1:3] == ["agent", "read"]:
+            return FakeCompleted(terminal)
+        raise AssertionError(f"unexpected herdr call: {arguments}")
+
+    client = HerdrClient(runner=fake_run)
+    monkeypatch.setattr(client, "_run_interruptible", lambda arguments, cancel_event, timeout: None)
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    prompt = f"HGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}"
+
+    status, body = client.turn("pi-peer", prompt, timeout_ms=5_000)
+
+    assert (status, body) == ("done", "terminal reply")
+
+
+def test_local_pi_reply_uses_exact_session_and_never_replays_prior_turns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = HerdrClient(runner=object)  # _run is stubbed below
+    turn_one_token = "1" * 32
+    turn_two_token = "2" * 32
+    session_file = write_pi_session(
+        tmp_path / "sessions",
+        [(turn_one_token, "first Pi reply"), (turn_two_token, "second Pi reply")],
+        string_content=True,
+    )
+
+    def fake_run(arguments: list[str], timeout: float = 30) -> object:
+        assert arguments[:2] == ["agent", "get"]
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps({"result": {"agent": pi_agent_meta(session_file)}}),
+        )
+
+    monkeypatch.setattr(client, "_run", fake_run)
+
+    # A second turn reads the new last assistant message, not the previous
+    # turn's marker-wrapped reply.
+    assert client._local_pi_reply("pi-peer", turn_two_token) == "second Pi reply"
+    assert client._local_pi_reply("pi-peer", turn_one_token) is None
+
+    # A missing session file falls back to the terminal path.
+    missing_meta = json.dumps(
+        {"result": {"agent": pi_agent_meta(tmp_path / "sessions" / "absent.jsonl")}}
+    )
+
+    def missing_run(arguments: list[str], timeout: float = 30) -> object:
+        return subprocess.CompletedProcess([], 0, stdout=missing_meta)
+
+    monkeypatch.setattr(client, "_run", missing_run)
+    assert client._local_pi_reply("pi-peer", turn_two_token) is None
+
+    # Non-Pi or mismatched session metadata never touches the filesystem.
+    def foreign_run(session: dict[str, object]) -> object:
+        def run(arguments: list[str], timeout: float = 30) -> object:
+            return subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps({"result": {"agent": session}})
+            )
+
+        return run
+
+    base_session: dict[str, object] = pi_agent_meta(session_file)["agent_session"]
+    foreign_sessions: list[dict[str, object]] = [
+        {
+            "agent": "claude",
+            "agent_session": {"source": "herdr:claude", "kind": "id", "value": session_file},
+        },
+        {"agent": "pi", "agent_session": {**base_session, "source": "herdr:claude"}},
+        {"agent": "pi", "agent_session": {**base_session, "kind": "id"}},
+        {"agent": "pi", "agent_session": {**base_session, "agent": "claude"}},
+    ]
+    for session in foreign_sessions:
+        monkeypatch.setattr(client, "_run", foreign_run(session))
+        assert client._local_pi_reply("pi-peer", turn_two_token) is None
 
 
 def test_missing_live_agent_fails_before_writing(tmp_path: Path) -> None:
