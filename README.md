@@ -396,9 +396,12 @@ disclosure boundary applies to anything addressed to `@glm`.
 - Rooms are local to one Herdr installation; this is not a network chat server.
 - An agent that finishes without emitting the `HGCHAT_REPLY_*` markers fails the
   turn fast with a clear error once its terminal output is observed stable,
-  instead of stalling until the full agent timeout. A generic unmarked-reply
-  extractor is deliberately not attempted: terminal output has no reliable
-  reply boundaries.
+  instead of stalling until the full agent timeout. Pi and Claude replies are
+  read from their local session records first, so a TUI that reports idle
+  before rendering the reply (Pi) or collapses prompt summaries into the
+  capture (Claude) still resolves from the clean transcript. A generic
+  unmarked-reply extractor is deliberately not attempted: terminal output has
+  no reliable reply boundaries.
 - Grok session recovery depends on the local `~/.grok/sessions` history layout.
 - The preview release supports macOS and Linux.
 

@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+- Fix a Pi participant's turn failing with `reply markers HGCHAT_REPLY_* not
+  found` even though Pi produced the marker-wrapped reply: Pi 0.84.4 reports
+  idle/done before its TUI renders the assistant text, so the quiet terminal
+  tripped the unmarked-stability rule first. Mirroring the Claude design, a
+  verified Pi target (`agent` `pi`, session source `herdr:pi`, session `kind`
+  `path`) now gets its reply from the exact session JSONL named by Herdr's
+  agent metadata, before any terminal capture: the last assistant message's
+  text parts are joined and scanned for the turn's markers, so a second turn
+  reads its own new reply and never replays the previous turn's. A record that
+  is missing, unreadable, not a regular file owned by the current user, or
+  markerless returns nothing and the terminal path (including the
+  unmarked-stability rule) stays the fallback.
+
 ## [0.9.0] - 2026-08-29
 
 - Add the bounded `sol-fable-glm` three-role profile and the `new-sol-fable-glm`
