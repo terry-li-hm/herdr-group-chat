@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [0.9.1] - 2026-08-29
 
 - Fix a Pi participant's turn failing with `reply markers HGCHAT_REPLY_* not
   found` even though Pi produced the marker-wrapped reply: Pi 0.84.4 reports
