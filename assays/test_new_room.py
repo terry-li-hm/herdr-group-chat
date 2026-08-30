@@ -298,6 +298,53 @@ def test_launcher_symlink_authority_never_mutates_target(
     assert sentinel.read_text(encoding="utf-8") == "do not touch\n"
 
 
+def test_launcher_error_record_rejects_symlinked_state_directory_without_mutating_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target-state"
+    target.mkdir(mode=0o700)
+    target.chmod(0o750)
+    sentinel = target / "sentinel"
+    sentinel.write_text("do not touch\n", encoding="utf-8")
+    sentinel.chmod(0o640)
+    state_dir = tmp_path / "state-link"
+    state_dir.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(state_dir))
+
+    module.append_launcher_error("setup", [], BootstrapError("boom"))
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o750
+    assert stat.S_IMODE(sentinel.stat().st_mode) == 0o640
+    assert sentinel.read_text(encoding="utf-8") == "do not touch\n"
+    assert not (target / module.LAUNCHER_ERRORS_NAME).exists()
+
+
+def test_launcher_error_record_rejects_hostile_existing_error_file_shapes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(state_dir))
+    target = tmp_path / "target-errors"
+    target.write_text("do not touch\n", encoding="utf-8")
+    target.chmod(0o640)
+    error_path = state_dir / module.LAUNCHER_ERRORS_NAME
+    error_path.symlink_to(target)
+
+    module.append_launcher_error("setup", [], BootstrapError("boom"))
+
+    assert target.read_text(encoding="utf-8") == "do not touch\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+    error_path.unlink()
+    error_path.write_text("untrusted\n", encoding="utf-8")
+    error_path.chmod(0o644)
+
+    module.append_launcher_error("setup", [], BootstrapError("boom"))
+
+    assert error_path.read_text(encoding="utf-8") == "untrusted\n"
+    assert stat.S_IMODE(error_path.stat().st_mode) == 0o644
+
+
 def test_nested_launcher_transaction_fails_without_waiting_for_second_lock(
     tmp_path: Path,
 ) -> None:
