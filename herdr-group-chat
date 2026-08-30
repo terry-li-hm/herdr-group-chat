@@ -4653,9 +4653,14 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
         else:
             delivery_status = deliveries.status()
             shown_status = (
-                delivery_status
-                if deliveries.is_active() or (delivery_status and status.startswith("Delivery:"))
-                else (status if status_override else (review_status or status))
+                status
+                if status_override
+                else (
+                    delivery_status
+                    if deliveries.is_active()
+                    or (delivery_status and status.startswith("Delivery:"))
+                    else (review_status or status)
+                )
             )
         max_scroll = draw_tui(
             screen,
@@ -4754,9 +4759,10 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
             try:
                 deliveries.start(buffer)
                 status = deliveries.status()
+                status_override = False
             except ChatError as error:
                 status = str(error)
-            status_override = True
+                status_override = True
             buffer = ""
             scroll_offset = 0
             continue

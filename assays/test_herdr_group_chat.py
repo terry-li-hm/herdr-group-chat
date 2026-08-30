@@ -1046,33 +1046,56 @@ class ScriptedTuiScreen:
         return key
 
 
-def test_tui_keeps_views_and_cancellation_responsive_while_delivery_drains(
+def test_tui_shows_delivery_rejection_while_worker_drains_and_keeps_views_responsive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     chat, client, transcript = make_cancellation_aware_ordinary_chat(tmp_path)
-    draws: list[tuple[str, str]] = []
+    draws: list[tuple[str, str, bool]] = []
+    controllers: list[DeliveryController] = []
     keys = [
         *list("@pi slow\n"),
         "WAIT_FOR_TURN",
         *list("/lanes\n/inbox\n/room\n@claude blocked second send\n/cancel\n\x11"),
     ]
     screen = ScriptedTuiScreen(keys, client)
+
+    class TrackingDeliveryController(DeliveryController):
+        def __init__(self, tracked_chat: object) -> None:
+            super().__init__(tracked_chat)
+            controllers.append(self)
+
+    def track_draw(
+        _screen: object,
+        _transcript: object,
+        _room: object,
+        _buffer: object,
+        status: str,
+        _participants: object,
+        _scroll: object = 0,
+        **kwargs: object,
+    ) -> int:
+        draws.append((str(kwargs.get("view", "room")), status, controllers[0].is_active()))
+        return 0
+
     monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
-    monkeypatch.setattr(
-        module,
-        "draw_tui",
-        lambda _screen, _transcript, _room, _buffer, status, _participants, _scroll=0, **kwargs: (
-            draws.append((kwargs.get("view", "room"), status)) or 0
-        ),
-    )
+    monkeypatch.setattr(module, "draw_tui", track_draw)
+    monkeypatch.setattr(module, "DeliveryController", TrackingDeliveryController)
 
     started = time.monotonic()
     run_tui(screen, chat, "ordinary-cancel-room")
     assert time.monotonic() - started < 1
 
     assert [target for target, _ in client.calls] == ["pi-peer"]
-    assert {view for view, _ in draws} >= {"room", "inbox", "lanes"}
-    assert any("@pi working" in status for _, status in draws)
+    assert {view for view, _, _ in draws} >= {"room", "inbox", "lanes"}
+    assert any(
+        view == "lanes" and active and "@pi working" in status for view, status, active in draws
+    )
+    assert any(
+        active
+        and status
+        == "Ordinary delivery is still draining; use /cancel or wait before starting more work."
+        for _, status, active in draws
+    )
     assert _wait_until(
         lambda: (
             transcript.read()
