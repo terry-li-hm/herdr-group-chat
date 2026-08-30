@@ -263,8 +263,8 @@ herdr plugin uninstall terry.herdr-group-chat
 
 The manifest declares five actions and two managed pane entrypoints: **New group
 chat**, **New Sol + Fable chat**, **New Sol + Fable + GLM chat**, **New classic
-four-agent chat**, and **Open group chat**, plus the visible setup pane and the
-room pane. Herdr
+four-agent chat**, **Open group chat**, and **Adopt stale group-chat peers**,
+plus the visible setup pane and the room pane. Herdr
 supplies `HERDR_PLUGIN_STATE_DIR`, so transcripts and the plugin's exact
 workspace and pane identifiers stay in a server-instance-scoped, locked state file. This
 keeps multiple Herdr sessions separate and serializes overlapping launcher and
@@ -440,6 +440,21 @@ See [SECURITY.md](SECURITY.md) for private vulnerability reporting and
 [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ### Troubleshooting
+
+**After a Herdr restart.** A server restart gives the launcher a new
+server-instance state key, so its fresh state has no participant records while
+the previous launch's peers stay live in the `agents · group-chat` workspace.
+Every such peer then fails the ownership check with the exact reason (different
+workspace, different cwd, or pane not recorded), and an atomic profile aborts
+with `profile_incomplete` listing each failed role. Run the **Adopt stale
+group-chat peers** action (or `./new-room --adopt-peers`) to re-record the
+orphaned peers: it verifies each live peer's kind and native evidence, adopts
+only when all of them share exactly one `agents · group-chat` workspace that no
+other launcher state file still claims and one common cwd, and never closes,
+prompts, or moves a pane. On success it records the workspace, the common cwd,
+and each adopted pane and tab, after which the normal launch actions reuse the
+peers; a previous empty placeholder workspace is left untouched and named in
+the summary.
 
 The setup pane and the room pane are short-lived processes, so a launcher
 failure would otherwise vanish with the pane. Every failure — a known setup

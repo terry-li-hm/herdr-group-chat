@@ -4,6 +4,24 @@ All notable changes to this project are documented here.
 
 ## [0.10.0] - 2026-08-30
 
+- Add the **Adopt stale group-chat peers** action (`./new-room --adopt-peers`)
+  for the Herdr-server-restart case: a restart gives the launcher a new
+  server-instance state key, so its fresh state has no participant records
+  while the previous launch's peers stay live. The action is fail-closed: every
+  live configured peer (classic plus every profile) must match its exact kind
+  and native evidence, all candidates must share exactly one
+  `agents · group-chat` workspace that no other `launcher-state-*.json` still
+  claims, and they must share one cwd. On success it records the agents
+  workspace, the common cwd, and each adopted role's pane and tab ids, prints
+  one line per role plus a summary, and never closes, prompts, or moves a pane;
+  a previous empty placeholder workspace is left untouched and mentioned. Any
+  mismatch adopts nothing and refuses with one listed reason per failure.
+- Make `profile_incomplete` actionable: the BootstrapError message now lists
+  each failed role with its exact reason, the per-role reasons travel as a
+  `failures` list on the error and in the durable `launcher-errors.jsonl`
+  record, and the ownership failure distinguishes which check failed
+  (different workspace, different cwd, or pane not recorded) while naming the
+  live workspace, the launcher's workspace, and the adopt-or-close recovery.
 - Record launcher failures durably: the setup pane, `--room-entrypoint`, and
   the `--launch`/`--open` action now append every `BootstrapError` and every
   unexpected exception as one JSON line to `launcher-errors.jsonl` in the
