@@ -302,6 +302,118 @@ def test_inbox_empty_state_is_explicit_and_nonempty_inbox_uses_message_rendering
     assert inbox_rendered_lines(messages, 80) == message_lines(messages, 80)
 
 
+def test_room_and_inbox_wrap_graphemes_to_terminal_cells_without_losing_body() -> None:
+    body = "漢字e\u0301👩‍💻" * 6
+    item = {"sender": "送信者", "kind": "message", "body": body}
+    width = 18
+    prefix = "送信者> "
+    prefix_width = terminal_display_width(prefix)
+
+    for rendered in (message_lines([item], width), inbox_rendered_lines([item], width)):
+        body_lines = rendered[:-1]
+        body_fragments = [
+            body_lines[0][len(prefix) :],
+            *(line[prefix_width:] for line in body_lines[1:]),
+        ]
+
+        assert all(terminal_display_width(line) <= width for line in body_lines)
+        assert "".join(body_fragments) == body
+        assert [
+            cluster for fragment in body_fragments for cluster in GRAPHEME_RE.findall(fragment)
+        ] == list(GRAPHEME_RE.findall(body))
+
+
+def test_message_rendering_makes_sender_and_body_controls_visible_without_mutating_records():
+    sender = "agent\x1b]8;;https://unsafe.example\x07\x7f"
+    body = "before\x00\rafter\x1b]52;c;payload\x07\nnext"
+    item = {"sender": sender, "kind": "message", "body": body}
+
+    rendered = message_lines([item], 100)
+    visible = "\n".join(rendered)
+
+    assert all(control not in visible for control in ("\x00", "\r", "\x1b", "\x07", "\x7f"))
+    assert r"\x00\rafter\x1b]52;c;payload\a" in visible
+    assert r"\x1b]8;;https://unsafe.example\a\x7f" in visible
+    assert item["sender"] == sender
+    assert item["body"] == body
+
+
+def test_show_and_once_escape_controls_but_preserve_transcript_and_lf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sender = "agent\x1b]8;;https://unsafe.example\x07\x7f"
+    body = "before\x00\rafter\x1b]52;c;payload\x07\nnext"
+    transcript = Transcript(tmp_path, "unsafe-output")
+    transcript.append(sender, ("human",), body)
+
+    assert main(["--state-dir", str(tmp_path), "--room", "unsafe-output", "--show"]) == 0
+    shown = capsys.readouterr().out
+    assert all(control not in shown for control in ("\x00", "\r", "\x1b", "\x07", "\x7f"))
+    assert r"\x00\rafter\x1b]52;c;payload\a" in shown
+    assert any(line.endswith("next") for line in shown.splitlines())
+    assert Transcript(tmp_path, "unsafe-output").read()[0]["body"] == body
+
+    class UnsafeOnceChat:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def dispatch(self, _text: str) -> list[dict[str, str]]:
+            return [{"sender": sender, "body": body}]
+
+    monkeypatch.setattr(module, "GroupChat", UnsafeOnceChat)
+    assert main(["--state-dir", str(tmp_path), "--room", "unsafe-once", "--once", "message"]) == 0
+    once = capsys.readouterr().out
+    assert all(control not in once for control in ("\x00", "\r", "\x1b", "\x07", "\x7f"))
+    assert r"\x1b]8;;https://unsafe.example\a\x7f> before\x00\rafter" in once
+    assert "next" in once.splitlines()
+
+
+def test_main_terminal_output_boundaries_escape_status_and_final_error_controls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    detail = "unsafe\x1b]8;;https://unsafe.example\x07\rmessage"
+    safe_detail = terminal_safe_text(detail, preserve_line_breaks=True)
+    monkeypatch.setattr(module, "council_status_message", lambda _records: detail)
+
+    assert main(["--state-dir", str(tmp_path), "--room", "unsafe-status", "--council-status"]) == 0
+    assert capsys.readouterr().out == f"{safe_detail}\n"
+
+    def failing_transcript(*_args: object, **_kwargs: object) -> object:
+        raise ChatError(detail)
+
+    monkeypatch.setattr(module, "Transcript", failing_transcript)
+    assert main(["--state-dir", str(tmp_path), "--room", "unsafe-error", "--show"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"herdr-group-chat: {safe_detail}\n"
+
+
+def test_council_export_error_is_terminal_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    detail = "export failed\x00\x1b]52;c;payload\x07\r"
+    monkeypatch.setattr(
+        module, "export_council_ledger", lambda *_args: (_ for _ in ()).throw(ChatError(detail))
+    )
+
+    assert (
+        main(
+            [
+                "--state-dir",
+                str(tmp_path),
+                "--room",
+                "unsafe-export",
+                "--council-export",
+                str(tmp_path / "export.json"),
+            ]
+        )
+        == 2
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"council export failed: {terminal_safe_text(detail)}\n"
+
+
 def test_shared_rendering_and_inbox_tolerate_malformed_legacy_optional_fields() -> None:
     messages = [
         {"seq": 1, "kind": "message", "meta": None},
@@ -4560,6 +4672,16 @@ def test_council_cli_status_and_export_offline(
     assert code == 0
     assert str(target) in capsys.readouterr().out.strip()
     assert json.loads(target.read_text()) == derive_council_ledger(transcript.read())
+
+    unsafe_target = tmp_path / "cli-\x1b]8;unsafe\x07.json"
+    code = main(
+        ["--council-export", str(unsafe_target), "--state-dir", str(state_dir), "--room", room]
+    )
+    assert code == 0
+    exported_path = capsys.readouterr().out
+    assert all(control not in exported_path for control in ("\x1b", "\x07"))
+    assert exported_path == f"{terminal_safe_text(str(unsafe_target))}\n"
+    assert json.loads(unsafe_target.read_text()) == derive_council_ledger(transcript.read())
 
     empty = Transcript(tmp_path, "cli-empty-room")
     code = main(

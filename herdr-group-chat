@@ -3635,20 +3635,26 @@ def _message_label(item: Mapping[str, Any]) -> str:
 
 
 def message_lines(messages: Sequence[dict[str, Any]], width: int) -> list[str]:
+    """Render room items to terminal cells without splitting graphemes."""
+    width = max(1, width)
     lines: list[str] = []
     for item in messages:
-        prefix = f"{_message_label(item)}> "
-        paragraphs = _message_body(item).splitlines() or [""]
+        prefix = f"{terminal_safe_text(_message_label(item))}> "
+        prefix_width = terminal_display_width(prefix)
+        paragraphs = terminal_safe_text(_message_body(item), preserve_line_breaks=True).split("\n")
+        if prefix_width >= width:
+            lines.extend(_display_wrap(prefix, width))
+            for paragraph in paragraphs:
+                lines.extend(_display_wrap(paragraph, width))
+            lines.append("")
+            continue
+
+        continuation = " " * prefix_width
         first = True
         for paragraph in paragraphs:
-            wrapped = textwrap.wrap(
-                paragraph,
-                width=max(10, width - len(prefix)),
-                replace_whitespace=False,
-                drop_whitespace=True,
-            ) or [""]
+            wrapped = _display_wrap(paragraph, width - prefix_width)
             for line in wrapped:
-                lines.append((prefix if first else " " * len(prefix)) + line)
+                lines.append((prefix if first else continuation) + line)
                 first = False
         lines.append("")
     return lines
@@ -3820,10 +3826,10 @@ def lane_narrow_message(width: int, participant_count: int) -> str:
 
 
 def terminal_safe_text(text: str, *, preserve_line_breaks: bool = False) -> str:
-    """Make terminal controls visible without changing safe Unicode graphemes."""
+    """Make terminal controls visible while preserving LF when requested."""
     escaped: list[str] = []
     for character in text:
-        if preserve_line_breaks and character in "\r\n":
+        if preserve_line_breaks and character == "\n":
             escaped.append(character)
             continue
         if unicodedata.category(character) != "Cc":
@@ -3840,6 +3846,11 @@ def terminal_safe_text(text: str, *, preserve_line_breaks: bool = False) -> str:
                 replacement = f"\\U{codepoint:08x}"
         escaped.append(replacement)
     return "".join(escaped)
+
+
+def terminal_print(text: object, *, file: Any | None = None) -> None:
+    """Print human-readable terminal output without executing its controls."""
+    print(terminal_safe_text(str(text), preserve_line_breaks=True), file=file)
 
 
 def terminal_display_width(text: str) -> int:
@@ -4633,19 +4644,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         transcript = Transcript(resolve_state_dir(args.state_dir), args.room)
         if args.council_status:
-            print(council_status_message(transcript.read()))
+            terminal_print(council_status_message(transcript.read()))
             return 0
         if args.council_export is not None:
             try:
                 exported = export_council_ledger(transcript.read(), args.council_export)
             except ChatError as error:
-                print(f"council export failed: {error}", file=sys.stderr)
+                terminal_print(f"council export failed: {error}", file=sys.stderr)
                 return 2
-            print(exported)
+            terminal_print(exported)
             return 0
         if args.show:
             for line in message_lines(transcript.read(), 100):
-                print(line)
+                terminal_print(line)
             return 0
         if args.profile:
             agents = parse_profile_agents(args.agent, PROFILE_ROLES[args.profile])
@@ -4721,14 +4732,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 created = chat.dispatch(args.once)
             for item in created:
-                print(f"{item['sender']}> {item['body']}")
+                terminal_print(f"{item['sender']}> {item['body']}")
             return 0
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             raise ChatError("interactive mode requires a TTY; use --once or --show")
         curses.wrapper(run_tui, chat, args.room)
         return 0
     except ChatError as error:
-        print(f"herdr-group-chat: {error}", file=sys.stderr)
+        terminal_print(f"herdr-group-chat: {error}", file=sys.stderr)
         return 2
     finally:
         if transcript is not None:
