@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 import tomllib
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
@@ -29,6 +30,7 @@ Future = namespace["Future"]
 ChatError = namespace["ChatError"]
 GroupChat = namespace["GroupChat"]
 HerdrClient = namespace["HerdrClient"]
+DeliveryController = namespace["DeliveryController"]
 ReviewController = namespace["ReviewController"]
 Route = namespace["Route"]
 Transcript = namespace["Transcript"]
@@ -76,6 +78,7 @@ lane_narrow_message = namespace["lane_narrow_message"]
 lane_message_lines = namespace["lane_message_lines"]
 lane_view_lines = namespace["lane_view_lines"]
 draw_tui = namespace["draw_tui"]
+run_tui = namespace["run_tui"]
 tui_regions = namespace["tui_regions"]
 terminal_display_width = namespace["terminal_display_width"]
 terminal_safe_text = namespace["terminal_safe_text"]
@@ -873,6 +876,238 @@ def test_lane_draw_uses_disjoint_tiny_regions_and_actual_terminal_width(
             for row, _, text, count in screen.writes
             if row == regions.content_start and count == width
         )
+
+
+class BlockingOrdinaryClient:
+    """Return late even after local cancellation, as an uncooperative tab may."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def live_targets(self) -> set[str]:
+        return {"pi-peer", "claude-peer"}
+
+    def states(self) -> dict[str, str]:
+        return {"pi-peer": "working", "claude-peer": "idle"}
+
+    def turn(
+        self,
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, str]:
+        self.calls.append((target, prompt))
+        self.started.set()
+        assert self.release.wait(HARNESS_WAIT_S)
+        return "done", f"late reply from {target}"
+
+
+def make_blocking_ordinary_chat(tmp_path: Path) -> tuple[object, BlockingOrdinaryClient, object]:
+    transcript = Transcript(tmp_path, "ordinary-cancel-room")
+    client = BlockingOrdinaryClient()
+    chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client)
+    return chat, client, transcript
+
+
+class CancellationAwareOrdinaryClient(BlockingOrdinaryClient):
+    """Block until the relay's local token asks this ordinary turn to stop."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancelled = threading.Event()
+
+    def turn(
+        self,
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, str]:
+        self.calls.append((target, prompt))
+        self.started.set()
+        assert cancel_event is not None
+        assert cancel_event.wait(HARNESS_WAIT_S)
+        self.cancelled.set()
+        raise ChatError("review cancelled")
+
+
+def make_cancellation_aware_ordinary_chat(
+    tmp_path: Path,
+) -> tuple[object, CancellationAwareOrdinaryClient, object]:
+    transcript = Transcript(tmp_path, "ordinary-cancel-room")
+    client = CancellationAwareOrdinaryClient()
+    chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client)
+    return chat, client, transcript
+
+
+def test_ordinary_dispatch_cancellation_skips_late_reply_and_unstarted_recipients(
+    tmp_path: Path,
+) -> None:
+    chat, client, transcript = make_blocking_ordinary_chat(tmp_path)
+    cancellation = threading.Event()
+    states: list[tuple[str, str]] = []
+    created: list[dict[str, object]] = []
+
+    worker = threading.Thread(
+        target=lambda: created.extend(
+            chat.dispatch(
+                "@pi,@claude slow delivery",
+                cancellation,
+                lambda agent, state: states.append((agent, state)),
+            )
+        )
+    )
+    worker.start()
+    assert client.started.wait(HARNESS_WAIT_S)
+    cancellation.set()
+    client.release.set()
+    worker.join(HARNESS_WAIT_S)
+
+    assert not worker.is_alive()
+    assert [target for target, _ in client.calls] == ["pi-peer"]
+    assert [item["sender"] for item in created] == ["human", "system"]
+    assert transcript.cursors() == {}
+    assert states[-2:] == [("pi", "cancelled"), ("claude", "cancelled")]
+    assert transcript.read()[-1]["body"] == (
+        "Ordinary delivery cancelled locally; participants may continue working."
+    )
+
+
+def test_ordinary_dispatch_callbacks_preserve_serial_transcript_and_cursors(tmp_path: Path) -> None:
+    chat, _, transcript = make_chat(tmp_path)
+    states: list[tuple[str, str]] = []
+
+    created = chat.dispatch(
+        "@pi,@claude preserve ordinary delivery",
+        on_state=lambda agent, state: states.append((agent, state)),
+    )
+
+    assert [item["sender"] for item in created] == ["human", "pi", "claude"]
+    assert transcript.cursors() == {"pi": created[0]["seq"], "claude": created[1]["seq"]}
+    assert states == [
+        ("pi", "queued"),
+        ("claude", "queued"),
+        ("pi", "working"),
+        ("pi", "ready"),
+        ("claude", "working"),
+        ("claude", "ready"),
+    ]
+
+
+def test_delivery_controller_rejects_second_work_until_its_worker_drains(tmp_path: Path) -> None:
+    chat, client, _ = make_blocking_ordinary_chat(tmp_path)
+    controller = DeliveryController(chat)
+    controller.start("@pi slow")
+    assert client.started.wait(HARNESS_WAIT_S)
+
+    with pytest.raises(ChatError, match="still draining"):
+        controller.start("@claude second")
+    assert controller.cancel() == "Local cancellation requested; participants may continue working."
+    client.release.set()
+    assert _wait_until(lambda: not controller.is_active(), HARNESS_WAIT_S)
+
+    controller.start("@claude second")
+    assert _wait_until(lambda: len(client.calls) == 2, HARNESS_WAIT_S)
+    assert [target for target, _ in client.calls] == ["pi-peer", "claude-peer"]
+
+
+def test_delivery_controller_wait_is_bounded_for_an_uncooperative_worker(tmp_path: Path) -> None:
+    chat, client, _ = make_blocking_ordinary_chat(tmp_path)
+    controller = DeliveryController(chat)
+    controller.start("@pi slow")
+    assert client.started.wait(HARNESS_WAIT_S)
+
+    controller.cancel()
+    assert not controller.wait(0)
+    assert controller.is_active()
+    client.release.set()
+    assert controller.wait(HARNESS_WAIT_S)
+
+
+class ScriptedTuiScreen:
+    def __init__(self, keys: list[object], client: BlockingOrdinaryClient) -> None:
+        self.keys = keys
+        self.client = client
+
+    def keypad(self, _enabled: bool) -> None:
+        pass
+
+    def timeout(self, _milliseconds: int) -> None:
+        pass
+
+    def get_wch(self) -> object:
+        key = self.keys.pop(0)
+        if key == "WAIT_FOR_TURN":
+            assert self.client.started.wait(HARNESS_WAIT_S)
+            return self.keys.pop(0)
+        return key
+
+
+def test_tui_keeps_views_and_cancellation_responsive_while_delivery_drains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, client, transcript = make_cancellation_aware_ordinary_chat(tmp_path)
+    draws: list[tuple[str, str]] = []
+    keys = [
+        *list("@pi slow\n"),
+        "WAIT_FOR_TURN",
+        *list("/lanes\n/inbox\n/room\n@claude blocked second send\n/cancel\n\x11"),
+    ]
+    screen = ScriptedTuiScreen(keys, client)
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    monkeypatch.setattr(
+        module,
+        "draw_tui",
+        lambda _screen, _transcript, _room, _buffer, status, _participants, _scroll=0, **kwargs: (
+            draws.append((kwargs.get("view", "room"), status)) or 0
+        ),
+    )
+
+    started = time.monotonic()
+    run_tui(screen, chat, "ordinary-cancel-room")
+    assert time.monotonic() - started < 1
+
+    assert [target for target, _ in client.calls] == ["pi-peer"]
+    assert {view for view, _ in draws} >= {"room", "inbox", "lanes"}
+    assert any("@pi working" in status for _, status in draws)
+    assert _wait_until(
+        lambda: (
+            transcript.read()
+            and transcript.read()[-1]["body"]
+            == "Ordinary delivery cancelled locally; participants may continue working."
+        ),
+        HARNESS_WAIT_S,
+    )
+
+
+def test_tui_ctrl_q_waits_for_ordinary_cancellation_outcome_before_returning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, client, transcript = make_cancellation_aware_ordinary_chat(tmp_path)
+    screen = ScriptedTuiScreen([*list("@pi slow\n"), "WAIT_FOR_TURN", "\x11"], client)
+    controllers: list[object] = []
+
+    class TrackingDeliveryController(DeliveryController):
+        def __init__(self, tracked_chat: object) -> None:
+            super().__init__(tracked_chat)
+            controllers.append(self)
+
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    monkeypatch.setattr(module, "draw_tui", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(module, "DeliveryController", TrackingDeliveryController)
+
+    started = time.monotonic()
+    run_tui(screen, chat, "ordinary-cancel-room")
+    assert time.monotonic() - started < 1
+    assert client.cancelled.is_set()
+    assert len(controllers) == 1
+    assert not controllers[0].is_active()
+    assert transcript.read()[-1]["body"] == (
+        "Ordinary delivery cancelled locally; participants may continue working."
+    )
 
 
 @pytest.mark.parametrize("buffer", ["漢字", "e\u0301e\u0301", "👩‍💻🚀"])

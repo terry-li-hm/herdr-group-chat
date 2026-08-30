@@ -2098,14 +2098,57 @@ class GroupChat:
             on_state(agent, effective_state)
         return should_start
 
-    def dispatch(self, text: str) -> list[dict[str, Any]]:
+    def dispatch(
+        self,
+        text: str,
+        cancel_event: threading.Event | None = None,
+        on_state: Callable[[str, str], None] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Deliver one ordinary message serially, with optional local cancellation.
+
+        Callers that omit the optional hooks retain the original synchronous
+        dispatch contract.  Cancellation is local to this relay: it stops
+        waiting and leaves participant tabs untouched.
+        """
         route = parse_route(text, tuple(self.agents))
         selected = route.recipients[: self.max_turns]
+        created: list[dict[str, Any]] = []
+        cancellation_recorded = False
+
+        def set_state(agent: str, state: str) -> None:
+            if on_state is not None:
+                on_state(agent, state)
+
+        def cancel_remaining(start: int) -> None:
+            nonlocal cancellation_recorded
+            for agent in selected[start:]:
+                set_state(agent, "cancelled")
+            if not cancellation_recorded:
+                created.append(
+                    self.transcript.append(
+                        "system",
+                        ("human",),
+                        "Ordinary delivery cancelled locally; participants may continue working.",
+                    )
+                )
+                cancellation_recorded = True
+
+        for agent in selected:
+            set_state(agent, "queued")
         with self.transcript.delivery_lock():
+            if cancel_event is not None and cancel_event.is_set():
+                cancel_remaining(0)
+                return created
             self._ensure_live(selected)
-            created = [self.transcript.append("human", selected, route.body)]
+            if cancel_event is not None and cancel_event.is_set():
+                cancel_remaining(0)
+                return created
+            created.append(self.transcript.append("human", selected, route.body))
             cursors = self.transcript.cursors()
-            for agent in selected:
+            for index, agent in enumerate(selected):
+                if cancel_event is not None and cancel_event.is_set():
+                    cancel_remaining(index)
+                    break
                 messages = [
                     item
                     for item in self.transcript.read()
@@ -2116,20 +2159,37 @@ class GroupChat:
                 delivered_through = max(item["seq"] for item in messages)
                 token = uuid.uuid4().hex
                 prompt = build_prompt(agent, messages, token, tuple(self.agents), self.host_label)
+                set_state(agent, "working")
                 try:
-                    status, reply = self.client.turn(
-                        self.agents[agent], prompt, self._timeout_for(agent)
-                    )
+                    if cancel_event is None:
+                        status, reply = self.client.turn(
+                            self.agents[agent], prompt, self._timeout_for(agent)
+                        )
+                    else:
+                        status, reply = self.client.turn(
+                            self.agents[agent], prompt, self._timeout_for(agent), cancel_event
+                        )
+                    if cancel_event is not None and cancel_event.is_set():
+                        set_state(agent, "cancelled")
+                        cancel_remaining(index + 1)
+                        break
                     if status == "blocked":
                         item = self.transcript.append(
                             "system",
                             ("human",),
                             f"@{agent} is blocked and needs attention in {self.host_label}.",
                         )
+                        set_state(agent, "blocked")
                     else:
                         item = self.transcript.append(agent, ("human", "all"), reply)
+                        set_state(agent, "ready")
                 except ChatError as error:
+                    if cancel_event is not None and cancel_event.is_set():
+                        set_state(agent, "cancelled")
+                        cancel_remaining(index + 1)
+                        break
                     item = self.transcript.append("system", ("human",), f"@{agent}: {error}")
+                    set_state(agent, "failed")
                 created.append(item)
                 if item["sender"] == agent:
                     self.transcript.advance_cursor(agent, delivered_through)
@@ -4075,6 +4135,104 @@ def handle_picker_key(
     return None
 
 
+class DeliveryController:
+    """Own the one ordinary-delivery worker used by the curses event loop."""
+
+    def __init__(self, chat: GroupChat) -> None:
+        self.chat = chat
+        self._lock = threading.RLock()
+        self._thread: threading.Thread | None = None
+        self._cancel_event: threading.Event | None = None
+        self._states: dict[str, str] = {}
+        self._order: tuple[str, ...] = ()
+        self._notice = ""
+
+    def _on_state(self, delivery_event: threading.Event, agent: str, state: str) -> None:
+        with self._lock:
+            if delivery_event is not self._cancel_event:
+                return
+            # Once local cancellation wins, a late client completion cannot
+            # repaint a cancelled recipient as ready, blocked, or failed.
+            if delivery_event.is_set() and state != "cancelled":
+                return
+            self._states[agent] = state
+
+    def _run(self, text: str, delivery_event: threading.Event) -> None:
+        try:
+            self.chat.dispatch(
+                text,
+                delivery_event,
+                lambda agent, state: self._on_state(delivery_event, agent, state),
+            )
+        except ChatError as error:
+            with self._lock:
+                if delivery_event is self._cancel_event and not delivery_event.is_set():
+                    self._notice = f"Delivery failed: {error}"
+        except Exception as error:
+            with self._lock:
+                if delivery_event is self._cancel_event and not delivery_event.is_set():
+                    self._notice = f"Delivery failed unexpectedly: {error}"
+        finally:
+            with self._lock:
+                if delivery_event is self._cancel_event:
+                    if delivery_event.is_set():
+                        self._notice = (
+                            "Delivery cancelled locally; participants may continue working."
+                        )
+                    elif not self._notice:
+                        self._notice = participant_status(self.chat, "Delivered.")
+
+    def is_active(self) -> bool:
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    def wait(self, timeout: float = 5) -> bool:
+        with self._lock:
+            thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
+    def start(self, text: str) -> None:
+        route = parse_route(text, tuple(self.chat.agents))
+        order = route.recipients[: self.chat.max_turns]
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                raise ChatError("ordinary delivery is still draining; use /cancel or wait")
+            delivery_event = threading.Event()
+            self._cancel_event = delivery_event
+            self._order = order
+            self._states = {agent: "queued" for agent in order}
+            self._notice = ""
+            self._thread = threading.Thread(
+                target=self._run,
+                args=(text, delivery_event),
+                name="hgchat-ordinary-delivery",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def cancel(self) -> str:
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive() or self._cancel_event is None:
+                raise ChatError("there is no active ordinary delivery to cancel")
+            self._cancel_event.set()
+            for agent, state in self._states.items():
+                if state in {"queued", "working"}:
+                    self._states[agent] = "cancelled"
+            self._notice = "Delivery cancelled locally; participants may continue working."
+        return "Local cancellation requested; participants may continue working."
+
+    def status(self) -> str:
+        with self._lock:
+            active = self._thread is not None and self._thread.is_alive()
+            if not active:
+                return self._notice
+            labels = [f"@{name} {self._states.get(name, 'queued')}" for name in self._order]
+        return "Delivery: " + " · ".join(labels)
+
+
 class ReviewController:
     def __init__(self, chat: GroupChat) -> None:
         self.chat = chat
@@ -4472,6 +4630,7 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
     scroll_offset = 0
     participants = tuple(chat.agents)
     reviews = ReviewController(chat)
+    deliveries = DeliveryController(chat)
     view = "room"
     status = participant_status(chat, "Ready.")
     status_override = False
@@ -4492,7 +4651,12 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
             picker_index %= len(suggestions)
             shown_status = mention_display(suggestions, picker_index)
         else:
-            shown_status = status if status_override else (review_status or status)
+            delivery_status = deliveries.status()
+            shown_status = (
+                delivery_status
+                if deliveries.is_active() or (delivery_status and status.startswith("Delivery:"))
+                else (status if status_override else (review_status or status))
+            )
         max_scroll = draw_tui(
             screen,
             chat.transcript,
@@ -4527,11 +4691,15 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
                 buffer, picker_index = handled
                 continue
         if key in ("\x03", "\x11"):
-            if reviews.is_active():
+            # Both paths request local cancellation and wait up to five seconds
+            # for their owned worker to drain. Participant tabs remain untouched.
+            if deliveries.is_active():
+                with suppress(ChatError):
+                    deliveries.cancel()
+                deliveries.wait(5)
+            elif reviews.is_active():
                 with suppress(ChatError):
                     reviews.cancel()
-                # Let local workers observe cancellation; participant tabs are never interrupted
-                # and may continue working after this room exits.
                 reviews.wait(5)
             return
         if key == curses.KEY_PPAGE:
@@ -4548,8 +4716,24 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
             view_result = handle_view_command(buffer)
             if view_result is not None:
                 view, status = view_result
-                status_override = not reviews.is_active()
+                status_override = not reviews.is_active() and not deliveries.is_active()
                 scroll_offset = 0
+                buffer = ""
+                continue
+            if buffer.strip() == "/cancel" and deliveries.is_active():
+                try:
+                    status = deliveries.cancel()
+                except ChatError as error:
+                    status = str(error)
+                status_override = True
+                buffer = ""
+                continue
+            if deliveries.is_active():
+                status = (
+                    "Ordinary delivery is still draining; use /cancel or wait before "
+                    "starting more work."
+                )
+                status_override = True
                 buffer = ""
                 continue
             try:
@@ -4567,20 +4751,9 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
                 status_override = True
                 buffer = ""
                 continue
-            status = "Waiting for the addressed agents..."
-            draw_tui(
-                screen,
-                chat.transcript,
-                room,
-                "",
-                status,
-                participants,
-                title=f"{chat.host_label} group chat",
-                view=view,
-            )
             try:
-                chat.dispatch(buffer)
-                status = participant_status(chat, "Delivered.")
+                deliveries.start(buffer)
+                status = deliveries.status()
             except ChatError as error:
                 status = str(error)
             status_override = True
