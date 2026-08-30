@@ -106,6 +106,9 @@ CONTROL_ESCAPES = {
     "\r": r"\r",
     "\x1b": r"\x1b",
 }
+TERMINAL_DIRECTIONAL_CONTROLS = frozenset(
+    "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+)
 
 
 class ChatError(RuntimeError):
@@ -3712,7 +3715,7 @@ def message_lines(messages: Sequence[dict[str, Any]], width: int) -> list[str]:
         continuation = " " * prefix_width
         first = True
         for paragraph in paragraphs:
-            wrapped = _display_wrap(paragraph, width - prefix_width)
+            wrapped = _display_word_wrap(paragraph, width - prefix_width)
             for line in wrapped:
                 lines.append((prefix if first else continuation) + line)
                 first = False
@@ -3886,13 +3889,16 @@ def lane_narrow_message(width: int, participant_count: int) -> str:
 
 
 def terminal_safe_text(text: str, *, preserve_line_breaks: bool = False) -> str:
-    """Make terminal controls visible while preserving LF when requested."""
+    """Make terminal controls and directional format characters visible."""
     escaped: list[str] = []
     for character in text:
         if preserve_line_breaks and character == "\n":
             escaped.append(character)
             continue
-        if unicodedata.category(character) != "Cc":
+        if (
+            unicodedata.category(character) != "Cc"
+            and character not in TERMINAL_DIRECTIONAL_CONTROLS
+        ):
             escaped.append(character)
             continue
         replacement = CONTROL_ESCAPES.get(character)
@@ -3959,6 +3965,36 @@ def _display_wrap(text: str, width: int) -> list[str]:
     if current:
         lines.append("".join(current))
     return lines or [""]
+
+
+def _display_word_wrap(text: str, width: int) -> list[str]:
+    """Wrap at the last fitting whitespace grapheme without losing it."""
+    if width <= 0:
+        return []
+    safe = terminal_safe_text(text)
+    clusters = GRAPHEME_RE.findall(safe)
+    if not clusters:
+        return [""]
+    lines: list[str] = []
+    while clusters:
+        used = 0
+        fitting = 0
+        last_whitespace = 0
+        for position, cluster in enumerate(clusters, start=1):
+            cluster_width = max(0, wcswidth(cluster))
+            if fitting and used + cluster_width > width:
+                break
+            used += cluster_width
+            fitting = position
+            if cluster.isspace():
+                last_whitespace = position
+        if fitting == len(clusters):
+            lines.append("".join(clusters))
+            break
+        split_at = last_whitespace or max(1, fitting)
+        lines.append("".join(clusters[:split_at]))
+        clusters = clusters[split_at:]
+    return lines
 
 
 def _lane_cell(text: str, width: int) -> str:
@@ -4183,12 +4219,13 @@ class DeliveryController:
             if needs_final_notice:
                 final_notice = participant_status(self.chat, "Delivered.")
             with self._lock:
-                if delivery_event is not self._cancel_event:
-                    return
-                if delivery_event.is_set():
-                    self._notice = "Delivery cancelled locally; participants may continue working."
-                elif not self._notice:
-                    self._notice = final_notice
+                if delivery_event is self._cancel_event:
+                    if delivery_event.is_set():
+                        self._notice = (
+                            "Delivery cancelled locally; participants may continue working."
+                        )
+                    elif not self._notice:
+                        self._notice = final_notice
 
     def is_active(self) -> bool:
         with self._lock:
@@ -4665,9 +4702,9 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
             shown_status = mention_display(suggestions, picker_index)
         else:
             delivery_status = deliveries.status()
-            if status_override == "independent":
-                shown_status = status
-            elif status_override == "delivery" and deliveries.is_active():
+            if status_override == "independent" or (
+                status_override == "delivery" and deliveries.is_active()
+            ):
                 shown_status = status
             elif deliveries.is_active():
                 shown_status = delivery_status
@@ -4932,7 +4969,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 created = chat.dispatch(args.once)
             for item in created:
-                terminal_print(f"{item['sender']}> {item['body']}")
+                sender = terminal_safe_text(str(item["sender"]))
+                body = terminal_safe_text(str(item["body"]))
+                terminal_print(f"{sender}> {body}")
             return 0
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             raise ChatError("interactive mode requires a TTY; use --once or --show")

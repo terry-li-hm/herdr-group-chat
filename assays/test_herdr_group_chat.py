@@ -327,34 +327,83 @@ def test_room_and_inbox_wrap_graphemes_to_terminal_cells_without_losing_body() -
         ] == list(GRAPHEME_RE.findall(body))
 
 
+@pytest.mark.parametrize(
+    ("body", "width", "expected_fragments"),
+    [
+        ("alpha beta gamma", 10, ["alpha ", "beta ", "gamma"]),
+        ("漢字 🙂 words", 12, None),
+        ("e\u0301 👩‍💻 café", 11, None),
+        ("supercalifragilisticexpialidocious", 10, None),
+    ],
+)
+def test_room_and_inbox_prefer_word_boundaries_without_losing_graphemes(
+    body: str, width: int, expected_fragments: list[str] | None
+) -> None:
+    item = {"sender": "pi", "kind": "message", "body": body}
+    prefix = "pi> "
+    prefix_width = terminal_display_width(prefix)
+
+    for rendered in (message_lines([item], width), inbox_rendered_lines([item], width)):
+        body_lines = rendered[:-1]
+        body_fragments = [
+            body_lines[0][len(prefix) :],
+            *(line[prefix_width:] for line in body_lines[1:]),
+        ]
+
+        assert "".join(body_fragments) == body
+        assert all(terminal_display_width(line) <= width for line in body_lines)
+        assert [
+            cluster for fragment in body_fragments for cluster in GRAPHEME_RE.findall(fragment)
+        ] == list(GRAPHEME_RE.findall(body))
+        if expected_fragments is not None:
+            assert body_fragments == expected_fragments
+
+
+def test_terminal_safe_text_escapes_directional_controls_without_breaking_zwj_graphemes() -> None:
+    directional = "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+    safe = terminal_safe_text(f"before{directional}👩‍💻after")
+
+    assert all(control not in safe for control in directional)
+    assert all(f"\\u{ord(control):04x}" in safe for control in directional)
+    assert "👩‍💻" in safe
+    assert list(GRAPHEME_RE.findall("👩‍💻")) == ["👩‍💻"]
+
+
 def test_message_rendering_makes_sender_and_body_controls_visible_without_mutating_records():
-    sender = "agent\x1b]8;;https://unsafe.example\x07\x7f"
-    body = "before\x00\rafter\x1b]52;c;payload\x07\nnext"
+    sender = "agent\u202e\x1b]8;;https://unsafe.example\x07\x7f"
+    body = "before\x00\rafter\u2066\x1b]52;c;payload\x07\nnext\u200f"
     item = {"sender": sender, "kind": "message", "body": body}
 
     rendered = message_lines([item], 100)
     visible = "\n".join(rendered)
 
-    assert all(control not in visible for control in ("\x00", "\r", "\x1b", "\x07", "\x7f"))
-    assert r"\x00\rafter\x1b]52;c;payload\a" in visible
-    assert r"\x1b]8;;https://unsafe.example\a\x7f" in visible
+    assert all(
+        control not in visible
+        for control in ("\x00", "\r", "\x1b", "\x07", "\x7f", "\u202e", "\u2066", "\u200f")
+    )
+    assert r"\x00\rafter\u2066\x1b]52;c;payload\a" in visible
+    assert r"agent\u202e\x1b]8;;https://unsafe.example\a\x7f" in visible
+    assert all(terminal_display_width(line) <= 100 for line in rendered)
     assert item["sender"] == sender
     assert item["body"] == body
 
 
-def test_show_and_once_escape_controls_but_preserve_transcript_and_lf(
+def test_show_and_once_escape_controls_without_mutating_the_transcript(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    sender = "agent\x1b]8;;https://unsafe.example\x07\x7f"
-    body = "before\x00\rafter\x1b]52;c;payload\x07\nnext"
+    sender = "agent\u202e\x1b]8;;https://unsafe.example\x07\x7f"
+    body = "before\x00\rafter\u2066\x1b]52;c;payload\x07\nnext\u200f"
     transcript = Transcript(tmp_path, "unsafe-output")
     transcript.append(sender, ("human",), body)
 
     assert main(["--state-dir", str(tmp_path), "--room", "unsafe-output", "--show"]) == 0
     shown = capsys.readouterr().out
-    assert all(control not in shown for control in ("\x00", "\r", "\x1b", "\x07", "\x7f"))
-    assert r"\x00\rafter\x1b]52;c;payload\a" in shown
-    assert any(line.endswith("next") for line in shown.splitlines())
+    assert all(
+        control not in shown
+        for control in ("\x00", "\r", "\x1b", "\x07", "\x7f", "\u202e", "\u2066", "\u200f")
+    )
+    assert r"\x00\rafter\u2066\x1b]52;c;payload\a" in shown
+    assert any(line.endswith(r"next\u200f") for line in shown.splitlines())
     assert Transcript(tmp_path, "unsafe-output").read()[0]["body"] == body
 
     class UnsafeOnceChat:
@@ -367,15 +416,34 @@ def test_show_and_once_escape_controls_but_preserve_transcript_and_lf(
     monkeypatch.setattr(module, "GroupChat", UnsafeOnceChat)
     assert main(["--state-dir", str(tmp_path), "--room", "unsafe-once", "--once", "message"]) == 0
     once = capsys.readouterr().out
-    assert all(control not in once for control in ("\x00", "\r", "\x1b", "\x07", "\x7f"))
-    assert r"\x1b]8;;https://unsafe.example\a\x7f> before\x00\rafter" in once
-    assert "next" in once.splitlines()
+    assert all(
+        control not in once
+        for control in ("\x00", "\r", "\x1b", "\x07", "\x7f", "\u202e", "\u2066", "\u200f")
+    )
+    assert r"agent\u202e\x1b]8;;https://unsafe.example\a\x7f> before\x00\rafter" in once
+    assert r"\u2066\x1b]52;c;payload\a\nnext\u200f" in once
+    assert once.count("\n") == 1
+
+
+def test_once_escapes_embedded_lines_that_could_forge_senders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class ForgingOnceChat:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def dispatch(self, _text: str) -> list[dict[str, str]]:
+            return [{"sender": "pi\nclaude", "body": "answer\nsystem> forged"}]
+
+    monkeypatch.setattr(module, "GroupChat", ForgingOnceChat)
+    assert main(["--state-dir", str(tmp_path), "--room", "forged-once", "--once", "message"]) == 0
+    assert capsys.readouterr().out == r"pi\nclaude> answer\nsystem> forged" + "\n"
 
 
 def test_main_terminal_output_boundaries_escape_status_and_final_error_controls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    detail = "unsafe\x1b]8;;https://unsafe.example\x07\rmessage"
+    detail = "unsafe\u202e\x1b]8;;https://unsafe.example\x07\rmessage"
     safe_detail = terminal_safe_text(detail, preserve_line_breaks=True)
     monkeypatch.setattr(module, "council_status_message", lambda _records: detail)
 
