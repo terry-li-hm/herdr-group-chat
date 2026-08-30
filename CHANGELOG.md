@@ -15,6 +15,11 @@ All notable changes to this project are documented here.
   dropping without closing participant tabs.
 - Keep status handoffs current between ordinary delivery and reviews, and keep
   delivery controls responsive while final participant state is read.
+- Fix fresh Codex sessions reporting done with a blank terminal capture: relay
+  turns make one at-most-once `herdr agent prompt --wait` call, recover
+  marker-bound output only from the exact Herdr-named current-user-owned Codex
+  rollout, retain terminal fallback, and never replay the payload after a
+  local timeout, cancellation, or identity failure.
 
 ## [0.10.1] - 2026-08-30
 
