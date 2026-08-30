@@ -189,9 +189,13 @@ def resolve_profile(profile: str | None) -> tuple[Participant, ...]:
 class BootstrapError(RuntimeError):
     """A user-visible setup failure."""
 
-    def __init__(self, message: str, code: str | None = None) -> None:
+    def __init__(
+        self, message: str, code: str | None = None, failures: Sequence[str] | None = None
+    ) -> None:
         super().__init__(message)
         self.code = code
+        # Optional per-role reasons carried into the durable launcher record.
+        self.failures = list(failures) if failures else None
 
 
 def _run_herdr(
@@ -254,7 +258,8 @@ def _launcher_error_record(
     """Build one failure record: the launch facts plus non-secret Herdr context."""
     context = plugin_context()
     configured_state_dir = os.environ.get("HERDR_PLUGIN_STATE_DIR", "").strip()
-    return {
+    carried_failures = getattr(error, "failures", None)
+    record: dict[str, Any] = {
         "at": datetime.now(UTC).isoformat(),
         "mode": mode,
         "argv": list(arguments),
@@ -274,6 +279,9 @@ def _launcher_error_record(
             },
         },
     }
+    if carried_failures:
+        record["failures"] = list(carried_failures)
+    return record
 
 
 def _write_launcher_error_record(record: dict[str, Any]) -> None:
@@ -1341,6 +1349,24 @@ def same_cwd(left: str, right: str) -> bool:
     return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
 
 
+def ownership_mismatch_reasons(
+    live_agent: Mapping[str, Any],
+    agents_workspace_id: str,
+    live_cwd: str,
+    agent_cwd: str,
+    recorded_pane_id: str | None,
+) -> list[str]:
+    """Name every failed ownership check for an already-live participant."""
+    reasons: list[str] = []
+    if str(live_agent.get("workspace_id")) != agents_workspace_id:
+        reasons.append("different workspace")
+    if not live_cwd or not same_cwd(live_cwd, agent_cwd):
+        reasons.append("different cwd")
+    if recorded_pane_id != str(live_agent.get("pane_id")):
+        reasons.append("pane not recorded")
+    return reasons
+
+
 def infer_owned_agents_cwd(herdr_bin: str, agents_workspace_id: str, requested_cwd: str) -> str:
     listed = run_json(herdr_bin, ["agent", "list"])
     expected_names = {name for _, name in PARTICIPANTS} | {
@@ -1451,8 +1477,16 @@ def start_participants(
                 or not same_cwd(live_cwd, agent_cwd)
                 or recorded_pane_id != str(live_agent.get("pane_id"))
             ):
+                reasons = ", ".join(
+                    ownership_mismatch_reasons(
+                        live_agent, agents_workspace_id, live_cwd, agent_cwd, recorded_pane_id
+                    )
+                )
                 failures.append(
-                    f"@{role}: {name} is already in use outside this plugin-owned project"
+                    f"@{role}: {name} is live in workspace "
+                    f"{live_agent.get('workspace_id')} but this launcher owns "
+                    f"{agents_workspace_id} ({reasons}); run the Adopt stale "
+                    "group-chat peers action or close that peer tab"
                 )
                 print(f"failed @{role}", flush=True)
                 continue
@@ -1692,8 +1726,10 @@ def main() -> int:
             save_launcher_state(state_dir, state, state_path)
             raise BootstrapError(
                 f"the {profile} profile requires every participant to verify "
-                "native-ui evidence; the room was not opened",
+                "native-ui evidence; the room was not opened:\n"
+                + "\n".join(f"- {failure}" for failure in failures),
                 code="profile_incomplete",
+                failures=failures,
             )
         if profile:
             # Trust the profile only for this room, whose id lands in last_room_id.

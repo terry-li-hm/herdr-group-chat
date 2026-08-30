@@ -814,7 +814,8 @@ def test_participant_start_does_not_move_a_globally_named_external_agent(
         "herdr", str(tmp_path), "w-agents", tmp_path, launcher_state_path(tmp_path), state
     )
 
-    assert failures and "outside this plugin-owned project" in failures[0]
+    assert failures and "(pane not recorded)" in failures[0]
+    assert "Adopt stale group-chat peers" in failures[0]
     assert calls == [["agent", "list"]]
 
 
@@ -1514,7 +1515,9 @@ def test_launch_hands_participant_failures_to_the_room_process(
 
     env = captured["env"]
     assert env[module.SETUP_FAILURES_ENV] == (
-        "@pi: pi-peer is already in use outside this plugin-owned project"
+        "@pi: pi-peer is live in workspace w-other but this launcher owns "
+        "w-agents (different workspace, different cwd, pane not recorded); "
+        "run the Adopt stale group-chat peers action or close that peer tab"
     )
     argv = captured["argv"]
     assert argv[0].endswith("herdr-group-chat") and "--room" in argv
@@ -1674,10 +1677,16 @@ def install_profile_host(
     catalog_rows: dict[tuple[str, str], bool] | None = None,
     live_agents: list[dict] | None = None,
     process_infos: dict[str, list[dict]] | None = None,
+    workspaces: list[dict] | None = None,
 ) -> None:
     """Fake Herdr plus the native Pi catalog for profile participant flows."""
     catalog_rows = catalog_rows if catalog_rows is not None else {}
     live_agents = [] if live_agents is None else live_agents
+    workspaces = (
+        workspaces
+        if workspaces is not None
+        else [{"workspace_id": "w-agents", "label": "agents · group-chat"}]
+    )
 
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
@@ -1685,11 +1694,7 @@ def install_profile_host(
         if arguments == ["agent", "list"]:
             return {"result": {"agents": live_agents}}
         if arguments == ["workspace", "list"]:
-            return {
-                "result": {
-                    "workspaces": [{"workspace_id": "w-agents", "label": "agents · group-chat"}]
-                }
-            }
+            return {"result": {"workspaces": workspaces}}
         if arguments[:2] == ["tab", "create"]:
             label = arguments[arguments.index("--label") + 1]
             role = label.split("-")[1]
@@ -3768,6 +3773,80 @@ def test_room_reopen_reverifies_sol_fable_glm_and_execs_with_receipt(
         call[call.index("--pane") + 1] for call in calls if call[:2] == ["pane", "process-info"]
     }
     assert process_panes == {"w-agents:p-fable"}
+
+
+def test_profile_incomplete_message_and_record_carry_each_role_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    profile_launch_env(tmp_path, monkeypatch, captured)
+    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable-grok")
+    monkeypatch.setenv(module.ROOM_ENV, "chat-sfg")
+    live = [
+        {**agent, "workspace_id": "w-old"}
+        if agent["name"] == "sol-peer"
+        else {**agent, "cwd": str(tmp_path / "elsewhere")}
+        if agent["name"] == "fable-peer"
+        else agent
+        for agent in SFG_LIVE_AGENTS
+    ]
+    calls = install_sfg_host(
+        monkeypatch,
+        tmp_path,
+        {
+            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-fable": FABLE_SCREEN,
+            "w-agents:p-grok": GROK_SCREEN,
+        },
+        live_agents=live,
+    )
+    # install_sfg_host normalises every cwd to tmp_path; move Fable afterwards.
+    live[1]["cwd"] = str(tmp_path / "elsewhere")
+    state = sfg_room_state(tmp_path)
+    # This session recorded Sol and Fable, but never Grok's pane.
+    state["participant_pane_ids"] = {"sol": "w-agents:p-sol", "fable": "w-agents:p-fable"}
+    state["participant_tab_ids"] = {"sol": "w-agents:t-sol", "fable": "w-agents:t-fable"}
+    save_launcher_state(tmp_path, state)
+
+    with pytest.raises(BootstrapError) as excinfo:
+        module.main()
+
+    error = excinfo.value
+    assert error.code == "profile_incomplete"
+    message = str(error)
+    assert (
+        "- @sol: sol-peer is live in workspace w-old but this launcher owns "
+        "w-agents (different workspace)" in message
+    )
+    assert (
+        "- @fable: fable-peer is live in workspace w-agents but this launcher owns "
+        "w-agents (different cwd)" in message
+    )
+    assert (
+        "- @grok: grok46-peer is live in workspace w-agents but this launcher owns "
+        "w-agents (pane not recorded)" in message
+    )
+    assert "run the Adopt stale group-chat peers action or close that peer tab" in message
+    assert error.failures == [
+        "@sol: sol-peer is live in workspace w-old but this launcher owns w-agents "
+        "(different workspace); run the Adopt stale group-chat peers action or "
+        "close that peer tab",
+        "@fable: fable-peer is live in workspace w-agents but this launcher owns "
+        "w-agents (different cwd); run the Adopt stale group-chat peers action or "
+        "close that peer tab",
+        "@grok: grok46-peer is live in workspace w-agents but this launcher owns "
+        "w-agents (pane not recorded); run the Adopt stale group-chat peers action "
+        "or close that peer tab",
+    ]
+    record = module._launcher_error_record(
+        "--launch", ["--launch", "--profile", "sol-fable-grok"], error
+    )
+    assert record["failures"] == error.failures
+    plain = module._launcher_error_record("setup", [], BootstrapError("boom"))
+    assert "failures" not in plain
+    assert "argv" not in captured
+    # Nothing was closed while refusing: the peers stay exactly as they were.
+    assert not any(tuple(call[:2]) in (("tab", "close"), ("pane", "close")) for call in calls)
 
 
 # --- durable launcher failure records --------------------------------------------------
