@@ -37,6 +37,20 @@ herdr plugin action invoke new --plugin terry.herdr-group-chat
 
 For local development, use `herdr plugin link .` from the checkout instead.
 
+## Hotkey
+
+The plugin actions appear in Herdr's action palette. To bind the default room
+to a key, add a `plugin_action` keybinding to `~/.config/herdr/config.toml` and
+run `herdr server reload-config`:
+
+```toml
+[[keys.command]]
+key = "prefix+g"
+type = "plugin_action"
+command = "terry.herdr-group-chat.new"
+description = "new group chat (Sol + Fable + Grok)"
+```
+
 ## Use
 
 Plain messages address everyone. Prefix a message to select participants:
