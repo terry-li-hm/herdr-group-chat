@@ -1401,6 +1401,32 @@ def blocked_startup_prompt_guidance(participant: Participant) -> str:
     )
 
 
+def blocked_pending_participant_tab_exists(
+    herdr_bin: str, agents_workspace_id: str, pending: object
+) -> bool:
+    """Return whether the exact blocked-startup tab remains in the owned workspace."""
+    if not isinstance(pending, dict) or pending.get("blocked_startup") is not True:
+        return False
+    tab_id = pending.get("tab_id")
+    pane_id = pending.get("pane_id")
+    if not isinstance(tab_id, str) or not tab_id or not isinstance(pane_id, str) or not pane_id:
+        return False
+    listed = run_json(herdr_bin, ["tab", "list", "--workspace", agents_workspace_id])
+    for tab in listed.get("result", {}).get("tabs", []):
+        if not isinstance(tab, dict) or tab.get("tab_id") != tab_id:
+            continue
+        if "workspace_id" in tab and str(tab["workspace_id"]) != agents_workspace_id:
+            continue
+        root_pane = tab.get("root_pane")
+        listed_pane_id = tab.get("pane_id") or tab.get("root_pane_id")
+        if isinstance(root_pane, dict):
+            listed_pane_id = listed_pane_id or root_pane.get("pane_id")
+        return listed_pane_id is None or (
+            isinstance(listed_pane_id, str) and listed_pane_id == pane_id
+        )
+    return False
+
+
 def infer_owned_agents_cwd(herdr_bin: str, agents_workspace_id: str, requested_cwd: str) -> str:
     listed = run_json(herdr_bin, ["agent", "list"])
     expected_names = {name for _, name in PARTICIPANTS} | {
@@ -1585,21 +1611,38 @@ def start_participants(
             save_launcher_state(state_dir, state, state_path)
         pending = pending_tabs.get(role)
         if pending:
-            age_ms = int(time.time() * 1000) - int(pending.get("started_unix_ms", 0))
-            if age_ms < PENDING_ROOM_GRACE_MS:
-                failures.append(f"@{role}: previous agent start is still pending")
-                print(f"pending @{role}", flush=True)
-                continue
-            try:
-                close_pending_participant_tab(
-                    herdr_bin, agents_workspace_id, pending, state_dir, state_path
-                )
-            except BootstrapError as error:
-                failures.append(f"@{role}: pending-tab cleanup failed: {error}")
-                print(f"cleanup @{role} pending", flush=True)
-                continue
-            pending_tabs.pop(role, None)
-            save_launcher_state(state_dir, state, state_path)
+            if pending.get("blocked_startup") is True:
+                try:
+                    blocked_tab_exists = blocked_pending_participant_tab_exists(
+                        herdr_bin, agents_workspace_id, pending
+                    )
+                except BootstrapError as error:
+                    failures.append(f"@{role}: blocked-startup tab check failed: {error}")
+                    print(f"blocked @{role} check", flush=True)
+                    continue
+                if blocked_tab_exists:
+                    failures.append(blocked_startup_prompt_guidance(participant))
+                    print(f"pending @{role} trust", flush=True)
+                    continue
+                pending_tabs.pop(role, None)
+                save_launcher_state(state_dir, state, state_path)
+                pending = None
+            if pending:
+                age_ms = int(time.time() * 1000) - int(pending.get("started_unix_ms", 0))
+                if age_ms < PENDING_ROOM_GRACE_MS:
+                    failures.append(f"@{role}: previous agent start is still pending")
+                    print(f"pending @{role}", flush=True)
+                    continue
+                try:
+                    close_pending_participant_tab(
+                        herdr_bin, agents_workspace_id, pending, state_dir, state_path
+                    )
+                except BootstrapError as error:
+                    failures.append(f"@{role}: pending-tab cleanup failed: {error}")
+                    print(f"cleanup @{role} pending", flush=True)
+                    continue
+                pending_tabs.pop(role, None)
+                save_launcher_state(state_dir, state, state_path)
         try:
             if not catalog_proof(participant):
                 failures.append(
@@ -1679,6 +1722,7 @@ def start_participants(
                 # Herdr has started the native agent but it is blocked in its
                 # own trust UI. Preserve the recorded pane/tab so a later
                 # setup retry can prove and promote that exact surface.
+                pending_tabs[role]["blocked_startup"] = True
                 save_launcher_state(state_dir, state, state_path)
                 failures.append(blocked_startup_prompt_guidance(participant))
                 print(f"pending @{role} trust", flush=True)

@@ -912,7 +912,8 @@ def test_indeterminate_agent_start_is_recorded_and_not_duplicated(
         "herdr", str(tmp_path), "w-agents", tmp_path, state_path, state
     )
 
-    assert first and second
+    assert first
+    assert second == ["@pi: previous agent start is still pending"]
     assert len([call for call in calls if call[:2] == ["tab", "create"]]) == 1
     assert state["pending_participant_tabs"]["pi"]["pane_id"] == "w-agents:p-pending"
 
@@ -1705,9 +1706,118 @@ def test_agent_not_ready_preserves_the_pending_trust_prompt_tab(
     ]
     assert state["pending_participant_tabs"][participant.role]["pane_id"] == pane_id
     assert state["pending_participant_tabs"][participant.role]["tab_id"] == tab_id
+    assert state["pending_participant_tabs"][participant.role]["blocked_startup"] is True
     assert participant.role not in state.get("participant_pane_ids", {})
     assert participant.role not in state.get("participant_tab_ids", {})
     assert not any(call[:2] == ["tab", "close"] for call in calls)
+
+
+def test_stale_blocked_startup_tab_is_preserved_and_repeats_prompt_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    participant = module.Participant(role="codex", kind="codex", name="codex-peer")
+    pending = {
+        "label": "hgchat-codex-trust",
+        "pane_id": "w-agents:p-codex",
+        "tab_id": "w-agents:t-codex",
+        "started_unix_ms": 0,
+        "blocked_startup": True,
+    }
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {"result": {"agents": []}}
+        if arguments == ["tab", "list", "--workspace", "w-agents"]:
+            return {
+                "result": {
+                    "tabs": [
+                        {
+                            "tab_id": pending["tab_id"],
+                            "workspace_id": "w-agents",
+                            "root_pane": {"pane_id": pending["pane_id"]},
+                        }
+                    ]
+                }
+            }
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {"schema_version": 1, "pending_participant_tabs": {"codex": pending}}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=(participant,),
+    )
+
+    assert failures == [module.blocked_startup_prompt_guidance(participant)]
+    assert state["pending_participant_tabs"]["codex"] == pending
+    assert not any(call[:2] in (["tab", "close"], ["tab", "create"]) for call in calls)
+
+
+def test_missing_blocked_startup_tab_is_cleared_before_a_fresh_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    participant = module.Participant(role="codex", kind="codex", name="codex-peer")
+    pending = {
+        "label": "hgchat-codex-trust",
+        "pane_id": "w-agents:p-closed",
+        "tab_id": "w-agents:t-closed",
+        "started_unix_ms": 0,
+        "blocked_startup": True,
+    }
+    other_pending = {"label": "hgchat-other", "started_unix_ms": 0}
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {"result": {"agents": []}}
+        if arguments == ["tab", "list", "--workspace", "w-agents"]:
+            return {"result": {"tabs": []}}
+        if arguments[:2] == ["tab", "create"]:
+            return {
+                "result": {
+                    "tab": {"tab_id": "w-agents:t-fresh"},
+                    "root_pane": {"pane_id": "w-agents:p-fresh"},
+                }
+            }
+        if arguments[:2] == ["pane", "process-info"]:
+            return {"result": {"process_info": {"foreground_processes": [{"name": "zsh"}]}}}
+        if arguments[:2] == ["agent", "start"]:
+            return {"result": {"type": "ok"}}
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {
+        "schema_version": 1,
+        "pending_participant_tabs": {"codex": pending, "other": other_pending},
+    }
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=(participant,),
+    )
+
+    assert failures == []
+    assert state["participant_pane_ids"]["codex"] == "w-agents:p-fresh"
+    assert state["participant_tab_ids"]["codex"] == "w-agents:t-fresh"
+    assert state["pending_participant_tabs"] == {"other": other_pending}
+    assert not any(call[:2] == ["tab", "close"] for call in calls)
+    assert len([call for call in calls if call[:2] == ["tab", "create"]]) == 1
 
 
 def test_matching_live_agent_promotes_only_its_exact_pending_tab(
