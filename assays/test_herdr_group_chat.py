@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 import re
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -29,6 +30,7 @@ namespace = module.__dict__
 
 Future = namespace["Future"]
 ChatError = namespace["ChatError"]
+LocalInterruptibleWaitTimeout = namespace.get("LocalInterruptibleWaitTimeout")
 GroupChat = namespace["GroupChat"]
 HerdrClient = namespace["HerdrClient"]
 DeliveryController = namespace["DeliveryController"]
@@ -39,6 +41,8 @@ extract_reply = namespace["extract_reply"]
 extract_grok_session_reply = namespace["extract_grok_session_reply"]
 extract_claude_session_reply = namespace.get("extract_claude_session_reply")
 extract_pi_session_reply = namespace.get("extract_pi_session_reply")
+extract_codex_session_reply = namespace.get("extract_codex_session_reply")
+codex_rollout_file = namespace.get("codex_rollout_file")
 claude_project_dir_name = namespace.get("claude_project_dir_name")
 build_prompt = namespace["build_prompt"]
 build_review_prompt = namespace["build_review_prompt"]
@@ -2452,6 +2456,665 @@ def test_local_pi_reply_uses_exact_session_and_never_replays_prior_turns(
         assert client._local_pi_reply("pi-peer", turn_two_token) is None
 
 
+def write_codex_session(
+    home: Path,
+    session_id: str,
+    cwd: str,
+    messages: list[str],
+    *,
+    source: str = "cli",
+    rollout_path: Path | None = None,
+) -> Path:
+    """Create one exact Codex state row and its rollout for recovery tests."""
+    state_dir = home / ".codex"
+    sessions = state_dir / "sessions" / "2026" / "08" / "30"
+    sessions.mkdir(parents=True)
+    rollout = rollout_path or sessions / f"rollout-test-{session_id}.jsonl"
+    rollout.parent.mkdir(parents=True, exist_ok=True)
+    rollout.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "item_completed",
+                        "item": {
+                            "type": "AgentMessage",
+                            "content": [{"type": "Text", "text": message}],
+                        },
+                    },
+                }
+            )
+            for message in messages
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    database = sqlite3.connect(state_dir / "state_5.sqlite")
+    database.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, source TEXT, cwd TEXT)"
+    )
+    database.execute(
+        "INSERT INTO threads VALUES (?, ?, ?, ?)", (session_id, str(rollout), source, cwd)
+    )
+    database.commit()
+    database.close()
+    return rollout
+
+
+def codex_agent_meta(session_id: str, cwd: str, target: str = "codex-peer") -> dict[str, object]:
+    return {
+        "name": target,
+        "agent": "codex",
+        "cwd": cwd,
+        "agent_session": {
+            "agent": "codex",
+            "kind": "id",
+            "source": "herdr:codex",
+            "value": session_id,
+        },
+    }
+
+
+def test_extract_codex_session_reply_uses_only_the_last_agent_message(tmp_path: Path) -> None:
+    assert extract_codex_session_reply is not None
+    session_id = "11111111-2222-3333-4444-555555555555"
+    old_token = "a" * 32
+    new_token = "b" * 32
+    rollout = write_codex_session(
+        tmp_path,
+        session_id,
+        "/work/codex",
+        [
+            f"HGCHAT_REPLY_BEGIN {old_token}\nold reply\nHGCHAT_REPLY_END {old_token}",
+            f"HGCHAT_REPLY_BEGIN {new_token}\nnew reply\nHGCHAT_REPLY_END {new_token}",
+        ],
+    )
+
+    assert extract_codex_session_reply(rollout, new_token) == "new reply"
+    with pytest.raises(ChatError):
+        extract_codex_session_reply(rollout, old_token)
+
+
+@pytest.mark.parametrize(
+    ("row_cwd", "source", "rollout_outside", "session_id"),
+    [
+        ("/different/cwd", "cli", False, "11111111-2222-3333-4444-555555555555"),
+        ("/work/codex", "desktop", False, "11111111-2222-3333-4444-555555555555"),
+        ("/work/codex", "cli", True, "11111111-2222-3333-4444-555555555555"),
+        ("/work/codex", "cli", False, "not-a-codex-id"),
+    ],
+)
+def test_codex_rollout_rejects_wrong_identity_or_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    row_cwd: str,
+    source: str,
+    rollout_outside: bool,
+    session_id: str,
+) -> None:
+    assert codex_rollout_file is not None
+    expected_id = "11111111-2222-3333-4444-555555555555"
+    outside = tmp_path / "outside" / f"rollout-{expected_id}.jsonl"
+    write_codex_session(
+        tmp_path,
+        expected_id,
+        row_cwd,
+        ["unrelated"],
+        source=source,
+        rollout_path=outside if rollout_outside else None,
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    with pytest.raises(ChatError):
+        codex_rollout_file(session_id, "/work/codex")
+
+
+def test_codex_rollout_rejects_unowned_state_and_malformed_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert codex_rollout_file is not None
+    session_id = "11111111-2222-3333-4444-555555555555"
+    cwd = "/work/codex"
+    write_codex_session(tmp_path, session_id, cwd, ["unrelated"])
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(module.os, "geteuid", lambda: -1)
+
+    with pytest.raises(ChatError):
+        codex_rollout_file(session_id, cwd)
+
+    client = HerdrClient(runner=object)
+    assert (
+        client._local_codex_reply(
+            "codex-peer",
+            "a" * 32,
+            {**codex_agent_meta("not-a-codex-id", cwd), "agent_status": "done"},
+            {"agent_status": "done"},
+        )
+        is None
+    )
+
+
+def test_codex_rollout_rejects_state_and_rollout_symlinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert codex_rollout_file is not None
+    session_id = "11111111-2222-3333-4444-555555555555"
+    cwd = "/work/codex"
+    rollout = write_codex_session(tmp_path, session_id, cwd, ["unrelated"])
+    monkeypatch.setenv("HOME", str(tmp_path))
+    state_file = tmp_path / ".codex" / "state_5.sqlite"
+    state_target = tmp_path / "state-target.sqlite"
+    state_file.rename(state_target)
+    state_file.symlink_to(state_target)
+
+    with pytest.raises(ChatError):
+        codex_rollout_file(session_id, cwd)
+
+    state_file.unlink()
+    state_target.rename(state_file)
+    rollout_target = rollout.with_name("rollout-target.jsonl")
+    rollout.rename(rollout_target)
+    rollout.symlink_to(rollout_target)
+
+    with pytest.raises(ChatError):
+        codex_rollout_file(session_id, cwd)
+
+
+def test_codex_rollout_rejects_a_nonregular_state_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert codex_rollout_file is not None
+    session_id = "11111111-2222-3333-4444-555555555555"
+    cwd = "/work/codex"
+    write_codex_session(tmp_path, session_id, cwd, ["unrelated"])
+    monkeypatch.setenv("HOME", str(tmp_path))
+    state_file = tmp_path / ".codex" / "state_5.sqlite"
+    state_file.unlink()
+    state_file.mkdir()
+
+    with pytest.raises(ChatError):
+        codex_rollout_file(session_id, cwd)
+
+
+def test_local_codex_reply_rejects_a_different_target_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "a" * 32
+    session_id = "11111111-2222-3333-4444-555555555555"
+    cwd = "/work/codex"
+    write_codex_session(
+        tmp_path,
+        session_id,
+        cwd,
+        [f"HGCHAT_REPLY_BEGIN {token}\nreply\nHGCHAT_REPLY_END {token}"],
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    client = HerdrClient(runner=object)
+
+    assert (
+        client._local_codex_reply(
+            "codex-peer",
+            token,
+            codex_agent_meta(session_id, cwd, "other-peer"),
+            None,
+        )
+        is None
+    )
+
+
+def test_cached_non_codex_identity_does_not_probe_or_use_wait() -> None:
+    client = HerdrClient(runner=object)
+    client._agent_kinds["reviewer-x"] = "claude"
+
+    assert client._codex_target("reviewer-x") is False
+
+
+def test_turn_waits_for_codex_and_recovers_the_captured_exact_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "c" * 32
+    session_id = "11111111-2222-3333-4444-555555555555"
+    cwd = "/work/codex"
+    write_codex_session(
+        tmp_path,
+        session_id,
+        cwd,
+        [f"HGCHAT_REPLY_BEGIN {token}\nCodex reply\nHGCHAT_REPLY_END {token}"],
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    calls: list[list[str]] = []
+    statuses = ["working", "done"]
+
+    def fake_run(arguments: list[str], timeout: float = 30, **_kwargs: object) -> object:
+        calls.append(arguments)
+        if arguments[:2] == ["agent", "get"]:
+            status = statuses.pop(0) if statuses else "done"
+            return subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=json.dumps(
+                    {
+                        "result": {
+                            "agent": {"agent_status": status, **codex_agent_meta(session_id, cwd)}
+                        }
+                    }
+                ),
+            )
+        raise AssertionError(f"unexpected Herdr call: {arguments}")
+
+    client = HerdrClient()
+    waited: list[list[str]] = []
+
+    def wait_prompt(arguments: list[str], *_args: object, **_kwargs: object) -> object:
+        waited.append(arguments)
+        return subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps({"result": {"agent": codex_agent_meta(session_id, cwd)}})
+        )
+
+    monkeypatch.setattr(client, "_run", fake_run)
+    monkeypatch.setattr(client, "_run_interruptible", wait_prompt)
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+
+    assert client.turn(
+        "codex-peer", f"HGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}", 4321
+    ) == (
+        "done",
+        "Codex reply",
+    )
+    assert waited == [
+        [
+            "agent",
+            "prompt",
+            "codex-peer",
+            f"HGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",
+            "--wait",
+            "--timeout",
+            "4321",
+        ]
+    ]
+    assert not any(call[:2] == ["agent", "read"] for call in calls)
+
+
+def test_group_chat_uses_cached_codex_identity_for_a_custom_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cwd = "/work/custom-codex"
+    session_id = "11111111-2222-3333-4444-555555555555"
+    calls: list[list[str]] = []
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1:3] == ["agent", "list"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "result": {
+                            "agents": [
+                                {
+                                    "name": "reviewer-x",
+                                    "kind": "codex",
+                                    "agent_status": "idle",
+                                }
+                            ]
+                        }
+                    }
+                ),
+                stderr="",
+            )
+        if argv[1:3] == ["agent", "prompt"]:
+            prompt = argv[4]
+            token = re.search(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})", prompt).group(1)
+            write_codex_session(
+                tmp_path,
+                session_id,
+                cwd,
+                [f"HGCHAT_REPLY_BEGIN {token}\ncustom reply\nHGCHAT_REPLY_END {token}"],
+            )
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "result": {
+                            "agent": {
+                                "agent_status": "done",
+                                **codex_agent_meta(session_id, cwd, "reviewer-x"),
+                            }
+                        }
+                    }
+                ),
+                stderr="",
+            )
+        raise AssertionError(f"unexpected Herdr call: {argv}")
+
+    transcript = Transcript(tmp_path, "custom-codex")
+    client = HerdrClient(runner=runner)
+    chat = GroupChat(transcript, {"review": "reviewer-x"}, client, synthesizer="review")
+
+    chat.dispatch("@review Recover the first reply")
+
+    assert transcript.read()[-1]["body"] == "custom reply"
+    prompt_call = next(call for call in calls if call[1:3] == ["agent", "prompt"])
+    assert prompt_call[-3:] == ["--wait", "--timeout", "600000"]
+    assert not any(call[1:3] == ["agent", "get"] for call in calls)
+
+
+def test_completed_codex_wait_recovers_before_any_follow_up_poll(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "d" * 32
+    session_id = "11111111-2222-3333-4444-555555555555"
+    cwd = "/work/codex"
+    write_codex_session(
+        tmp_path,
+        session_id,
+        cwd,
+        [f"HGCHAT_REPLY_BEGIN {token}\nwait reply\nHGCHAT_REPLY_END {token}"],
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    client = HerdrClient(runner=object)
+    client._agent_kinds["codex-peer"] = "codex"
+
+    def wait_prompt(arguments: list[str], *_args: object, **_kwargs: object) -> object:
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps(
+                {"result": {"agent": {"agent_status": "done", **codex_agent_meta(session_id, cwd)}}}
+            ),
+        )
+
+    monkeypatch.setattr(client, "_run_interruptible", wait_prompt)
+    monkeypatch.setattr(
+        client,
+        "_run",
+        lambda *_args, **_kwargs: pytest.fail("completed wait must not poll before recovery"),
+    )
+
+    assert client.turn("codex-peer", f"HGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}") == (
+        "done",
+        "wait reply",
+    )
+
+
+def test_codex_local_wait_timeout_falls_through_once_to_a_blocked_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert LocalInterruptibleWaitTimeout is not None
+    token = "e" * 32
+    client = HerdrClient(runner=object)
+    client._agent_kinds["codex-peer"] = "codex"
+    submissions: list[list[str]] = []
+    observed: list[list[str]] = []
+    local_timeouts: list[float] = []
+
+    def local_timeout(arguments: list[str], *_args: object, **kwargs: object) -> object:
+        submissions.append(arguments)
+        local_timeouts.append(float(kwargs["timeout"]))
+        raise LocalInterruptibleWaitTimeout("local wait elapsed")
+
+    def blocked_poll(arguments: list[str], **_kwargs: object) -> object:
+        observed.append(arguments)
+        assert arguments == ["agent", "get", "codex-peer"]
+        return subprocess.CompletedProcess(
+            [], 0, stdout='{"result":{"agent":{"agent_status":"blocked"}}}'
+        )
+
+    monkeypatch.setattr(client, "_run_interruptible", local_timeout)
+    monkeypatch.setattr(client, "_run", blocked_poll)
+
+    assert client.turn(
+        "codex-peer", f"HGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}", 10_000
+    ) == ("blocked", "")
+    assert len(submissions) == 1
+    assert submissions[0][-3:] == ["--wait", "--timeout", "10000"]
+    assert local_timeouts == [9]
+    assert len(observed) == 1
+
+
+def test_completed_codex_wait_restores_stable_unmarked_fast_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "f" * 32
+    client = HerdrClient(runner=object)
+    client._agent_kinds["codex-peer"] = "codex"
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    monkeypatch.setitem(namespace, "STABLE_UNMARKED_POLLS", 1)
+    terminals = 0
+
+    def completed_wait(_arguments: list[str], *_args: object, **_kwargs: object) -> object:
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            stdout='{"result":{"agent":{"name":"codex-peer","agent":"codex",'
+            '"agent_status":"done"}}}',
+        )
+
+    def fake_run(arguments: list[str], **_kwargs: object) -> object:
+        nonlocal terminals
+        if arguments == ["agent", "get", "codex-peer"]:
+            return subprocess.CompletedProcess(
+                [], 0, stdout='{"result":{"agent":{"agent_status":"done"}}}'
+            )
+        if arguments[:2] == ["agent", "read"]:
+            terminals += 1
+            return subprocess.CompletedProcess([], 0, stdout="completed without reply markers")
+        raise AssertionError(f"unexpected Herdr call: {arguments}")
+
+    monkeypatch.setattr(client, "_run_interruptible", completed_wait)
+    monkeypatch.setattr(client, "_run", fake_run)
+
+    with pytest.raises(ChatError, match="reply markers"):
+        client.turn("codex-peer", f"HGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}")
+    assert terminals == 2
+
+
+def test_codex_local_wait_timeout_restores_stable_unmarked_fast_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert LocalInterruptibleWaitTimeout is not None
+    token = "0" * 32
+    client = HerdrClient(runner=object)
+    client._agent_kinds["codex-peer"] = "codex"
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    monkeypatch.setitem(namespace, "STABLE_UNMARKED_POLLS", 1)
+    submissions: list[list[str]] = []
+    terminals = 0
+
+    def local_timeout(arguments: list[str], *_args: object, **_kwargs: object) -> object:
+        submissions.append(arguments)
+        raise LocalInterruptibleWaitTimeout("local wait elapsed")
+
+    def fake_run(arguments: list[str], **_kwargs: object) -> object:
+        nonlocal terminals
+        if arguments == ["agent", "get", "codex-peer"]:
+            return subprocess.CompletedProcess(
+                [], 0, stdout='{"result":{"agent":{"agent_status":"done"}}}'
+            )
+        if arguments[:2] == ["agent", "read"]:
+            terminals += 1
+            return subprocess.CompletedProcess([], 0, stdout="completed without reply markers")
+        raise AssertionError(f"unexpected Herdr call: {arguments}")
+
+    monkeypatch.setattr(client, "_run_interruptible", local_timeout)
+    monkeypatch.setattr(client, "_run", fake_run)
+
+    with pytest.raises(ChatError, match="reply markers"):
+        client.turn("codex-peer", f"HGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}")
+    assert len(submissions) == 1
+    assert terminals == 2
+
+
+def test_conventional_codex_probe_is_bounded_and_memoized(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = HerdrClient(runner=object)
+    calls: list[tuple[list[str], float]] = []
+
+    def probe(arguments: list[str], timeout: float = 30, **_kwargs: object) -> object:
+        calls.append((arguments, timeout))
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            stdout='{"result":{"agent":{"name":"codex-peer","agent":"codex"}}}',
+        )
+
+    monkeypatch.setattr(client, "_run", probe)
+
+    assert client._codex_target("codex-peer") is True
+    assert client._codex_target("codex-peer") is True
+    assert calls == [(["agent", "get", "codex-peer"], namespace["CODEX_PROBE_TIMEOUT_S"])]
+
+
+def test_agent_list_keeps_conflicting_identity_live_but_untrusted() -> None:
+    def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=(
+                '{"result":{"agents":[{"name":"codex-peer","agent":"codex",'
+                '"kind":"claude"},{"name":"claude-peer","agent":"claude"}]}}'
+            ),
+            stderr="",
+        )
+
+    client = HerdrClient(runner=runner)
+
+    assert client.live_targets() == {"codex-peer", "claude-peer"}
+    assert client._agent_kinds == {"claude-peer": "claude"}
+    assert client._codex_target("codex-peer") is False
+
+
+def test_cold_codex_probe_does_not_consume_the_turn_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert LocalInterruptibleWaitTimeout is not None
+    token = "1" * 32
+    clock = iter((0.0, 5.0, 10.0))
+    monkeypatch.setattr(namespace["time"], "monotonic", lambda: next(clock))
+    client = HerdrClient(runner=object)
+    calls: list[list[str]] = []
+
+    def fake_run(arguments: list[str], timeout: float = 30, **_kwargs: object) -> object:
+        calls.append(arguments)
+        if len(calls) == 1:
+            assert arguments == ["agent", "get", "codex-peer"]
+            assert timeout == namespace["CODEX_PROBE_TIMEOUT_S"]
+            namespace["time"].monotonic()
+            return subprocess.CompletedProcess(
+                [],
+                0,
+                stdout='{"result":{"agent":{"name":"codex-peer","agent":"codex"}}}',
+            )
+        assert arguments == ["agent", "get", "codex-peer"]
+        assert timeout == 5
+        return subprocess.CompletedProcess(
+            [], 0, stdout='{"result":{"agent":{"agent_status":"blocked"}}}'
+        )
+
+    def local_timeout(_arguments: list[str], *_args: object, **_kwargs: object) -> object:
+        raise LocalInterruptibleWaitTimeout("local wait elapsed")
+
+    monkeypatch.setattr(client, "_run", fake_run)
+    monkeypatch.setattr(client, "_run_interruptible", local_timeout)
+
+    assert client.turn(
+        "codex-peer", f"HGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}", 10_000
+    ) == ("blocked", "")
+
+
+def test_codex_identity_failure_falls_back_without_resubmitting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "d" * 32
+    cwd = "/work/codex"
+    session_id = "11111111-2222-3333-4444-555555555555"
+    terminal = f"HGCHAT_REPLY_BEGIN {token}\nterminal reply\nHGCHAT_REPLY_END {token}"
+    calls: list[list[str]] = []
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def fake_run(arguments: list[str], timeout: float = 30, **_kwargs: object) -> object:
+        calls.append(arguments)
+        if arguments[:2] == ["agent", "get"]:
+            return subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=json.dumps(
+                    {
+                        "result": {
+                            "agent": {"agent_status": "done", **codex_agent_meta(session_id, cwd)}
+                        }
+                    }
+                ),
+            )
+        if arguments[:2] == ["agent", "read"]:
+            return subprocess.CompletedProcess([], 0, stdout=terminal)
+        raise AssertionError(f"unexpected Herdr call: {arguments}")
+
+    client = HerdrClient()
+    submitted: list[list[str]] = []
+
+    def wait_prompt(arguments: list[str], *_args: object, **_kwargs: object) -> object:
+        submitted.append(arguments)
+        return subprocess.CompletedProcess([], 0, stdout='{"result":{"agent":{}}}')
+
+    monkeypatch.setattr(client, "_run", fake_run)
+    monkeypatch.setattr(client, "_run_interruptible", wait_prompt)
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+
+    assert client.turn("codex-peer", f"HGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}") == (
+        "done",
+        "terminal reply",
+    )
+    assert len(submitted) == 1
+    assert submitted[0][1:3] == ["prompt", "codex-peer"]
+
+
+def test_codex_wait_cancellation_stops_local_wait_without_a_second_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "e" * 32
+    client = HerdrClient()
+    submissions: list[list[str]] = []
+
+    def fake_run(arguments: list[str], timeout: float = 30) -> object:
+        assert arguments == ["agent", "get", "codex-peer"]
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps(
+                {
+                    "result": {
+                        "agent": codex_agent_meta(
+                            "11111111-2222-3333-4444-555555555555", "/work/codex"
+                        )
+                    }
+                }
+            ),
+        )
+
+    def cancelled_wait(arguments: list[str], *_args: object, **_kwargs: object) -> object:
+        submissions.append(arguments)
+        raise ChatError("review cancelled")
+
+    monkeypatch.setattr(client, "_run", fake_run)
+    monkeypatch.setattr(client, "_run_interruptible", cancelled_wait)
+
+    with pytest.raises(ChatError, match="review cancelled"):
+        client.turn("codex-peer", f"HGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}")
+    assert len(submissions) == 1
+
+
 def test_missing_live_agent_fails_before_writing(tmp_path: Path) -> None:
     chat, client, transcript = make_chat(tmp_path)
     client.live_targets = lambda: {"pi-peer"}
@@ -3536,6 +4199,7 @@ def test_review_cancel_never_sends_keys_for_working_or_idle_status(
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
     client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    client._agent_kinds["codex-peer"] = "codex"
     with pytest.raises(ChatError, match="review cancelled"):
         client.turn(
             "codex-peer",
@@ -3661,6 +4325,7 @@ def test_herdr_turn_detects_clipped_hooks_dialog_as_blocked(
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
     client = HerdrClient(herdr_bin="herdr-test", runner=runner)
+    client._agent_kinds["codex-peer"] = "codex"
     assert client.turn(
         "codex-peer",
         f"prompt\nHGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}",

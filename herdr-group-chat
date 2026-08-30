@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -70,6 +71,9 @@ SETUP_FAILURES_ENV = "HERDR_GROUP_CHAT_SETUP_FAILURES"
 ROOM_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
 MENTION_RE = re.compile(r"^@([a-z0-9_,@-]+)\s+(.*)$", re.DOTALL | re.IGNORECASE)
 REPLY_TOKEN_RE = re.compile(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})")
+CODEX_SESSION_ID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
+)
 CONSENSUS_SHARE_REFUSED = "CONSENSUS_SHARE_REFUSED"
 CONSENSUS_VERDICT_RE = re.compile(r"\AVERDICT: (PASS|REVISE)(?:[ \t]+(\S.*))?\Z")
 CONSENSUS_EXPLANATION_CONNECTOR_RE = re.compile(
@@ -84,6 +88,7 @@ CONSENSUS_EXPLANATION_VERDICT_RE = re.compile(r"(?<![A-Za-z0-9])(?:PASS|REVISE)(
 POLL_INTERVAL_S = 0.5
 SUBMIT_GRACE_S = 2.0
 TERMINAL_READ_TIMEOUT_S = 30.0
+CODEX_PROBE_TIMEOUT_S = 5.0
 # An agent that went back to idle/done but keeps showing the same terminal text without
 # the reply markers has finished without honoring the marker protocol; after this many
 # consecutive stable unmarked reads the turn fails fast instead of stalling to timeout.
@@ -117,6 +122,10 @@ class ChatError(RuntimeError):
 
 class CommandLaunchError(ChatError):
     """The Herdr command could not start, so no agent turn was submitted."""
+
+
+class LocalInterruptibleWaitTimeout(ChatError):
+    """Only the caller's local wait expired; the submitted turn may continue."""
 
 
 class AgentClient(Protocol):
@@ -647,13 +656,20 @@ class HerdrClient:
         self.herdr_bin = herdr_bin
         self.timeout_ms = timeout_ms
         self.runner = runner
+        self._agent_kinds: dict[str, str] = {}
+        self._untrusted_agent_names: set[str] = set()
         self.popen_factory = (
             subprocess.Popen
             if popen_factory is None and runner is subprocess.run
             else popen_factory
         )
 
-    def _run(self, arguments: list[str], timeout: float = 30) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self,
+        arguments: list[str],
+        timeout: float = 30,
+        timeout_error: type[ChatError] = ChatError,
+    ) -> subprocess.CompletedProcess[str]:
         try:
             result = self.runner(
                 [self.herdr_bin, *arguments],
@@ -666,7 +682,7 @@ class HerdrClient:
         except OSError as error:
             raise CommandLaunchError(f"Herdr command failed: {error}") from error
         except subprocess.TimeoutExpired as error:
-            raise ChatError(f"Herdr command failed: {error}") from error
+            raise timeout_error(f"Herdr command failed: {error}") from error
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
             raise ChatError(f"Herdr command failed: {detail}")
@@ -690,9 +706,12 @@ class HerdrClient:
         arguments: list[str],
         cancel_event: threading.Event | None,
         timeout: float,
+        *,
+        local_wait: bool = False,
     ) -> subprocess.CompletedProcess[str]:
+        timeout_error = LocalInterruptibleWaitTimeout if local_wait else ChatError
         if self.popen_factory is None:
-            return self._run(arguments, timeout=timeout)
+            return self._run(arguments, timeout=timeout, timeout_error=timeout_error)
         try:
             process = self.popen_factory(
                 [self.herdr_bin, *arguments],
@@ -711,7 +730,7 @@ class HerdrClient:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self._stop_process(process)
-                raise ChatError(f"Herdr command timed out after {int(timeout * 1000)} ms")
+                raise timeout_error(f"Herdr command timed out after {int(timeout * 1000)} ms")
             try:
                 stdout, stderr = process.communicate(timeout=min(0.1, remaining))
             except subprocess.TimeoutExpired:
@@ -733,7 +752,28 @@ class HerdrClient:
             raise ChatError("Herdr returned an invalid agent list") from error
         if not isinstance(agents, list):
             raise ChatError("Herdr returned an invalid agent list")
-        return [item for item in agents if isinstance(item, dict)]
+        parsed = [item for item in agents if isinstance(item, dict)]
+        kinds: dict[str, str] = {}
+        untrusted_names: set[str] = set()
+        for item in parsed:
+            name = item.get("name")
+            agent = item.get("agent")
+            kind = item.get("kind")
+            if not isinstance(name, str):
+                continue
+            if agent is not None:
+                if not isinstance(agent, str) or (kind is not None and kind != agent):
+                    untrusted_names.add(name)
+                else:
+                    kinds[name] = agent
+            elif kind is not None:
+                if isinstance(kind, str):
+                    kinds[name] = kind
+                else:
+                    untrusted_names.add(name)
+        self._agent_kinds = kinds
+        self._untrusted_agent_names = untrusted_names
+        return parsed
 
     def live_targets(self) -> set[str]:
         return {item["name"] for item in self._agents() if item.get("name")}
@@ -772,14 +812,56 @@ class HerdrClient:
         if cancel_event is not None and cancel_event.is_set():
             raise ChatError("review cancelled")
 
+        codex_target = self._codex_target(target)
+        submitted_agent: dict[str, Any] | None = None
+        saw_working = False
+        if cancel_event is not None and cancel_event.is_set():
+            raise ChatError("review cancelled")
         submitted_at = time.monotonic()
         deadline = submitted_at + (effective_timeout_ms / 1000)
-        self._run_interruptible(
-            ["agent", "prompt", target, prompt],
-            cancel_event,
-            timeout=max(1, min(30, effective_timeout_ms / 1000)),
-        )
-        saw_working = False
+        if codex_target:
+            local_wait_timeout = codex_local_wait_timeout(effective_timeout_ms)
+            try:
+                prompt_result = self._run_interruptible(
+                    [
+                        "agent",
+                        "prompt",
+                        target,
+                        prompt,
+                        "--wait",
+                        "--timeout",
+                        str(effective_timeout_ms),
+                    ],
+                    cancel_event,
+                    timeout=local_wait_timeout,
+                    local_wait=True,
+                )
+            except LocalInterruptibleWaitTimeout:
+                # The local waiter remained active until its reserve boundary,
+                # proving submission ran. Keep observing without replaying the
+                # user payload.
+                prompt_result = None
+                saw_working = True
+            else:
+                saw_working = True
+            submitted_agent = self._prompt_result_agent(prompt_result)
+            if cancel_event is not None and cancel_event.is_set():
+                raise ChatError("review cancelled")
+            submitted_status = (
+                submitted_agent.get("agent_status") if submitted_agent is not None else None
+            )
+            if submitted_status == "blocked":
+                return "blocked", ""
+            if submitted_status in {"idle", "done"}:
+                reply = self._local_codex_reply(target, reply_marker_id, submitted_agent, None)
+                if reply is not None:
+                    return submitted_status, reply
+        else:
+            self._run_interruptible(
+                ["agent", "prompt", target, prompt],
+                cancel_event,
+                timeout=max(1, min(30, effective_timeout_ms / 1000)),
+            )
         stable_unmarked = 0
         last_unmarked_read: str | None = None
         while True:
@@ -803,6 +885,8 @@ class HerdrClient:
             except (json.JSONDecodeError, KeyError, TypeError) as error:
                 # Malformed status is unknown, not evidence that the target is working.
                 raise ChatError(f"Herdr returned an invalid result for {target}") from error
+            if cancel_event is not None and cancel_event.is_set():
+                raise ChatError("review cancelled")
             if status == "blocked":
                 return "blocked", ""
             if status == "working":
@@ -821,6 +905,10 @@ class HerdrClient:
                 reply = self._local_claude_reply(target, reply_marker_id, agent_info)
                 if reply is None:
                     reply = self._local_pi_reply(target, reply_marker_id, agent_info)
+                if reply is None:
+                    reply = self._local_codex_reply(
+                        target, reply_marker_id, submitted_agent, agent_info
+                    )
                 if reply is not None:
                     return status, reply
                 terminal = self._read_terminal(target, timeout=remaining)
@@ -851,6 +939,50 @@ class HerdrClient:
                 cancel_event.wait(pause)
             else:
                 time.sleep(pause)
+
+    def _codex_target(self, target: str) -> bool:
+        """Identify Codex before changing its submission protocol.
+
+        A failed or malformed best-effort identification preserves the existing
+        prompt path. It supplies no authority to read a local Codex rollout.
+        """
+        kind = self._agent_kinds.get(target)
+        if kind is not None:
+            return kind == "codex"
+        if target in self._untrusted_agent_names:
+            return False
+        if not target.lower().startswith("codex"):
+            return False
+        try:
+            result = self._run(["agent", "get", target], timeout=CODEX_PROBE_TIMEOUT_S)
+            agent = json.loads(result.stdout)["result"]["agent"]
+            if (
+                isinstance(agent, dict)
+                and agent.get("name") == target
+                and isinstance(agent.get("agent"), str)
+            ):
+                self._agent_kinds[target] = agent["agent"]
+                return agent["agent"] == "codex"
+            return False
+        except (ChatError, KeyError, TypeError, json.JSONDecodeError):
+            return False
+
+    @staticmethod
+    def _prompt_result_agent(
+        result: subprocess.CompletedProcess[str] | None,
+    ) -> dict[str, Any] | None:
+        """Read the exact agent record returned by a completed prompt wait."""
+        if result is None:
+            return None
+        try:
+            payload = json.loads(result.stdout)
+            response = payload["result"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return None
+        if not isinstance(response, dict):
+            return None
+        agent = response.get("agent", response)
+        return agent if isinstance(agent, dict) else None
 
     def _read_terminal(self, target: str, timeout: float) -> str | None:
         """Read recent terminal output, or None when Herdr refuses or the capture is slow.
@@ -942,6 +1074,43 @@ class HerdrClient:
         except (ChatError, KeyError, TypeError, json.JSONDecodeError, OSError):
             return None
 
+    def _local_codex_reply(
+        self,
+        target: str,
+        token: str,
+        submitted_agent: dict[str, Any] | None,
+        observed_agent: dict[str, Any] | None,
+    ) -> str | None:
+        """Recover Codex only from an exact, owned rollout selected by Herdr.
+
+        The submission result is preferred because it names the turn that was
+        just accepted. A later exact Herdr record is a narrow fallback when the
+        wait result did not include the session metadata.
+        """
+        for agent in (submitted_agent, observed_agent):
+            try:
+                if agent is None:
+                    continue
+                session = agent["agent_session"]
+                session_id = session["value"]
+                cwd = agent["cwd"]
+                if (
+                    agent["name"] != target
+                    or agent["agent"] != "codex"
+                    or session["agent"] != "codex"
+                    or session["source"] != "herdr:codex"
+                    or session["kind"] != "id"
+                    or not isinstance(session_id, str)
+                    or not CODEX_SESSION_ID_RE.fullmatch(session_id)
+                    or not isinstance(cwd, str)
+                ):
+                    continue
+                rollout = codex_rollout_file(session_id, cwd)
+                return extract_codex_session_reply(rollout, token)
+            except (ChatError, KeyError, TypeError, OSError, sqlite3.Error):
+                continue
+        return None
+
 
 def extract_reply(terminal: str, token: str) -> str:
     def wrapped_literal(value: str) -> re.Pattern[str]:
@@ -1027,6 +1196,79 @@ def extract_pi_session_reply(session_file: Path, token: str) -> str:
         )
         return extract_reply(text, token)
     raise ChatError("Pi session response marker was not found")
+
+
+def codex_local_wait_timeout(effective_timeout_ms: int) -> float:
+    """Leave a bounded observation reserve after Codex's server-side wait."""
+    budget = effective_timeout_ms / 1000
+    reserve = min(5.0, max(0.1, budget * 0.1))
+    return max(0.1, budget - reserve)
+
+
+def codex_rollout_file(session_id: str, cwd: str) -> Path:
+    """Resolve one exact Codex session through its owned state row."""
+    if not CODEX_SESSION_ID_RE.fullmatch(session_id):
+        raise ChatError("Codex session id is invalid")
+    codex_home = Path.home() / ".codex"
+    state_file = codex_home / "state_5.sqlite"
+    state_info = os.lstat(state_file)
+    if not stat.S_ISREG(state_info.st_mode) or state_info.st_uid != os.geteuid():
+        raise ChatError("Codex state is unavailable")
+    database = sqlite3.connect(f"{state_file.as_uri()}?mode=ro", uri=True)
+    try:
+        row = database.execute(
+            "SELECT rollout_path FROM threads WHERE id = ? AND cwd = ? AND source = 'cli'",
+            (session_id, cwd),
+        ).fetchone()
+    finally:
+        database.close()
+    if row is None or not isinstance(row[0], str):
+        raise ChatError("Codex session is unavailable")
+    sessions_root = (codex_home / "sessions").resolve(strict=True)
+    rollout_leaf = Path(row[0])
+    rollout_leaf_info = os.lstat(rollout_leaf)
+    if stat.S_ISLNK(rollout_leaf_info.st_mode):
+        raise ChatError("Codex rollout path is invalid")
+    rollout = rollout_leaf.resolve(strict=True)
+    if sessions_root not in rollout.parents or not rollout.stem.endswith(session_id):
+        raise ChatError("Codex rollout path is invalid")
+    rollout_info = os.stat(rollout)
+    if not stat.S_ISREG(rollout_info.st_mode) or rollout_info.st_uid != os.geteuid():
+        raise ChatError("Codex rollout is unavailable")
+    return rollout
+
+
+def extract_codex_session_reply(session_file: Path, token: str) -> str:
+    """Extract only the last Codex final AgentMessage from one rollout."""
+    if not session_file.is_file():
+        raise ChatError("Codex session transcript is unavailable")
+    for line in reversed(session_file.read_text(encoding="utf-8", errors="replace").splitlines()):
+        try:
+            record = json.loads(line)
+            payload = record["payload"]
+            item = payload["item"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+        if (
+            record.get("type") != "event_msg"
+            or not isinstance(payload, dict)
+            or payload.get("type") != "item_completed"
+            or not isinstance(item, dict)
+            or item.get("type") != "AgentMessage"
+        ):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            raise ChatError("Codex final message is invalid")
+        text = "\n".join(
+            block["text"]
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "Text"
+            and isinstance(block.get("text"), str)
+        )
+        return extract_reply(text, token)
+    raise ChatError("Codex session response marker was not found")
 
 
 def extract_grok_session_reply(session_dir: Path, token: str) -> str:
