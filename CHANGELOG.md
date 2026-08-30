@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [0.10.0] - 2026-08-30
+## [0.10.1] - 2026-08-30
 
 - Fix native process proofs on the protocol-21 Herdr server, which reports the
   foreground executable as `name` instead of `argv0`: the proof now accepts
@@ -26,6 +26,8 @@ All notable changes to this project are documented here.
   record, and the ownership failure distinguishes which check failed
   (different workspace, different cwd, or pane not recorded) while naming the
   live workspace, the launcher's workspace, and the adopt-or-close recovery.
+## [0.10.0] - 2026-08-30
+
 - Record launcher failures durably: the setup pane, `--room-entrypoint`, and
   the `--launch`/`--open` action now append every `BootstrapError` and every
   unexpected exception as one JSON line to `launcher-errors.jsonl` in the
