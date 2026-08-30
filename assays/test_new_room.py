@@ -2363,6 +2363,41 @@ def test_reopen_accepts_post_turn_fable_status_with_exact_process_argv(
 
 
 @pytest.mark.parametrize(
+    "process",
+    [
+        pytest.param(
+            {"argv0": "claude", "argv": ["claude", "--model", "fable", "--effort", "high"]},
+            id="argv0-herdr-0.8.2",
+        ),
+        pytest.param(
+            {"name": "claude", "argv": ["claude", "--model", "fable", "--effort", "high"]},
+            id="name-protocol-21",
+        ),
+        pytest.param(
+            {"argv": ["claude", "--model", "fable", "--effort", "high"]},
+            id="argv-only",
+        ),
+    ],
+)
+def test_reopen_fable_process_proof_accepts_each_herdr_identity_field(
+    monkeypatch: pytest.MonkeyPatch, process: dict
+) -> None:
+    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        lambda _herdr_bin, arguments, timeout=30: (
+            {"result": {"process_info": {"foreground_processes": [process]}}}
+            if arguments[:2] == ["pane", "process-info"]
+            else (_ for _ in ()).throw(AssertionError(arguments))
+        ),
+    )
+    assert module.native_pane_process_proves(
+        "herdr", "w-agents:p-fable", "claude", ("--model", "fable", "--effort", "high")
+    )
+
+
+@pytest.mark.parametrize(
     "processes",
     [
         pytest.param([], id="missing-process"),
@@ -2390,6 +2425,10 @@ def test_reopen_accepts_post_turn_fable_status_with_exact_process_argv(
         pytest.param(
             [{"argv0": "claude-code", "argv": ["claude", "--model", "fable", "--effort", "high"]}],
             id="wrong-argv0",
+        ),
+        pytest.param(
+            [{"name": "claude-code", "argv": ["claude", "--model", "fable", "--effort", "high"]}],
+            id="wrong-name-protocol-21",
         ),
         pytest.param(
             [{"argv0": "claude", "argv": ["claude", "--model", "fable-5", "--effort", "high"]}],

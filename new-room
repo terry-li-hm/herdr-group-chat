@@ -882,9 +882,15 @@ def native_pane_process_proves(
     expected = list(expected_args)
 
     def matches(process: object) -> bool:
-        if not isinstance(process, dict) or str(process.get("argv0") or "") != argv0:
+        if not isinstance(process, dict):
             return False
         argv = [str(argument) for argument in process.get("argv", [])]
+        # Herdr 0.8.2 reported the executable identity as ``argv0``; the
+        # protocol-21 server reports ``name`` instead. Accept either, then
+        # fall back to argv[0], and require an exact identity in every case.
+        identity = str(process.get("argv0") or process.get("name") or (argv[0] if argv else ""))
+        if identity != argv0:
+            return False
         return any(
             list(argv[position : position + len(expected)]) == expected
             for position in range(len(argv) - len(expected) + 1)
