@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [0.10.0] - 2026-08-30
 
+- Fix native process proofs on the protocol-21 Herdr server, which reports the
+  foreground executable as `name` instead of `argv0`: the proof now accepts
+  `argv0`, then `name`, then `argv[0]`, still requiring the exact identity. On the
+  updated host every Fable and Grok reopen and adoption had failed closed.
 - Add the **Adopt stale group-chat peers** action (`./new-room --adopt-peers`)
   for the Herdr-server-restart case: a restart gives the launcher a new
   server-instance state key, so its fresh state has no participant records
