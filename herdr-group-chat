@@ -1,7 +1,10 @@
 #!/usr/bin/env -S uv run --script --python 3.13
 # /// script
 # requires-python = ">=3.13"
-# dependencies = []
+# dependencies = [
+#   "regex>=2024.11.6",
+#   "wcwidth>=0.2.13",
+# ]
 # ///
 """A thin local group-chat TUI for agents already running in Herdr."""
 
@@ -19,6 +22,7 @@ import sys
 import textwrap
 import threading
 import time
+import unicodedata
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
@@ -28,6 +32,9 @@ from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import quote
+
+import regex
+from wcwidth import wcswidth
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -82,6 +89,23 @@ TERMINAL_READ_TIMEOUT_S = 30.0
 # consecutive stable unmarked reads the turn fails fast instead of stalling to timeout.
 STABLE_UNMARKED_POLLS = 20
 TUI_TIMESTAMP_RE = re.compile(r"[ \t]{2,}\d{1,2}:\d{2}\s+[AP]M[ \t█]*(?:\n[ \t]*)?")
+LANE_MIN_COLUMN_WIDTH = 24
+LANE_SEPARATOR = "|"
+GRAPHEME_RE = regex.compile(r"\X")
+LEADING_PARTICIPANT_RE = re.compile(r"\A@([a-z0-9_-]+)(?=$|[\s:])", re.IGNORECASE)
+NO_LEADING_PARTICIPANT = object()
+UNCONFIGURED_LEADING_PARTICIPANT = object()
+CONTROL_ESCAPES = {
+    "\0": r"\x00",
+    "\a": r"\a",
+    "\b": r"\b",
+    "\t": r"\t",
+    "\n": r"\n",
+    "\v": r"\v",
+    "\f": r"\f",
+    "\r": r"\r",
+    "\x1b": r"\x1b",
+}
 
 
 class ChatError(RuntimeError):
@@ -2339,10 +2363,16 @@ class GroupChat:
             else:
                 if message is not None:
                     sender, recipients, body, kind, provisional = message
+                    effective_meta = dict(message_meta or {})
+                    if kind == "review_status":
+                        # Every status committed through this phase helper is
+                        # about this exact participant. Council scope remains
+                        # useful context but must not broaden lane visibility.
+                        effective_meta["agent"] = agent
                     stored_meta = (
-                        consensus_item_meta(review, message_meta)
+                        consensus_item_meta(review, effective_meta)
                         if review.mode == "consensus"
-                        else message_meta
+                        else effective_meta or None
                     )
                     if settle_attempt is not None:
                         merged_meta = dict(stored_meta or {})
@@ -3570,29 +3600,45 @@ def resolve_state_dir(
     return DEFAULT_STATE_DIR
 
 
+def _message_meta(item: Mapping[str, Any]) -> dict[str, Any]:
+    meta = item.get("meta")
+    return meta if isinstance(meta, dict) else {}
+
+
+def _message_body(item: Mapping[str, Any]) -> str:
+    body = item.get("body")
+    return "" if body is None else str(body)
+
+
+def _message_label(item: Mapping[str, Any]) -> str:
+    sender = item.get("sender")
+    label = "unknown" if sender is None or sender == "" else str(sender)
+    kind = item.get("kind")
+    if kind == "review_response":
+        label += " [review]"
+    elif kind == "review_synthesis":
+        label += " [synthesis]"
+    elif kind == "anneal_challenge":
+        label += " [challenge]"
+    elif kind == "anneal_final":
+        label += " [final]"
+    elif kind == "consensus_provisional":
+        label += " [provisional]"
+    elif kind == "consensus_vote":
+        verdict = _message_meta(item).get("verdict", "INVALID")
+        label += f" [vote {verdict}]"
+    elif kind == "consensus_final":
+        label += " [final]"
+    elif kind == "consensus_status":
+        label += " [consensus status]"
+    return label
+
+
 def message_lines(messages: Sequence[dict[str, Any]], width: int) -> list[str]:
     lines: list[str] = []
     for item in messages:
-        label = str(item["sender"])
-        if item.get("kind") == "review_response":
-            label += " [review]"
-        elif item.get("kind") == "review_synthesis":
-            label += " [synthesis]"
-        elif item.get("kind") == "anneal_challenge":
-            label += " [challenge]"
-        elif item.get("kind") == "anneal_final":
-            label += " [final]"
-        elif item.get("kind") == "consensus_provisional":
-            label += " [provisional]"
-        elif item.get("kind") == "consensus_vote":
-            verdict = item.get("meta", {}).get("verdict", "INVALID")
-            label += f" [vote {verdict}]"
-        elif item.get("kind") == "consensus_final":
-            label += " [final]"
-        elif item.get("kind") == "consensus_status":
-            label += " [consensus status]"
-        prefix = f"{label}> "
-        paragraphs = str(item["body"]).splitlines() or [""]
+        prefix = f"{_message_label(item)}> "
+        paragraphs = _message_body(item).splitlines() or [""]
         first = True
         for paragraph in paragraphs:
             wrapped = textwrap.wrap(
@@ -3627,7 +3673,7 @@ def inbox_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         ):
             kept.append(item)
         elif kind == "consensus_status":
-            meta = item.get("meta", {})
+            meta = _message_meta(item)
             outcome = meta.get("terminal_outcome")
             if meta.get("unanimous") is False or outcome in {
                 "cancelled",
@@ -3638,7 +3684,7 @@ def inbox_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
             }:
                 kept.append(item)
         elif kind == "review_status":
-            body = str(item.get("body", "")).lower()
+            body = _message_body(item).lower()
             if any(marker in body for marker in attention_markers):
                 kept.append(item)
         elif kind == "message":
@@ -3653,16 +3699,265 @@ def inbox_rendered_lines(messages: Sequence[dict[str, Any]], width: int) -> list
 
 
 def handle_view_command(text: str) -> tuple[str, str] | None:
-    """Handle the exact /inbox and /room view switches; anything else is None."""
+    """Handle exact presentation switches; anything else is not a view command."""
     stripped = text.strip()
     if stripped == "/inbox":
         return (
             "inbox",
             "Inbox shows final replies, syntheses, and attention items. Use /room to return.",
         )
+    if stripped == "/lanes":
+        return (
+            "lanes",
+            "Lane view shows each participant's scoped conversation. Use /room to return.",
+        )
     if stripped == "/room":
         return "room", "Showing the full room transcript."
     return None
+
+
+def _leading_configured_participant(
+    body: object, participants: Sequence[str] | None = None
+) -> str | object:
+    match = LEADING_PARTICIPANT_RE.match("" if body is None else str(body))
+    if match is None:
+        return NO_LEADING_PARTICIPANT
+    marker = match.group(1).lower()
+    if participants is None:
+        return marker
+    configured = next((name for name in participants if name.lower() == marker), None)
+    return configured if configured is not None else UNCONFIGURED_LEADING_PARTICIPANT
+
+
+def _lane_message_visible(
+    item: Mapping[str, Any], participant: str, leading_participant: str | object
+) -> bool:
+    sender = item.get("sender")
+    recipients = item.get("recipients")
+    recipient_names = (
+        recipients
+        if isinstance(recipients, list | tuple)
+        and all(isinstance(name, str) and name for name in recipients)
+        else ()
+    )
+    metadata = _message_meta(item)
+    council_scope: list[str] | None = None
+    if "council_participants" in metadata:
+        raw_scope = metadata["council_participants"]
+        if not isinstance(raw_scope, list) or not all(
+            isinstance(name, str) and name for name in raw_scope
+        ):
+            return False
+        council_scope = raw_scope
+    if sender == "human":
+        return participant in recipient_names or "all" in recipient_names
+    if sender == participant:
+        return True
+
+    kind = str(item.get("kind", ""))
+    if sender != "system" and not kind.endswith("_status"):
+        return False
+    if "agent" in metadata:
+        direct_agent = metadata["agent"]
+        if not isinstance(direct_agent, str) or not direct_agent:
+            return False
+        if council_scope is not None and direct_agent not in council_scope:
+            return False
+        return direct_agent == participant
+    if leading_participant is UNCONFIGURED_LEADING_PARTICIPANT:
+        return False
+    if leading_participant is not NO_LEADING_PARTICIPANT:
+        return leading_participant == participant
+    if council_scope is not None:
+        return participant in council_scope
+    return participant in recipient_names or "all" in recipient_names
+
+
+def lane_message_visible(item: Mapping[str, Any], participant: str) -> bool:
+    """Project one item when no configured roster is available to the caller."""
+    leading = _leading_configured_participant(item.get("body"))
+    return _lane_message_visible(item, participant, leading)
+
+
+def lane_projections(
+    messages: Sequence[dict[str, Any]], participants: Sequence[str]
+) -> dict[str, list[dict[str, Any]]]:
+    """Project every item once across the configured roster in stable transcript order."""
+    participant_order = tuple(participants)
+    projected = {participant: [] for participant in participant_order}
+    for item in messages:
+        leading = _leading_configured_participant(item.get("body"), participant_order)
+        for participant in participant_order:
+            if _lane_message_visible(item, participant, leading):
+                projected[participant].append(item)
+    return projected
+
+
+def lane_messages(messages: Sequence[dict[str, Any]], participant: str) -> list[dict[str, Any]]:
+    """Keep one participant's lane when the wider configured roster is unavailable."""
+    return [item for item in messages if lane_message_visible(item, participant)]
+
+
+def lane_column_widths(width: int, participant_count: int) -> tuple[int, ...] | None:
+    """Return stable lane widths, or None when every configured lane cannot stay readable."""
+    if participant_count < 1:
+        return ()
+    separators = participant_count - 1
+    required = participant_count * LANE_MIN_COLUMN_WIDTH + separators
+    if width < required:
+        return None
+    usable = width - separators
+    base, remainder = divmod(usable, participant_count)
+    return tuple(base + (1 if index < remainder else 0) for index in range(participant_count))
+
+
+def lane_narrow_message(width: int, participant_count: int) -> str:
+    required = participant_count * LANE_MIN_COLUMN_WIDTH + max(0, participant_count - 1)
+    return (
+        f"Widen terminal to at least {required} columns for {participant_count} "
+        f"participant lanes (current width: {width})."
+    )
+
+
+def terminal_safe_text(text: str, *, preserve_line_breaks: bool = False) -> str:
+    """Make terminal controls visible without changing safe Unicode graphemes."""
+    escaped: list[str] = []
+    for character in text:
+        if preserve_line_breaks and character in "\r\n":
+            escaped.append(character)
+            continue
+        if unicodedata.category(character) != "Cc":
+            escaped.append(character)
+            continue
+        replacement = CONTROL_ESCAPES.get(character)
+        if replacement is None:
+            codepoint = ord(character)
+            if codepoint <= 0xFF:
+                replacement = f"\\x{codepoint:02x}"
+            elif codepoint <= 0xFFFF:
+                replacement = f"\\u{codepoint:04x}"
+            else:
+                replacement = f"\\U{codepoint:08x}"
+        escaped.append(replacement)
+    return "".join(escaped)
+
+
+def terminal_display_width(text: str) -> int:
+    """Return terminal cells for safe grapheme clusters using wcwidth's Unicode tables."""
+    safe = terminal_safe_text(text)
+    return sum(max(0, wcswidth(cluster)) for cluster in GRAPHEME_RE.findall(safe))
+
+
+def _display_clip(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    kept: list[str] = []
+    used = 0
+    safe = terminal_safe_text(text)
+    for cluster in GRAPHEME_RE.findall(safe):
+        cluster_width = max(0, wcswidth(cluster))
+        if used + cluster_width > width:
+            break
+        kept.append(cluster)
+        used += cluster_width
+    return "".join(kept)
+
+
+def _display_pad(text: str, width: int) -> str:
+    clipped = _display_clip(text, width)
+    return clipped + " " * max(0, width - terminal_display_width(clipped))
+
+
+def _display_wrap(text: str, width: int) -> list[str]:
+    if width <= 0:
+        return []
+    safe = terminal_safe_text(text)
+    if not safe:
+        return [""]
+    lines: list[str] = []
+    current: list[str] = []
+    used = 0
+    for cluster in GRAPHEME_RE.findall(safe):
+        cluster_width = max(0, wcswidth(cluster))
+        if current and used + cluster_width > width:
+            lines.append("".join(current))
+            current = []
+            used = 0
+        current.append(cluster)
+        used += cluster_width
+    if current:
+        lines.append("".join(current))
+    return lines or [""]
+
+
+def _lane_cell(text: str, width: int) -> str:
+    inner_width = max(0, width - 2)
+    return " " + _display_pad(text, inner_width) + (" " if width > 1 else "")
+
+
+def lane_message_lines(messages: Sequence[dict[str, Any]], width: int) -> list[str]:
+    """Render lane items within the exact inner width without clipping body text."""
+    if width < 1:
+        return []
+    lines: list[str] = []
+    for item in messages:
+        label = terminal_safe_text(_message_label(item))
+        if terminal_display_width(label) + 1 > width:
+            label = _display_clip(label, max(1, width - 2)) + "~"
+        lines.append(f"{label}>")
+        safe_body = terminal_safe_text(_message_body(item), preserve_line_breaks=True)
+        paragraphs = safe_body.splitlines() or [""]
+        for paragraph in paragraphs:
+            lines.extend(_display_wrap(paragraph, width))
+        lines.append("")
+    return lines
+
+
+def lane_view_lines(
+    messages: Sequence[dict[str, Any]],
+    participants: Sequence[str],
+    width: int,
+    available: int,
+    scroll_offset: int,
+) -> tuple[list[str], int]:
+    """Render fixed participant columns with one coherent, shared scroll offset."""
+    participant_order = tuple(participants)
+    if available <= 0:
+        return [], 0
+    column_widths = lane_column_widths(width, len(participant_order))
+    if not participant_order:
+        return ["No participants are configured."], 0
+    if column_widths is None:
+        message = lane_narrow_message(width, len(participant_order))
+        wrapped = textwrap.wrap(message, width=max(1, width), break_long_words=True) or [message]
+        return wrapped[:available], 0
+
+    headers = [
+        _lane_cell(f"@{participant}", column_width)
+        for participant, column_width in zip(participant_order, column_widths, strict=True)
+    ]
+    header = LANE_SEPARATOR.join(headers)
+    content_height = max(0, available - 1)
+    projections = lane_projections(messages, participant_order)
+    columns: list[list[str]] = []
+    for participant, column_width in zip(participant_order, column_widths, strict=True):
+        rendered = lane_message_lines(projections[participant], column_width - 2)
+        columns.append(rendered or ["(no lane activity)"])
+
+    timeline_height = max(len(column) for column in columns)
+    aligned = [([""] * (timeline_height - len(column))) + column for column in columns]
+    max_scroll = max(0, timeline_height - content_height)
+    offset = min(max(0, scroll_offset), max_scroll)
+    end = timeline_height - offset
+    start = max(0, end - content_height)
+    rows = [header]
+    for line_index in range(start, end):
+        cells = [
+            _lane_cell(column[line_index], column_width)
+            for column, column_width in zip(aligned, column_widths, strict=True)
+        ]
+        rows.append(LANE_SEPARATOR.join(cells))
+    return rows, max_scroll
 
 
 def visible_message_lines(
@@ -4016,7 +4311,7 @@ def handle_local_command(
             "Commands: /review [@agents] QUESTION · /anneal @author,@critic QUESTION · "
             "/consensus [@agents] QUESTION · /retry <agent|synthesis> · /cancel · /agents · "
             "/council status · /council export PATH · /council resume · "
-            "/show <agent> · /inbox · /room · PgUp/PgDn · @ opens a mention picker "
+            "/show <agent> · /inbox · /lanes · /room · PgUp/PgDn · @ opens a mention picker "
             "(Tab completes, Esc closes)"
         )
     if stripped == "/review" or stripped.startswith("/review "):
@@ -4060,6 +4355,47 @@ def handle_local_command(
     return "Unknown command. Use /help."
 
 
+@dataclass(frozen=True)
+class TuiRegions:
+    header_row: int | None
+    content_start: int
+    content_height: int
+    status_row: int | None
+    input_row: int | None
+
+
+def tui_regions(height: int) -> TuiRegions:
+    """Reserve disjoint rows, keeping status and input usable on tiny terminals."""
+    if height <= 0:
+        return TuiRegions(None, 0, 0, None, None)
+    if height == 1:
+        return TuiRegions(None, 0, 0, None, 0)
+    if height == 2:
+        return TuiRegions(None, 0, 0, 0, 1)
+    return TuiRegions(0, 1, max(0, height - 3), height - 2, height - 1)
+
+
+def _tui_addnstr(
+    screen: curses.window,
+    row: int,
+    column: int,
+    text: str,
+    count: int,
+    attribute: int | None = None,
+) -> None:
+    """Keep one failed terminal write from suppressing the shared status or input row."""
+    if count <= 0:
+        return
+    clipped = _display_clip(text, count)
+    try:
+        if attribute is None:
+            screen.addnstr(row, column, clipped, len(clipped))
+        else:
+            screen.addnstr(row, column, clipped, len(clipped), attribute)
+    except curses.error:
+        pass
+
+
 def draw_tui(
     screen: curses.window,
     transcript: Transcript,
@@ -4074,25 +4410,46 @@ def draw_tui(
     screen.erase()
     height, width = screen.getmaxyx()
     mentions = " ".join(f"@{name}" for name in participants)
-    title = title if view == "room" else f"{title} | inbox (/room returns)"
+    if view == "inbox":
+        title = f"{title} | inbox (/room returns)"
+    elif view == "lanes":
+        title = f"{title} | lanes (/room returns)"
     header = f" {title}: {room} | {mentions} @all | Ctrl-Q exits "
-    try:
-        screen.addnstr(0, 0, header, width - 1, curses.A_REVERSE)
-        available = max(1, height - 4)
-        if view == "inbox":
-            all_lines = inbox_rendered_lines(inbox_messages(transcript.read()), width - 2)
-        else:
-            all_lines = transcript.rendered_lines(width - 2)
+    regions = tui_regions(height)
+    max_scroll = 0
+    if regions.header_row is not None:
+        _tui_addnstr(screen, regions.header_row, 0, header, width - 1, curses.A_REVERSE)
+    available = regions.content_height
+    lines: list[str] = []
+    line_column = 0
+    line_width = 0
+    if available > 0 and view == "inbox":
+        all_lines = inbox_rendered_lines(inbox_messages(transcript.read()), max(1, width - 2))
         lines, max_scroll = visible_wrapped_lines(all_lines, available, scroll_offset)
-        for row, line in enumerate(lines, start=1):
-            screen.addnstr(row, 1, line, width - 2)
-        screen.addnstr(height - 3, 0, status, width - 1, curses.A_DIM)
-        prompt = f"> {buffer}"
-        screen.addnstr(height - 2, 0, prompt, width - 1)
-        screen.move(height - 2, min(width - 1, len(prompt)))
-    except curses.error:
-        max_scroll = 0
-    screen.refresh()
+        line_column = 1
+        line_width = max(0, width - 2)
+    elif available > 0 and view == "lanes":
+        lines, max_scroll = lane_view_lines(
+            transcript.read(), participants, width, available, scroll_offset
+        )
+        line_width = max(0, width)
+    elif available > 0:
+        all_lines = transcript.rendered_lines(max(1, width - 2))
+        lines, max_scroll = visible_wrapped_lines(all_lines, available, scroll_offset)
+        line_column = 1
+        line_width = max(0, width - 2)
+    for row, line in enumerate(lines, start=regions.content_start):
+        _tui_addnstr(screen, row, line_column, line, line_width)
+    if regions.status_row is not None:
+        _tui_addnstr(screen, regions.status_row, 0, status, width - 1, curses.A_DIM)
+    prompt = f"> {buffer}"
+    if regions.input_row is not None:
+        _tui_addnstr(screen, regions.input_row, 0, prompt, width - 1)
+        if width > 0:
+            with suppress(curses.error):
+                screen.move(regions.input_row, min(width - 1, terminal_display_width(prompt)))
+    with suppress(curses.error):
+        screen.refresh()
     return max_scroll
 
 

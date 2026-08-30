@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+- Add the exact presentation-only `/lanes` command beside `/room` and `/inbox`.
+  It keeps one stable column per configured participant and projects only human
+  turns addressed to that participant or all, the participant's own replies
+  and review artifacts, and directly scoped system or status items. All columns
+  use one shared Page Up/Page Down offset. Narrow terminals show an explicit
+  widen-terminal message rather than dropping or rearranging lanes. Switching
+  views does not append to the transcript or dispatch agent work, and the
+  shared status and input rows remain usable.
+- Harden lane scope and rendering: per-agent review statuses now carry an exact
+  structured agent alongside council scope, malformed scope fails closed, and
+  legacy fallback recognizes only a leading participant marker. A compact
+  lane renderer preserves complete bodies at minimum width. Shared and inbox
+  rendering tolerate missing optional legacy fields, while tiny terminals use
+  disjoint regions and width guidance reports the actual terminal width.
+- Make leading legacy participant markers override council-wide scope when no
+  structured agent is available. Add `regex` and `wcwidth` so lane wrapping,
+  clipping, padding, separators, and input cursor placement use terminal cells
+  without splitting CJK, combining-mark, or emoji grapheme clusters.
+- Distinguish absent legacy markers from leading unconfigured markers, which
+  now fail closed instead of inheriting council-wide scope. Escape tabs, NUL,
+  ESC, and other terminal controls visibly before all terminal-cell operations
+  and curses writes without changing stored transcript text.
+
 ## [0.9.1] - 2026-08-29
 
 - Fix a Pi participant's turn failing with `reply markers HGCHAT_REPLY_* not

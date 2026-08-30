@@ -23,8 +23,9 @@ this TUI a thin Cumora client, with one backend owner and no dual writes. See
 
 Prerequisites are Herdr 0.8.0 or newer, [`uv`](https://docs.astral.sh/uv/), and
 installed, authenticated Pi, Claude Code, Codex, and Grok Build CLIs. The room
-executable uses `uv` to run Python 3.13. The `sol-fable-glm` profile
-additionally needs Pi configured and authenticated for its `bigmodel-coding`
+executable uses `uv` to run Python 3.13 and installs `regex` plus `wcwidth` for
+grapheme-safe terminal-cell layout. The `sol-fable-glm` profile additionally
+needs Pi configured and authenticated for its `bigmodel-coding`
 provider (`glm-5.3`).
 
 Install the pinned release from GitHub:
@@ -67,7 +68,7 @@ Ctrl-C or other keys, so a participant may continue working and its later reply
 is not collected by the cancelled round. A failed, blocked, timed-out, or
 cancelled first pass can be retried without rerunning the other reviewers; a
 successful retry triggers a fresh synthesis. Use Page Up and Page
-Down to scroll the transcript while work continues.
+Down to scroll the active room, inbox, or lane presentation while work continues.
 
 Typing `@` at the start of the recipient token — at the beginning of the line
 or right after `/review `, `/anneal `, `/consensus `, or a comma still inside that token —
@@ -201,10 +202,29 @@ profile setup:
 replies, review syntheses, system notices, and review statuses that need
 attention (non-unanimous, blocked, failed, timed out, refused, or cancelled);
 clean unanimous consensus statuses stay in the room while `consensus_final`
-remains in the inbox. `/room` returns to the full
-transcript. Both are pure view switches: nothing is dispatched, recorded, or
-kept as unread state, and the room remains the single live discussion and
-independent-review surface.
+remains in the inbox.
+
+`/lanes` switches to one stable column per configured participant, in configured
+roster order. Each lane shows human turns addressed to that participant or all,
+that participant's own replies and review artifacts, and system or status items
+directly scoped to that participant. Per-agent council statuses use their
+structured agent scope. A leading configured legacy marker takes exact scope;
+a leading unconfigured marker fails closed instead of becoming council-wide.
+Lane-specific wrapping may compact labels but never clips body text. CJK,
+combining marks, and emoji are wrapped, clipped, padded, and positioned by
+terminal display cells without splitting grapheme clusters. Tabs, NUL, ESC,
+and other terminal controls render as deterministic visible escapes while the
+stored transcript remains unchanged. Page Up and Page
+Down move every lane with one shared scroll offset. If the terminal cannot
+keep every configured column readable, the room reports the actual terminal
+width and asks you to widen it instead of dropping, stacking, or reordering
+lanes. Tiny terminals reserve disjoint title, status, and input rows before
+allocating any lane body rows.
+
+`/room` returns to the full transcript. All three commands are pure view
+switches: nothing is dispatched, recorded, or kept as unread state, and the
+room remains the single live discussion and independent-review surface. The
+input and shared status rows remain available in every view.
 
 A verified four-agent round looks like:
 
@@ -224,6 +244,7 @@ The standalone CLI remains available:
 ./herdr-group-chat --once "/review @claude,@codex Compare these options."
 ./herdr-group-chat --once "/anneal @pi,@claude Harden this plan."
 ./herdr-group-chat --once "/consensus @claude,@codex Decide whether this is ready."
+# In the interactive TUI: /room, /inbox, and /lanes switch presentations.
 ./herdr-group-chat --council-status
 ./herdr-group-chat --council-export council-ledger.json
 ./herdr-group-chat --synthesizer codex --agent-timeout grok=900000

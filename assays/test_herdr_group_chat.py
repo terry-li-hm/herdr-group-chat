@@ -68,6 +68,19 @@ handle_picker_key = namespace["handle_picker_key"]
 inbox_messages = namespace["inbox_messages"]
 inbox_rendered_lines = namespace["inbox_rendered_lines"]
 visible_message_lines = namespace["visible_message_lines"]
+lane_message_visible = namespace["lane_message_visible"]
+lane_messages = namespace["lane_messages"]
+lane_projections = namespace["lane_projections"]
+lane_column_widths = namespace["lane_column_widths"]
+lane_narrow_message = namespace["lane_narrow_message"]
+lane_message_lines = namespace["lane_message_lines"]
+lane_view_lines = namespace["lane_view_lines"]
+draw_tui = namespace["draw_tui"]
+tui_regions = namespace["tui_regions"]
+terminal_display_width = namespace["terminal_display_width"]
+terminal_safe_text = namespace["terminal_safe_text"]
+GRAPHEME_RE = namespace["GRAPHEME_RE"]
+LANE_MIN_COLUMN_WIDTH = namespace["LANE_MIN_COLUMN_WIDTH"]
 
 # Harness-wide budget for waiting on deterministic internal test events
 # (controller completion, worker entry latches, release gates, blind-phase
@@ -289,17 +302,542 @@ def test_inbox_empty_state_is_explicit_and_nonempty_inbox_uses_message_rendering
     assert inbox_rendered_lines(messages, 80) == message_lines(messages, 80)
 
 
+def test_shared_rendering_and_inbox_tolerate_malformed_legacy_optional_fields() -> None:
+    messages = [
+        {"seq": 1, "kind": "message", "meta": None},
+        {"seq": 2, "sender": "system", "kind": "review_status", "body": None, "meta": None},
+        {
+            "seq": 3,
+            "sender": "system",
+            "kind": "review_status",
+            "body": "blocked legacy review",
+            "meta": None,
+        },
+        {"seq": 4, "sender": "system", "kind": "consensus_status", "meta": None},
+        {
+            "seq": 5,
+            "sender": "system",
+            "kind": "consensus_status",
+            "meta": {"unanimous": False},
+        },
+        {"seq": 6, "sender": "pi", "kind": "consensus_vote", "body": None, "meta": None},
+    ]
+
+    rendered = message_lines(messages, 40)
+    inbox = inbox_messages(messages)
+
+    assert rendered[0] == "unknown> "
+    assert any("pi [vote INVALID]>" in line for line in rendered)
+    assert [item["seq"] for item in inbox] == [1, 3, 5]
+    assert inbox_rendered_lines(inbox, 40)
+
+
 def test_view_commands_are_exact_and_do_not_enter_the_transcript(tmp_path: Path) -> None:
-    _, _, transcript = make_chat(tmp_path)
+    chat, _, transcript = make_chat(tmp_path)
 
     assert handle_view_command("/inbox") == (
         "inbox",
         "Inbox shows final replies, syntheses, and attention items. Use /room to return.",
     )
+    assert handle_view_command("/lanes") == (
+        "lanes",
+        "Lane view shows each participant's scoped conversation. Use /room to return.",
+    )
     assert handle_view_command("/room") == ("room", "Showing the full room transcript.")
-    assert handle_view_command("/inbox later") is None
-    assert handle_view_command("ordinary message") is None
+    for non_command in ("/inbox later", "/lanes later", "/lanes-extra", "ordinary message"):
+        assert handle_view_command(non_command) is None
+    assert "/lanes" in handle_local_command("/help", chat)
     assert transcript.read() == []
+    assert not transcript.path.exists()
+
+
+def test_lane_projection_keeps_stable_order_and_direct_scope() -> None:
+    messages = [
+        {"seq": 1, "sender": "human", "recipients": ["pi"], "kind": "message", "body": "pi"},
+        {
+            "seq": 2,
+            "sender": "claude",
+            "recipients": ["human", "all"],
+            "kind": "message",
+            "body": "claude reply",
+        },
+        {
+            "seq": 3,
+            "sender": "pi",
+            "recipients": ["human", "all"],
+            "kind": "review_response",
+            "body": "pi review",
+        },
+        {
+            "seq": 4,
+            "sender": "human",
+            "recipients": ["all"],
+            "kind": "review_question",
+            "body": "everyone",
+        },
+        {
+            "seq": 5,
+            "sender": "system",
+            "recipients": ["human"],
+            "kind": "review_status",
+            "body": "council call started",
+            "meta": {"agent": "pi"},
+        },
+        {
+            "seq": 6,
+            "sender": "system",
+            "recipients": ["human"],
+            "kind": "review_status",
+            "body": "@claude review blocked",
+        },
+        {
+            "seq": 7,
+            "sender": "system",
+            "recipients": ["human", "all"],
+            "kind": "consensus_status",
+            "body": "scoped council status",
+            "meta": {"council_participants": ["pi"]},
+        },
+    ]
+
+    assert [item["seq"] for item in lane_messages(messages, "pi")] == [1, 3, 4, 5, 7]
+    assert [item["seq"] for item in lane_messages(messages, "claude")] == [2, 4, 6]
+
+
+def test_legacy_leading_marker_overrides_combined_council_scope_without_agent() -> None:
+    legacy = {
+        "seq": 1,
+        "sender": "system",
+        "recipients": ["human"],
+        "kind": "review_status",
+        "body": "@claude consensus review blocked",
+        "meta": {"council_participants": ["claude", "codex", "pi"]},
+    }
+    participants = ("claude", "codex", "pi")
+
+    projected = lane_projections([legacy], participants)
+
+    assert projected == {"claude": [legacy], "codex": [], "pi": []}
+    assert lane_messages([legacy], "claude") == [legacy]
+    assert lane_messages([legacy], "pi") == []
+    assert lane_message_visible(legacy, "claude")
+    assert not lane_message_visible(legacy, "codex")
+    assert not lane_message_visible(legacy, "pi")
+
+    unconfigured = {**legacy, "body": "@outsider consensus review blocked"}
+    unmarked = {**legacy, "body": "Consensus review blocked"}
+    assert lane_projections([unconfigured], participants) == {
+        "claude": [],
+        "codex": [],
+        "pi": [],
+    }
+    assert lane_projections([unmarked], participants) == {
+        "claude": [unmarked],
+        "codex": [unmarked],
+        "pi": [unmarked],
+    }
+
+
+def test_lane_combined_scope_prefers_exact_agent_and_legacy_marker_is_anchored() -> None:
+    combined = {
+        "sender": "system",
+        "recipients": ["human"],
+        "kind": "review_status",
+        "body": "@claude consensus review blocked; @pi is synthesizing",
+        "meta": {
+            "agent": "claude",
+            "council_participants": ["claude", "codex", "pi"],
+        },
+    }
+    incidental_legacy = {
+        "sender": "system",
+        "recipients": ["human"],
+        "kind": "review_status",
+        "body": "review blocked after asking @claude for help",
+        "meta": None,
+    }
+    leading_legacy = {**incidental_legacy, "body": "@claude review blocked"}
+
+    assert lane_message_visible(combined, "claude")
+    assert not lane_message_visible(combined, "codex")
+    assert not lane_message_visible(combined, "pi")
+    assert not lane_message_visible(incidental_legacy, "claude")
+    assert lane_message_visible(leading_legacy, "claude")
+
+
+@pytest.mark.parametrize(
+    "malformed_scope",
+    ["claude", ["claude", None], {"claude": True}],
+)
+def test_lane_projection_fails_closed_on_malformed_council_scope(
+    malformed_scope: object,
+) -> None:
+    item = {
+        "sender": "system",
+        "recipients": ["human", "all"],
+        "kind": "review_status",
+        "body": "@claude review blocked",
+        "meta": {"agent": "claude", "council_participants": malformed_scope},
+    }
+
+    assert not lane_message_visible(item, "claude")
+    assert not lane_message_visible(item, "pi")
+
+
+def test_lane_human_visibility_and_unrelated_participant_replies() -> None:
+    addressed = {
+        "sender": "human",
+        "recipients": ["pi"],
+        "kind": "message",
+        "body": "only pi",
+    }
+    broadcast = {**addressed, "recipients": ["all"], "body": "all"}
+    claude_reply = {
+        "sender": "claude",
+        "recipients": ["human", "all"],
+        "kind": "review_response",
+        "body": "claude artifact",
+    }
+
+    assert lane_message_visible(addressed, "pi")
+    assert not lane_message_visible(addressed, "claude")
+    assert lane_message_visible(broadcast, "pi")
+    assert lane_message_visible(broadcast, "claude")
+    assert lane_message_visible(claude_reply, "claude")
+    assert not lane_message_visible(claude_reply, "pi")
+
+
+def test_lane_projection_does_not_broaden_a_malformed_recipient_scope() -> None:
+    malformed_broadcast = {
+        "sender": "human",
+        "recipients": ["all", None],
+        "kind": "message",
+        "body": "do not broaden this lane",
+    }
+
+    assert lane_projections([malformed_broadcast], ("pi", "claude")) == {
+        "pi": [],
+        "claude": [],
+    }
+
+
+@pytest.mark.parametrize(
+    ("kind", "meta"),
+    [
+        ("message", None),
+        ("review_response", None),
+        ("consensus_vote", {"verdict": "PASS"}),
+    ],
+)
+def test_lane_compact_renderer_preserves_long_bodies_at_minimum_width(
+    kind: str, meta: dict[str, str] | None
+) -> None:
+    sentinel = f"{kind.upper()}_SENTINEL_" + "0123456789" * 6
+    item = {"sender": "pi", "kind": kind, "body": sentinel, "meta": meta}
+    inner_width = LANE_MIN_COLUMN_WIDTH - 2
+
+    lines = lane_message_lines([item], inner_width)
+    body_lines = lines[1:-1]
+
+    assert all(len(line) <= inner_width for line in lines)
+    assert "".join(body_lines) == sentinel
+
+    rendered, _ = lane_view_lines([item], ("pi",), LANE_MIN_COLUMN_WIDTH, 20, 0)
+    cells = [row[1:-1].rstrip() for row in rendered[2:-1]]
+    assert "".join(cells) == sentinel
+
+
+@pytest.mark.parametrize(
+    ("kind", "meta", "body"),
+    [
+        ("message", None, "普通訊息漢字測試" * 3),
+        ("review_response", None, "e\u0301" * 30),
+        ("consensus_vote", {"verdict": "PASS"}, "👩‍💻🚀🙂" * 12),
+    ],
+)
+def test_lane_unicode_wrap_preserves_graphemes_and_terminal_width_at_minimum(
+    kind: str, meta: dict[str, str] | None, body: str
+) -> None:
+    item = {"sender": "pi", "kind": kind, "body": body, "meta": meta}
+    inner_width = LANE_MIN_COLUMN_WIDTH - 2
+
+    lines = lane_message_lines([item], inner_width)
+    body_lines = lines[1:-1]
+
+    assert "".join(body_lines) == body
+    assert all(terminal_display_width(line) <= inner_width for line in lines)
+    assert [cluster for line in body_lines for cluster in GRAPHEME_RE.findall(line)] == list(
+        GRAPHEME_RE.findall(body)
+    )
+
+    rendered, _ = lane_view_lines([item], ("pi",), LANE_MIN_COLUMN_WIDTH, 20, 0)
+    assert all(terminal_display_width(row) == LANE_MIN_COLUMN_WIDTH for row in rendered)
+
+
+def test_lane_view_unicode_cells_keep_separators_aligned_at_minimum_width() -> None:
+    messages = [
+        {
+            "sender": "pi",
+            "kind": "message",
+            "body": "漢字e\u0301👩‍💻" * 4,
+        },
+        {
+            "sender": "claude",
+            "kind": "review_response",
+            "body": "🙂測試a\u0301" * 4,
+        },
+    ]
+    participants = ("pi", "claude")
+    width = len(participants) * LANE_MIN_COLUMN_WIDTH + len(participants) - 1
+
+    rendered, _ = lane_view_lines(messages, participants, width, 20, 0)
+
+    assert all(terminal_display_width(row) == width for row in rendered)
+    assert all(row.count("|") == 1 for row in rendered)
+
+
+@pytest.mark.parametrize(
+    ("control", "visible"),
+    [("\t", r"\t"), ("\x00", r"\x00"), ("\x1b", r"\x1b")],
+)
+def test_lane_controls_are_visible_and_cannot_cross_minimum_lane_boundaries(
+    control: str, visible: str
+) -> None:
+    inner_width = LANE_MIN_COLUMN_WIDTH - 2
+    body = "A" * (inner_width - 1) + control + "BOUNDARY"
+    item = {"sender": "pi", "kind": "message", "body": body}
+
+    lines = lane_message_lines([item], inner_width)
+    body_lines = lines[1:-1]
+
+    assert "".join(body_lines) == terminal_safe_text(body)
+    assert visible in "".join(body_lines)
+    assert control not in "".join(body_lines)
+    assert all(terminal_display_width(line) <= inner_width for line in lines)
+
+    width = 2 * LANE_MIN_COLUMN_WIDTH + 1
+    rendered, _ = lane_view_lines([item], ("pi", "claude"), width, 20, 0)
+    assert all(terminal_display_width(row) == width for row in rendered)
+    assert all(row.count("|") == 1 for row in rendered)
+
+
+def test_lane_view_refuses_an_unreadable_width_with_explicit_guidance() -> None:
+    participants = ("pi", "claude", "codex")
+    required = len(participants) * LANE_MIN_COLUMN_WIDTH + len(participants) - 1
+    assert lane_column_widths(required, len(participants)) == (24, 24, 24)
+    assert lane_column_widths(required - 1, len(participants)) is None
+
+    lines, max_scroll = lane_view_lines([], participants, required - 1, 6, 0)
+
+    assert " ".join(lines) == lane_narrow_message(required - 1, len(participants))
+    assert "Widen terminal" in lines[0]
+    assert max_scroll == 0
+    assert not any("@pi" in line for line in lines)
+
+
+def test_lane_view_uses_fixed_headers_and_one_shared_scroll_offset() -> None:
+    messages = [
+        {
+            "seq": 1,
+            "sender": "human",
+            "recipients": ["all"],
+            "kind": "message",
+            "body": "first question",
+        },
+        {
+            "seq": 2,
+            "sender": "pi",
+            "recipients": ["human", "all"],
+            "kind": "message",
+            "body": "older pi reply",
+        },
+        {
+            "seq": 3,
+            "sender": "claude",
+            "recipients": ["human", "all"],
+            "kind": "message",
+            "body": "older claude reply",
+        },
+        {
+            "seq": 4,
+            "sender": "human",
+            "recipients": ["all"],
+            "kind": "message",
+            "body": "latest question",
+        },
+        {
+            "seq": 5,
+            "sender": "pi",
+            "recipients": ["human", "all"],
+            "kind": "message",
+            "body": "latest pi reply",
+        },
+        {
+            "seq": 6,
+            "sender": "claude",
+            "recipients": ["human", "all"],
+            "kind": "message",
+            "body": "latest claude reply",
+        },
+    ]
+    width = 2 * LANE_MIN_COLUMN_WIDTH + 1
+
+    latest, max_scroll = lane_view_lines(messages, ("pi", "claude"), width, 5, 0)
+    older, older_max_scroll = lane_view_lines(messages, ("pi", "claude"), width, 5, max_scroll)
+
+    assert max_scroll > 0
+    assert older_max_scroll == max_scroll
+    assert latest[0] == older[0]
+    assert latest[0].index("@pi") < latest[0].index("@claude")
+    assert "latest pi reply" in "\n".join(latest)
+    assert "latest claude" in "\n".join(latest)
+    assert "first question" in "\n".join(older)
+    assert latest != older
+
+
+@pytest.mark.parametrize("height", [3, 4, 5])
+@pytest.mark.parametrize("width_delta", [-1, 0])
+def test_lane_draw_uses_disjoint_tiny_regions_and_actual_terminal_width(
+    tmp_path: Path, height: int, width_delta: int
+) -> None:
+    participants = ("pi", "claude")
+    threshold = len(participants) * LANE_MIN_COLUMN_WIDTH + len(participants) - 1
+    width = threshold + width_delta
+    transcript = Transcript(tmp_path, f"tiny-{height}-{width_delta + 1}")
+
+    class FakeScreen:
+        def __init__(self) -> None:
+            self.writes: list[tuple[int, int, str, int]] = []
+            self.cursor: tuple[int, int] | None = None
+
+        def erase(self) -> None:
+            pass
+
+        def getmaxyx(self) -> tuple[int, int]:
+            return height, width
+
+        def addnstr(self, row: int, column: int, text: str, count: int, *_attrs: int) -> None:
+            assert 0 <= row < height
+            assert 0 <= column < width
+            self.writes.append((row, column, text, count))
+
+        def move(self, row: int, column: int) -> None:
+            assert 0 <= row < height
+            assert 0 <= column < width
+            self.cursor = (row, column)
+
+        def refresh(self) -> None:
+            pass
+
+    screen = FakeScreen()
+    draw_tui(
+        screen,
+        transcript,
+        "tiny",
+        "draft",
+        "shared status",
+        participants,
+        view="lanes",
+    )
+
+    regions = tui_regions(height)
+    written_rows = [row for row, _, _, _ in screen.writes]
+    assert len(written_rows) == len(set(written_rows))
+    assert set(written_rows) == set(range(height))
+    assert regions.header_row == 0
+    assert regions.content_height == height - 3
+    assert regions.status_row == height - 2
+    assert regions.input_row == height - 1
+    if height == 5 and width_delta == -1:
+        content = " ".join(
+            text
+            for row, _, text, _ in screen.writes
+            if regions.content_start <= row < regions.status_row
+        )
+        assert f"current width: {width}" in content
+    if height >= 4 and width_delta == 0:
+        assert any(
+            "@pi" in text and "@claude" in text
+            for row, _, text, count in screen.writes
+            if row == regions.content_start and count == width
+        )
+
+
+@pytest.mark.parametrize("buffer", ["漢字", "e\u0301e\u0301", "👩‍💻🚀"])
+def test_tui_cursor_uses_terminal_cells_for_unicode_input(tmp_path: Path, buffer: str) -> None:
+    width = LANE_MIN_COLUMN_WIDTH
+    height = 4
+    transcript = Transcript(tmp_path, "unicode-cursor")
+
+    class CursorScreen:
+        def __init__(self) -> None:
+            self.cursor: tuple[int, int] | None = None
+
+        def erase(self) -> None:
+            pass
+
+        def getmaxyx(self) -> tuple[int, int]:
+            return height, width
+
+        def addnstr(self, *_args: object) -> None:
+            pass
+
+        def move(self, row: int, column: int) -> None:
+            self.cursor = (row, column)
+
+        def refresh(self) -> None:
+            pass
+
+    screen = CursorScreen()
+    draw_tui(screen, transcript, "unicode", buffer, "ready", ("pi",), view="lanes")
+
+    assert screen.cursor == (height - 1, terminal_display_width(f"> {buffer}"))
+
+
+def test_tui_write_seam_escapes_controls_without_mutating_transcript(tmp_path: Path) -> None:
+    width = LANE_MIN_COLUMN_WIDTH
+    height = 10
+    controls = "\t\x00\x1b"
+    body = "lane-boundary:" + controls + ":stored"
+    transcript = Transcript(tmp_path, "control-seam")
+    transcript.append("pi", ("human", "all"), body)
+
+    class ControlScreen:
+        def __init__(self) -> None:
+            self.writes: list[tuple[int, str]] = []
+            self.cursor: tuple[int, int] | None = None
+
+        def erase(self) -> None:
+            pass
+
+        def getmaxyx(self) -> tuple[int, int]:
+            return height, width
+
+        def addnstr(self, row: int, _column: int, text: str, count: int, *_attrs: int) -> None:
+            self.writes.append((row, text[:count]))
+
+        def move(self, row: int, column: int) -> None:
+            self.cursor = (row, column)
+
+        def refresh(self) -> None:
+            pass
+
+    screen = ControlScreen()
+    draw_tui(
+        screen,
+        transcript,
+        "controls",
+        controls,
+        "status:" + controls,
+        ("pi",),
+        view="lanes",
+    )
+
+    written = "\n".join(text for _, text in screen.writes)
+    assert all(control not in written for control in controls)
+    assert r"\t\x00\x1b" in next(text for row, text in screen.writes if row == height - 1)
+    assert screen.cursor == (height - 1, terminal_display_width(f"> {controls}"))
+    assert transcript.read()[0]["body"] == body
 
 
 def test_agents_command_does_not_guess_a_workspace_by_label(tmp_path: Path) -> None:
@@ -3153,6 +3691,50 @@ def make_consensus_chat(
         synthesizer="pi",
     )
     return chat, transcript
+
+
+@pytest.mark.parametrize("outcome", ["blocked", "failed"])
+def test_consensus_per_agent_status_carries_exact_agent_with_council_scope(
+    tmp_path: Path, outcome: str
+) -> None:
+    class OneReviewerFailsClient(ConsensusClient):
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[str, str]:
+            if CONSENSUS_BLIND_MARKER in prompt:
+                with self.call_lock:
+                    self.calls.append((target, prompt))
+                    self.timeouts.append(timeout_ms)
+                self.blind_barrier.wait(timeout=HARNESS_WAIT_S)
+                if target == "claude-peer":
+                    if outcome == "blocked":
+                        return "blocked", ""
+                    raise ChatError("simulated reviewer failure")
+                return "done", f"blind from {target}"
+            return super().turn(target, prompt, timeout_ms, cancel_event)
+
+    chat, transcript = make_consensus_chat(
+        tmp_path, OneReviewerFailsClient(), f"scoped-{outcome}-room"
+    )
+
+    chat.consensus("@claude,@codex Decide safely")
+
+    statuses = [
+        item
+        for item in transcript.read()
+        if item.get("kind") == "review_status" and item.get("meta", {}).get("agent") == "claude"
+    ]
+    assert len(statuses) == 1
+    status = statuses[0]
+    assert status["meta"]["council_participants"] == ["claude", "codex", "pi"]
+    assert "council_attempt_settlement" in status["meta"]
+    assert lane_message_visible(status, "claude")
+    assert not lane_message_visible(status, "codex")
+    assert not lane_message_visible(status, "pi")
 
 
 def make_council_round(**overrides: object) -> object:
