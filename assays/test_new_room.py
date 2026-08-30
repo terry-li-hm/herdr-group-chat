@@ -3721,3 +3721,228 @@ def test_room_reopen_reverifies_sol_fable_glm_and_execs_with_receipt(
         call[call.index("--pane") + 1] for call in calls if call[:2] == ["pane", "process-info"]
     }
     assert process_panes == {"w-agents:p-fable"}
+
+
+# --- durable launcher failure records --------------------------------------------------
+
+
+class _FakeStdin:
+    """A TTY stdin whose readline can be observed without touching the test runner."""
+
+    def __init__(self) -> None:
+        self.readline_calls = 0
+
+    def isatty(self) -> bool:
+        return True
+
+    def readline(self) -> str:
+        self.readline_calls += 1
+        return "\n"
+
+
+def _record_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    arguments: list[str] | None = None,
+) -> int:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("HERDR_WORKSPACE_ID", "w-ctx")
+    monkeypatch.setenv("HERDR_TAB_ID", "w-ctx:t-ctx")
+    monkeypatch.setenv("HERDR_PANE_ID", "w-ctx:p-ctx")
+    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable")
+    monkeypatch.setenv(
+        "HERDR_PLUGIN_CONTEXT_JSON",
+        json.dumps(
+            {
+                "workspace_id": "w-ctx",
+                "tab_id": "w-ctx:t-ctx",
+                "focused_pane_id": "w-ctx:p-focus",
+                "focused_pane_cwd": "/never/recorded",
+            }
+        ),
+    )
+    monkeypatch.setattr(module, "main", lambda: (_ for _ in ()).throw(error))
+
+    try:
+        module.run_launcher(arguments or [])
+    except SystemExit as exited:
+        assert exited.code is not None
+        return exited.code
+    raise AssertionError("a recorded failure must exit")
+
+
+def test_bootstrap_failure_is_recorded_and_exits_two(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exit_code = _record_failure(tmp_path, monkeypatch, BootstrapError("boom", code="plugin_x"))
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "new-room: boom" in captured.err
+
+    error_path = tmp_path / "launcher-errors.jsonl"
+    lines = error_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["mode"] == "setup"
+    assert record["argv"] == []
+    assert record["pid"] == os.getpid()
+    assert record["error_type"] == "BootstrapError"
+    assert record["code"] == "plugin_x"
+    assert record["message"] == "boom"
+    assert record["traceback"] is None
+    assert record["at"].endswith("+00:00")
+    assert record["herdr"] == {
+        "workspace_id": "w-ctx",
+        "tab_id": "w-ctx:t-ctx",
+        "pane_id": "w-ctx:p-ctx",
+        "plugin_state_dir": str(tmp_path),
+        "profile": "sol-fable",
+        "plugin_context": {
+            "workspace_id": "w-ctx",
+            "tab_id": "w-ctx:t-ctx",
+            "focused_pane_id": "w-ctx:p-focus",
+        },
+    }
+    assert stat.S_IMODE(error_path.stat().st_mode) == 0o600
+
+
+def test_unexpected_failure_is_recorded_with_traceback_and_exits_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exit_code = _record_failure(tmp_path, monkeypatch, RuntimeError("kaboom"))
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Traceback" in captured.err
+    assert "RuntimeError: kaboom" in captured.err
+
+    record = json.loads(
+        (tmp_path / "launcher-errors.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert record["error_type"] == "RuntimeError"
+    assert record["code"] is None
+    assert "RuntimeError: kaboom" in record["traceback"]
+
+
+def test_hold_skipped_under_no_hold_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv(module.NO_HOLD_ENV, "1")
+    monkeypatch.setattr(
+        module.select,
+        "select",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("hold must be skipped")),
+    )
+    monkeypatch.setattr(sys, "stdin", _FakeStdin())
+
+    exit_code = _record_failure(tmp_path, monkeypatch, BootstrapError("boom", code="plugin_x"))
+
+    assert exit_code == 2
+    assert module.HOLD_PROMPT not in capsys.readouterr().out
+
+
+def test_hold_waits_for_enter_with_sixty_second_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[tuple[object, float]] = []
+    stdin = _FakeStdin()
+
+    def fake_select(
+        rlist: list[object], _wlist: object, _xlist: object, timeout: float
+    ) -> tuple[list[object], list[object], list[object]]:
+        calls.append((rlist, timeout))
+        return [], [], []
+
+    monkeypatch.setattr(module.select, "select", fake_select)
+    monkeypatch.setattr(sys, "stdin", stdin)
+
+    exit_code = _record_failure(tmp_path, monkeypatch, BootstrapError("boom", code="plugin_x"))
+
+    assert exit_code == 2
+    assert module.HOLD_PROMPT in capsys.readouterr().out
+    assert calls == [([stdin], module.HOLD_TIMEOUT_SECONDS)]
+    assert module.HOLD_TIMEOUT_SECONDS == 60.0
+    assert stdin.readline_calls == 0
+
+
+def test_hold_returns_immediately_after_enter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stdin = _FakeStdin()
+
+    def fake_select(
+        rlist: list[object], _wlist: object, _xlist: object, timeout: float
+    ) -> tuple[list[object], list[object], list[object]]:
+        del timeout
+        return rlist, [], []
+
+    monkeypatch.setattr(module.select, "select", fake_select)
+    monkeypatch.setattr(sys, "stdin", stdin)
+
+    exit_code = _record_failure(tmp_path, monkeypatch, BootstrapError("boom", code="plugin_x"))
+
+    assert exit_code == 2
+    assert stdin.readline_calls == 1
+
+
+def test_last_error_prints_most_recent_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    module.append_launcher_error("--room-entrypoint", ["--room-entrypoint"], BootstrapError("old"))
+    module.append_launcher_error("setup", [], BootstrapError("newest", code="plugin_x"))
+
+    assert module.run_launcher(["--last-error"]) == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["message"] == "newest"
+    assert record["code"] == "plugin_x"
+    assert record["mode"] == "setup"
+
+
+def test_errors_prints_last_n_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    for index in range(3):
+        module.append_launcher_error("setup", [], BootstrapError(f"failure-{index}"))
+
+    assert module.run_launcher(["--errors", "2"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 2
+    assert [json.loads(line)["message"] for line in lines] == ["failure-1", "failure-2"]
+
+
+def test_last_error_without_records_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+
+    assert module.run_launcher(["--last-error"]) == 0
+    assert capsys.readouterr().out.strip() == "no launcher errors recorded"
+
+
+def test_error_records_are_capped_at_two_hundred(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    for index in range(205):
+        module.append_launcher_error("setup", [], BootstrapError(f"failure-{index}"))
+
+    exit_code = _record_failure(tmp_path, monkeypatch, BootstrapError("boom", code="plugin_x"))
+    assert exit_code == 2
+    capsys.readouterr()
+
+    lines = (tmp_path / "launcher-errors.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == module.LAUNCHER_ERRORS_MAX_RECORDS == 200
+    assert json.loads(lines[0])["message"] == "failure-6"
+    assert json.loads(lines[-1])["message"] == "boom"
+
+
+def test_inspection_argument_parsing_is_exact() -> None:
+    assert module.parse_launch_arguments(["--last-error"]) == ("--last-error", None)
+    assert module.parse_launch_arguments(["--errors", "5"]) == ("--errors", None)
+    with pytest.raises(BootstrapError, match="unknown arguments"):
+        module.parse_launch_arguments(["--last-error", "extra"])
+    for arguments in (["--errors"], ["--errors", "0"], ["--errors", "x"], ["--errors", "1", "2"]):
+        with pytest.raises(BootstrapError, match="requires a positive record count"):
+            module.parse_launch_arguments(arguments)
