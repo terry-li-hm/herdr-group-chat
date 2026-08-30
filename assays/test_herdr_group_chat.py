@@ -1028,16 +1028,46 @@ def test_delivery_controller_wait_is_bounded_for_an_uncooperative_worker(tmp_pat
     assert controller.wait(HARNESS_WAIT_S)
 
 
+def test_delivery_controller_final_status_lookup_keeps_controls_responsive(tmp_path: Path) -> None:
+    class BlockingStatesClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.states_started = threading.Event()
+            self.release_states = threading.Event()
+
+        def states(self) -> dict[str, str]:
+            self.states_started.set()
+            assert self.release_states.wait(HARNESS_WAIT_S)
+            return {"pi-peer": "idle"}
+
+    client = BlockingStatesClient()
+    chat = GroupChat(Transcript(tmp_path, "blocking-states-room"), {"pi": "pi-peer"}, client)
+    controller = DeliveryController(chat)
+    controller.start("@pi finish")
+    assert client.states_started.wait(HARNESS_WAIT_S)
+
+    started = time.monotonic()
+    assert controller.is_active()
+    assert controller.status() == "Delivery: @pi ready"
+    assert time.monotonic() - started < 1
+
+    client.release_states.set()
+    assert controller.wait(HARNESS_WAIT_S)
+    assert controller.status() == "Delivered. @pi ready"
+
+
 class ScriptedTuiScreen:
     def __init__(
         self,
         keys: list[object],
         client: BlockingOrdinaryClient,
         release_wait: Callable[[], bool] | None = None,
+        review_wait: Callable[[], bool] | None = None,
     ) -> None:
         self.keys = keys
         self.client = client
         self.release_wait = release_wait
+        self.review_wait = review_wait
 
     def keypad(self, _enabled: bool) -> None:
         pass
@@ -1054,6 +1084,10 @@ class ScriptedTuiScreen:
             self.client.release.set()
             assert self.release_wait is not None
             assert self.release_wait()
+            return module.curses.KEY_RESIZE
+        if key == "WAIT_FOR_REVIEW":
+            assert self.review_wait is not None
+            assert self.review_wait()
             return module.curses.KEY_RESIZE
         return key
 
@@ -1129,6 +1163,56 @@ def test_tui_shows_delivery_rejection_while_worker_drains_and_keeps_views_respon
         for view, status, active in draws
     )
     assert draws[-1][1:] == ("unknown participant: @nobody", False)
+
+
+def test_tui_clears_completed_delivery_notice_before_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, client, _ = make_blocking_ordinary_chat(tmp_path)
+    draws: list[str] = []
+    deliveries: list[DeliveryController] = []
+    reviews: list[ReviewController] = []
+    keys = [
+        *list("@pi ordinary delivery\n"),
+        "RELEASE_WORKER",
+        *list("/review @pi Check handoff\n"),
+        "WAIT_FOR_REVIEW",
+        "\x11",
+    ]
+
+    class TrackingDeliveryController(DeliveryController):
+        def __init__(self, tracked_chat: object) -> None:
+            super().__init__(tracked_chat)
+            deliveries.append(self)
+
+    class TrackingReviewController(ReviewController):
+        def __init__(self, tracked_chat: object) -> None:
+            super().__init__(tracked_chat)
+            reviews.append(self)
+
+    screen = ScriptedTuiScreen(
+        keys,
+        client,
+        lambda: _wait_until(lambda: not deliveries[0].is_active(), HARNESS_WAIT_S),
+        lambda: reviews[0].wait(HARNESS_WAIT_S),
+    )
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    monkeypatch.setattr(
+        module,
+        "draw_tui",
+        lambda _screen, _transcript, _room, _buffer, status, _participants, _scroll=0, **_kwargs: (
+            draws.append(status) or 0
+        ),
+    )
+    monkeypatch.setattr(module, "DeliveryController", TrackingDeliveryController)
+    monkeypatch.setattr(module, "ReviewController", TrackingReviewController)
+
+    run_tui(screen, chat, "ordinary-review-handoff-room")
+
+    assert "Delivered. @pi working · @claude ready" in draws
+    assert draws[-1] == "Review complete."
+    assert deliveries[0].status() == ""
+    assert reviews[0].status() == "Review complete."
 
 
 def test_tui_ctrl_q_waits_for_ordinary_cancellation_outcome_before_returning(

@@ -4173,14 +4173,22 @@ class DeliveryController:
                 if delivery_event is self._cancel_event and not delivery_event.is_set():
                     self._notice = f"Delivery failed unexpectedly: {error}"
         finally:
+            final_notice = ""
             with self._lock:
-                if delivery_event is self._cancel_event:
-                    if delivery_event.is_set():
-                        self._notice = (
-                            "Delivery cancelled locally; participants may continue working."
-                        )
-                    elif not self._notice:
-                        self._notice = participant_status(self.chat, "Delivered.")
+                needs_final_notice = (
+                    delivery_event is self._cancel_event
+                    and not delivery_event.is_set()
+                    and not self._notice
+                )
+            if needs_final_notice:
+                final_notice = participant_status(self.chat, "Delivered.")
+            with self._lock:
+                if delivery_event is not self._cancel_event:
+                    return
+                if delivery_event.is_set():
+                    self._notice = "Delivery cancelled locally; participants may continue working."
+                elif not self._notice:
+                    self._notice = final_notice
 
     def is_active(self) -> bool:
         with self._lock:
@@ -4231,6 +4239,11 @@ class DeliveryController:
                 return self._notice
             labels = [f"@{name} {self._states.get(name, 'queued')}" for name in self._order]
         return "Delivery: " + " · ".join(labels)
+
+    def clear_notice(self) -> None:
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._notice = ""
 
 
 class ReviewController:
@@ -4718,6 +4731,7 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
         if key in ("\n", "\r"):
             if not buffer.strip():
                 continue
+            deliveries.clear_notice()
             reviews.clear_notice()
             status_override = None
             view_result = handle_view_command(buffer)
