@@ -3233,6 +3233,7 @@ def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:
         "new-sol-fable-glm",
         "new-classic",
         "open",
+        "adopt-peers",
     ]
     new_default = manifest["actions"][0]
     assert new_default["title"] == "New group chat"
@@ -3254,6 +3255,10 @@ def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:
     assert new_classic["title"] == "New classic four-agent chat"
     assert new_classic["command"] == ["./new-room", "--launch"]
     assert new_classic["contexts"] == ["workspace", "tab", "pane"]
+    adopt_peers = manifest["actions"][5]
+    assert adopt_peers["title"] == "Adopt stale group-chat peers"
+    assert adopt_peers["command"] == ["./new-room", "--adopt-peers"]
+    assert adopt_peers["contexts"] == ["workspace", "tab", "pane"]
     assert [pane["id"] for pane in manifest["panes"]] == ["new-room", "room"]
     assert all(pane["placement"] == "tab" for pane in manifest["panes"])
     assert "events" not in manifest

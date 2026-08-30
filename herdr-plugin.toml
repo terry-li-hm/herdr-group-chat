@@ -35,6 +35,12 @@ title = "Open group chat"
 contexts = ["workspace", "tab", "pane"]
 command = ["./new-room", "--open"]
 
+[[actions]]
+id = "adopt-peers"
+title = "Adopt stale group-chat peers"
+contexts = ["workspace", "tab", "pane"]
+command = ["./new-room", "--adopt-peers"]
+
 [[panes]]
 id = "new-room"
 title = "New group chat"

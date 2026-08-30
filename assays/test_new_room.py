@@ -3775,6 +3775,295 @@ def test_room_reopen_reverifies_sol_fable_glm_and_execs_with_receipt(
     assert process_panes == {"w-agents:p-fable"}
 
 
+# --- adopting stale peers after a Herdr server restart ---------------------------------
+
+
+def adopt_live_agents(workspace_id: str, cwd: str, names: tuple[str, ...] = ()) -> list[dict]:
+    """The six live peers the restart orphaned, exact names and kinds."""
+    specs = (
+        ("sol-peer", "pi"),
+        ("fable-peer", "claude"),
+        ("grok46-peer", "grok"),
+        ("pi-peer", "pi"),
+        ("claude-peer", "claude"),
+        ("codex-peer", "codex"),
+    )
+    return [
+        {
+            "name": name,
+            "kind": kind,
+            "workspace_id": workspace_id,
+            "cwd": cwd,
+            "pane_id": f"{workspace_id}:p-{name.removesuffix('-peer')}",
+            "tab_id": f"{workspace_id}:t-{name.removesuffix('-peer')}",
+        }
+        for name, kind in specs
+        if not names or name in names
+    ]
+
+
+def install_adopt_host(
+    monkeypatch: pytest.MonkeyPatch,
+    live: list[dict],
+    workspaces: list[dict] | None = None,
+    pane_screens: dict[str, str] | None = None,
+) -> list[list[str]]:
+    """Fake Herdr for --adopt-peers: live peers, one agents workspace, proofs."""
+    calls: list[list[str]] = []
+    screens = (
+        pane_screens
+        if pane_screens is not None
+        else {
+            "w1E:p-sol": SOL_SCREEN,
+            "w1E:p-fable": FABLE_SCREEN,
+            "w1E:p-grok46": GROK_SCREEN,
+        }
+    )
+    install_profile_host(
+        monkeypatch,
+        calls,
+        screens,
+        live_agents=live,
+        workspaces=workspaces
+        if workspaces is not None
+        else [{"workspace_id": "w1E", "label": "agents · group-chat"}],
+    )
+    return calls
+
+
+ADOPT_MUTATIONS = (
+    ("tab", "close"),
+    ("pane", "close"),
+    ("tab", "create"),
+    ("tab", "rename"),
+    ("workspace", "create"),
+    ("workspace", "rename"),
+    ("agent", "start"),
+    ("agent", "send-keys"),
+)
+
+
+def test_adopt_peers_adopts_a_clean_single_workspace_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    calls = install_adopt_host(monkeypatch, adopt_live_agents("w1E", str(tmp_path)))
+
+    assert module.adopt_stale_peers() == 0
+
+    state = load_launcher_state(tmp_path)
+    assert state["agents_workspace_id"] == "w1E"
+    assert state["agents_cwd"] == str(tmp_path)
+    assert state["participant_pane_ids"] == {
+        role: f"w1E:p-{pane}"
+        for role, pane in (
+            ("sol", "sol"),
+            ("fable", "fable"),
+            ("grok", "grok46"),
+            ("pi", "pi"),
+            ("claude", "claude"),
+            ("codex", "codex"),
+        )
+    }
+    assert state["participant_tab_ids"] == {
+        role: f"w1E:t-{pane}"
+        for role, pane in (
+            ("sol", "sol"),
+            ("fable", "fable"),
+            ("grok", "grok46"),
+            ("pi", "pi"),
+            ("claude", "claude"),
+            ("codex", "codex"),
+        )
+    }
+    out = capsys.readouterr().out.splitlines()
+    assert [line.split()[1] for line in out[:-1]] == [
+        "@pi",
+        "@claude",
+        "@codex",
+        "@sol",
+        "@fable",
+        "@grok",
+    ]
+    assert "adopted 6 peers in workspace w1E (agents · group-chat)" in out[-1]
+    assert not any(tuple(call[:2]) in ADOPT_MUTATIONS for call in calls)
+
+
+def test_adopt_peers_leaves_a_previous_placeholder_workspace_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    save_launcher_state(
+        tmp_path,
+        {
+            "agents_workspace_id": "w1Z",
+            "agents_placeholder_tab_id": "w1Z:t-placeholder",
+        },
+    )
+    calls = install_adopt_host(
+        monkeypatch,
+        adopt_live_agents("w1E", str(tmp_path)),
+        workspaces=[
+            {"workspace_id": "w1E", "label": "agents · group-chat"},
+            {"workspace_id": "w1Z", "label": "agents · group-chat"},
+        ],
+    )
+
+    assert module.adopt_stale_peers() == 0
+
+    state = load_launcher_state(tmp_path)
+    assert state["agents_workspace_id"] == "w1E"
+    assert state["agents_placeholder_tab_id"] == "w1Z:t-placeholder"
+    summary = capsys.readouterr().out.splitlines()[-1]
+    assert "previous placeholder workspace w1Z was left untouched" in summary
+    assert not any(tuple(call[:2]) in ADOPT_MUTATIONS for call in calls)
+
+
+def _adopt_kind_mismatch_live() -> list[dict]:
+    live = adopt_live_agents("w1E", "/gone", names=("sol-peer", "codex-peer"))
+    live[1]["kind"] = "pi"  # codex-peer is reported as a pi agent
+    return live
+
+
+@pytest.mark.parametrize(
+    ("live", "screens", "workspaces", "needle", "other_state"),
+    [
+        pytest.param(
+            _adopt_kind_mismatch_live(),
+            None,
+            None,
+            "@codex: codex-peer is live with a different agent kind",
+            None,
+            id="kind-mismatch",
+        ),
+        pytest.param(
+            adopt_live_agents("w1E", "/gone", names=("sol-peer",)),
+            {"w1E:p-sol": "Pi\nmodel gpt-5.6-sol-01 • high\n"},
+            None,
+            "@sol: sol-peer failed native-ui verification",
+            None,
+            id="native-proof",
+        ),
+        pytest.param(
+            [
+                *adopt_live_agents("w1E", "/gone", names=("sol-peer",)),
+                *adopt_live_agents("w2E", "/gone", names=("fable-peer",)),
+            ],
+            {"w1E:p-sol": SOL_SCREEN, "w2E:p-fable": FABLE_SCREEN},
+            [
+                {"workspace_id": "w1E", "label": "agents · group-chat"},
+                {"workspace_id": "w2E", "label": "agents · group-chat"},
+            ],
+            "the live peers span several workspaces: w1E, w2E",
+            None,
+            id="two-workspaces",
+        ),
+        pytest.param(
+            adopt_live_agents("w1E", "/gone"),
+            None,
+            None,
+            "workspace w1E is still recorded by launcher-state-deadbee000.json",
+            {"schema_version": 1, "agents_workspace_id": "w1E"},
+            id="claimed-by-other-state",
+        ),
+        pytest.param(
+            [
+                *adopt_live_agents("w1E", "/gone", names=("sol-peer", "fable-peer")),
+                *adopt_live_agents("w1E", "/elsewhere", names=("grok46-peer",)),
+            ],
+            {"w1E:p-sol": SOL_SCREEN, "w1E:p-fable": FABLE_SCREEN, "w1E:p-grok46": GROK_SCREEN},
+            None,
+            "grok46-peer (/elsewhere)",
+            None,
+            id="differing-cwds",
+        ),
+        pytest.param(
+            [],
+            None,
+            None,
+            "no configured group-chat participant is live",
+            None,
+            id="nothing-live",
+        ),
+    ],
+)
+def test_adopt_peers_refuses_and_adopts_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    live: list[dict],
+    screens: dict[str, str] | None,
+    workspaces: list[dict] | None,
+    needle: str,
+    other_state: dict | None,
+) -> None:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    if other_state is not None:
+        (tmp_path / "launcher-state-deadbee000.json").write_text(
+            json.dumps(other_state), encoding="utf-8"
+        )
+    calls = install_adopt_host(monkeypatch, live, workspaces=workspaces, pane_screens=screens)
+
+    with pytest.raises(BootstrapError) as excinfo:
+        module.adopt_stale_peers()
+
+    error = excinfo.value
+    assert error.code == "adopt_refused"
+    assert needle in str(error)
+    assert error.failures and any(needle in failure for failure in error.failures)
+    assert load_launcher_state(tmp_path) == {"schema_version": module.LAUNCHER_STATE_VERSION}
+    assert not any(tuple(call[:2]) in ADOPT_MUTATIONS for call in calls)
+
+
+def test_adopt_peers_ignores_claims_of_workspaces_that_no_longer_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The restart-dead launcher states point at workspaces Herdr deleted."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    (tmp_path / "launcher-state-deadbee000.json").write_text(
+        json.dumps({"schema_version": 1, "agents_workspace_id": "w3"}), encoding="utf-8"
+    )
+    calls = install_adopt_host(monkeypatch, adopt_live_agents("w1E", str(tmp_path)))
+
+    assert module.adopt_stale_peers() == 0
+    assert load_launcher_state(tmp_path)["agents_workspace_id"] == "w1E"
+    assert not any(tuple(call[:2]) in ADOPT_MUTATIONS for call in calls)
+
+
+def test_adopt_then_atomic_profile_launch_succeeds_against_the_same_fake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    profile_launch_env(tmp_path, monkeypatch, captured)
+    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable-grok")
+    monkeypatch.setenv(module.ROOM_ENV, "chat-sfg")
+    calls = install_adopt_host(
+        monkeypatch,
+        [
+            *adopt_live_agents("w1E", str(tmp_path), names=("sol-peer", "fable-peer")),
+            *adopt_live_agents("w1E", str(tmp_path), names=("grok46-peer",)),
+        ],
+    )
+    state = sfg_room_state(tmp_path)
+    state.pop("agents_workspace_id")  # the restart wiped this launcher's records
+    state.pop("agents_cwd")
+    state.pop("participant_pane_ids")
+    state.pop("participant_tab_ids")
+    save_launcher_state(tmp_path, state)
+
+    assert module.adopt_stale_peers() == 0
+    module.main()
+
+    argv = captured["argv"]
+    assert argv[argv.index("--profile") + 1] == "sol-fable-grok"
+    mappings = [value for index, value in enumerate(argv) if argv[index - 1] == "--agent"]
+    assert mappings == ["sol=sol-peer", "fable=fable-peer", "grok=grok46-peer"]
+    # The adopted sessions are reused and re-verified, never restarted.
+    assert not any(call[:2] in (["tab", "create"], ["agent", "start"]) for call in calls)
+    final_state = load_launcher_state(tmp_path)
+    assert final_state["selected_profile"] == "sol-fable-grok"
+    assert final_state["agents_workspace_id"] == "w1E"
+
+
 def test_profile_incomplete_message_and_record_carry_each_role_reason(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
