@@ -1931,8 +1931,9 @@ def test_recorded_live_agent_closes_a_different_stale_pending_tab(
     assert ["tab", "close", pending["tab_id"]] in calls
 
 
-def test_pending_profile_participant_still_requires_native_pane_proof(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("blocked_startup", [False, True], ids=["ordinary", "blocked-startup"])
+def test_exact_live_pending_prompt_preserves_state_when_native_proof_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocked_startup: bool
 ) -> None:
     participant = module.FABLE_PARTICIPANT
     calls: list[list[str]] = []
@@ -1940,8 +1941,10 @@ def test_pending_profile_participant_still_requires_native_pane_proof(
         "label": "hgchat-fable-trust",
         "pane_id": "w-agents:p-fable",
         "tab_id": "w-agents:t-fable",
-        "started_unix_ms": int(module.time.time() * 1000),
+        "started_unix_ms": 0,
     }
+    if blocked_startup:
+        pending["blocked_startup"] = True
 
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
@@ -1978,10 +1981,70 @@ def test_pending_profile_participant_still_requires_native_pane_proof(
         participants=(participant,),
     )
 
-    assert len(failures) == 1 and "failed native-ui verification" in failures[0]
+    if blocked_startup:
+        assert failures == [module.blocked_startup_prompt_guidance(participant)]
+    else:
+        assert len(failures) == 1 and "failed native-ui verification" in failures[0]
     assert state["pending_participant_tabs"]["fable"] == pending
     assert "participant_pane_ids" not in state
     assert "participant_tab_ids" not in state
+    assert not any(call[:2] in (["tab", "close"], ["pane", "close"]) for call in calls)
+
+
+def test_exact_live_blocked_startup_promotes_after_native_proof_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    participant = module.FABLE_PARTICIPANT
+    pending = {
+        "label": "hgchat-fable-trust",
+        "pane_id": "w-agents:p-fable",
+        "tab_id": "w-agents:t-fable",
+        "started_unix_ms": 0,
+        "blocked_startup": True,
+    }
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {
+                "result": {
+                    "agents": [
+                        {
+                            "name": participant.name,
+                            "kind": participant.kind,
+                            "workspace_id": "w-agents",
+                            "cwd": str(tmp_path),
+                            "pane_id": pending["pane_id"],
+                            "tab_id": pending["tab_id"],
+                        }
+                    ]
+                }
+            }
+        if arguments[:2] == ["pane", "process-info"]:
+            return {"result": {"process_info": {"foreground_processes": CLAUDE_FABLE_PROCESS}}}
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    monkeypatch.setattr(module, "run_text", lambda *_args, **_kwargs: FABLE_POST_TURN_SCREEN)
+    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+    state: dict = {"schema_version": 1, "pending_participant_tabs": {"fable": pending}}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=(participant,),
+    )
+
+    assert failures == []
+    assert state["participant_pane_ids"] == {"fable": pending["pane_id"]}
+    assert state["participant_tab_ids"] == {"fable": pending["tab_id"]}
+    assert "pending_participant_tabs" not in state
     assert not any(call[:2] in (["tab", "close"], ["pane", "close"]) for call in calls)
 
 

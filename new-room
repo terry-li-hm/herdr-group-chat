@@ -1526,6 +1526,11 @@ def start_participants(
             recorded_pane_id = participant_panes.get(role)
             pending = pending_tabs.get(role)
             pending_matches_live_agent = pending_participant_tab_matches(live_agent, pending)
+            blocked_pending_live_agent = (
+                isinstance(pending, dict)
+                and pending.get("blocked_startup") is True
+                and pending_matches_live_agent
+            )
             has_recorded_pane = bool(recorded_pane_id)
             if not live_agent_kind_matches(live_agent, participant.kind):
                 failures.append(
@@ -1558,6 +1563,10 @@ def start_participants(
                 catalog_proof(participant)
                 and reopen_pane_proof(herdr_bin, participant, str(live_agent["pane_id"]))
             ):
+                if blocked_pending_live_agent:
+                    failures.append(blocked_startup_prompt_guidance(participant))
+                    print(f"pending @{role} trust", flush=True)
+                    continue
                 failures.append(
                     f"@{role}: {name} failed native-ui verification; the session was left open"
                 )
