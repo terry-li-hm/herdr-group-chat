@@ -1656,6 +1656,284 @@ def test_agent_start_does_not_retry_other_error_codes(
     assert len(starts) == 1
 
 
+@pytest.mark.parametrize(
+    ("participant", "product"),
+    [
+        (module.Participant(role="claude", kind="claude", name="claude-peer"), "Claude"),
+        (module.Participant(role="codex", kind="codex", name="codex-peer"), "Codex"),
+    ],
+)
+def test_agent_not_ready_preserves_the_pending_trust_prompt_tab(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    participant: module.Participant,
+    product: str,
+) -> None:
+    calls: list[list[str]] = []
+    pane_id = f"w-agents:p-{participant.role}"
+    tab_id = f"w-agents:t-{participant.role}"
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {"result": {"agents": []}}
+        if arguments[:2] == ["tab", "create"]:
+            return {"result": {"tab": {"tab_id": tab_id}, "root_pane": {"pane_id": pane_id}}}
+        if arguments[:2] == ["pane", "process-info"]:
+            return {"result": {"process_info": {"foreground_processes": [{"name": "zsh"}]}}}
+        if arguments[:2] == ["agent", "start"]:
+            raise BootstrapError("agent needs directory trust", code="agent_not_ready")
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {"schema_version": 1}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=(participant,),
+    )
+
+    assert failures == [
+        f"@{participant.role}: {product} is waiting at a blocked startup prompt in the "
+        "preserved tab; answer the prompt there, then rerun group-chat setup"
+    ]
+    assert state["pending_participant_tabs"][participant.role]["pane_id"] == pane_id
+    assert state["pending_participant_tabs"][participant.role]["tab_id"] == tab_id
+    assert participant.role not in state.get("participant_pane_ids", {})
+    assert participant.role not in state.get("participant_tab_ids", {})
+    assert not any(call[:2] == ["tab", "close"] for call in calls)
+
+
+def test_matching_live_agent_promotes_only_its_exact_pending_tab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    participant = module.Participant(role="codex", kind="codex", name="codex-peer")
+    calls: list[list[str]] = []
+    pending = {
+        "label": "hgchat-codex-trust",
+        "pane_id": "w-agents:p-codex",
+        "tab_id": "w-agents:t-codex",
+        "started_unix_ms": int(module.time.time() * 1000),
+    }
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {
+                "result": {
+                    "agents": [
+                        {
+                            "name": participant.name,
+                            "kind": participant.kind,
+                            "workspace_id": "w-agents",
+                            "cwd": str(tmp_path),
+                            "pane_id": pending["pane_id"],
+                            "tab_id": pending["tab_id"],
+                        }
+                    ]
+                }
+            }
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {"schema_version": 1, "pending_participant_tabs": {"codex": pending}}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=(participant,),
+    )
+
+    assert failures == []
+    assert state["participant_pane_ids"] == {"codex": pending["pane_id"]}
+    assert state["participant_tab_ids"] == {"codex": pending["tab_id"]}
+    assert "pending_participant_tabs" not in state
+    assert not any(call[:2] in (["tab", "close"], ["pane", "close"]) for call in calls)
+
+
+def test_recorded_live_agent_closes_a_different_stale_pending_tab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    participant = module.Participant(role="codex", kind="codex", name="codex-peer")
+    calls: list[list[str]] = []
+    pending = {
+        "label": "hgchat-codex-stale",
+        "pane_id": "w-agents:p-stale",
+        "tab_id": "w-agents:t-stale",
+        "started_unix_ms": int(module.time.time() * 1000),
+    }
+    recorded_pane_id = "w-agents:p-codex"
+    recorded_tab_id = "w-agents:t-codex"
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {
+                "result": {
+                    "agents": [
+                        {
+                            "name": participant.name,
+                            "kind": participant.kind,
+                            "workspace_id": "w-agents",
+                            "cwd": str(tmp_path),
+                            "pane_id": recorded_pane_id,
+                            "tab_id": recorded_tab_id,
+                        }
+                    ]
+                }
+            }
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {
+        "schema_version": 1,
+        "participant_pane_ids": {"codex": recorded_pane_id},
+        "participant_tab_ids": {"codex": recorded_tab_id},
+        "pending_participant_tabs": {"codex": pending},
+    }
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=(participant,),
+    )
+
+    assert failures == []
+    assert state["participant_pane_ids"] == {"codex": recorded_pane_id}
+    assert state["participant_tab_ids"] == {"codex": recorded_tab_id}
+    assert "pending_participant_tabs" not in state
+    assert ["tab", "close", pending["tab_id"]] in calls
+
+
+def test_pending_profile_participant_still_requires_native_pane_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    participant = module.FABLE_PARTICIPANT
+    calls: list[list[str]] = []
+    pending = {
+        "label": "hgchat-fable-trust",
+        "pane_id": "w-agents:p-fable",
+        "tab_id": "w-agents:t-fable",
+        "started_unix_ms": int(module.time.time() * 1000),
+    }
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {
+                "result": {
+                    "agents": [
+                        {
+                            "name": participant.name,
+                            "kind": participant.kind,
+                            "workspace_id": "w-agents",
+                            "cwd": str(tmp_path),
+                            "pane_id": pending["pane_id"],
+                            "tab_id": pending["tab_id"],
+                        }
+                    ]
+                }
+            }
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    monkeypatch.setattr(module, "run_text", lambda *_args, **_kwargs: "Claude Code\n")
+    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+    state: dict = {"schema_version": 1, "pending_participant_tabs": {"fable": pending}}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=(participant,),
+    )
+
+    assert len(failures) == 1 and "failed native-ui verification" in failures[0]
+    assert state["pending_participant_tabs"]["fable"] == pending
+    assert "participant_pane_ids" not in state
+    assert "participant_tab_ids" not in state
+    assert not any(call[:2] in (["tab", "close"], ["pane", "close"]) for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("live_pane_id", "live_tab_id"),
+    [
+        ("w-agents:p-other", "w-agents:t-codex"),
+        ("w-agents:p-codex", "w-agents:t-other"),
+    ],
+)
+def test_mismatched_live_agent_is_not_adopted_or_closed_from_pending_tab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_pane_id: str, live_tab_id: str
+) -> None:
+    participant = module.Participant(role="codex", kind="codex", name="codex-peer")
+    calls: list[list[str]] = []
+    pending = {
+        "label": "hgchat-codex-trust",
+        "pane_id": "w-agents:p-codex",
+        "tab_id": "w-agents:t-codex",
+        "started_unix_ms": int(module.time.time() * 1000),
+    }
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {
+                "result": {
+                    "agents": [
+                        {
+                            "name": participant.name,
+                            "kind": participant.kind,
+                            "workspace_id": "w-agents",
+                            "cwd": str(tmp_path),
+                            "pane_id": live_pane_id,
+                            "tab_id": live_tab_id,
+                        }
+                    ]
+                }
+            }
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {"schema_version": 1, "pending_participant_tabs": {"codex": pending}}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=(participant,),
+    )
+
+    assert len(failures) == 1 and "pane not recorded" in failures[0]
+    assert state["pending_participant_tabs"]["codex"] == pending
+    assert "participant_pane_ids" not in state
+    assert "participant_tab_ids" not in state
+    assert not any(call[:2] in (["tab", "close"], ["pane", "close"]) for call in calls)
+
+
 # --- bounded sol-fable model profile -------------------------------------------------
 
 SOL_SCREEN = "Pi\nprovider openai-codex\nmodel gpt-5.6-sol • high\n"
@@ -2252,6 +2530,50 @@ def test_room_reopen_reverifies_and_execs_with_receipt_and_mappings(
     assert not any(
         call[:2] in (["agent", "start"], ["tab", "close"], ["pane", "close"]) for call in calls
     )
+
+
+def test_profile_reverify_accepts_foreground_cwd_and_checks_native_pane_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    participant = module.FABLE_PARTICIPANT
+    pane_id = "w-agents:p-fable"
+    tab_id = "w-agents:t-fable"
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {
+                "result": {
+                    "agents": [
+                        {
+                            "name": participant.name,
+                            "kind": participant.kind,
+                            "workspace_id": "w-agents",
+                            "foreground_cwd": str(tmp_path),
+                            "pane_id": pane_id,
+                            "tab_id": tab_id,
+                        }
+                    ]
+                }
+            }
+        if arguments[:2] == ["pane", "process-info"]:
+            return {"result": {"process_info": {"foreground_processes": CLAUDE_FABLE_PROCESS}}}
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    monkeypatch.setattr(module, "run_text", lambda *_args, **_kwargs: FABLE_POST_TURN_SCREEN)
+    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+    state = {
+        "schema_version": 1,
+        "participant_pane_ids": {"fable": pane_id},
+        "participant_tab_ids": {"fable": tab_id},
+    }
+
+    module.reverify_profile_participants("herdr", "w-agents", str(tmp_path), state, (participant,))
+
+    assert ["pane", "process-info", "--pane", pane_id] in calls
 
 
 def test_room_reopen_fails_closed_on_a_renamed_or_replaced_pane(

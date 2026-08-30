@@ -1374,6 +1374,33 @@ def ownership_mismatch_reasons(
     return reasons
 
 
+def pending_participant_tab_matches(live_agent: Mapping[str, Any], pending: object) -> bool:
+    """Accept a first-run agent only when it is still in its exact pending tab."""
+    if not isinstance(pending, dict):
+        return False
+    pending_pane_id = pending.get("pane_id")
+    pending_tab_id = pending.get("tab_id")
+    live_pane_id = live_agent.get("pane_id")
+    live_tab_id = live_agent.get("tab_id")
+    return (
+        isinstance(pending_pane_id, str)
+        and isinstance(pending_tab_id, str)
+        and bool(pending_pane_id)
+        and bool(pending_tab_id)
+        and pending_pane_id == live_pane_id
+        and pending_tab_id == live_tab_id
+    )
+
+
+def blocked_startup_prompt_guidance(participant: Participant) -> str:
+    """Explain how to resume a native startup prompt without answering it."""
+    product = {"claude": "Claude", "codex": "Codex"}.get(participant.kind, participant.kind)
+    return (
+        f"@{participant.role}: {product} is waiting at a blocked startup prompt in the "
+        "preserved tab; answer the prompt there, then rerun group-chat setup"
+    )
+
+
 def infer_owned_agents_cwd(herdr_bin: str, agents_workspace_id: str, requested_cwd: str) -> str:
     listed = run_json(herdr_bin, ["agent", "list"])
     expected_names = {name for _, name in PARTICIPANTS} | {
@@ -1471,6 +1498,9 @@ def start_participants(
         if live_agent is not None:
             live_cwd = str(live_agent.get("cwd") or live_agent.get("foreground_cwd") or "")
             recorded_pane_id = participant_panes.get(role)
+            pending = pending_tabs.get(role)
+            pending_matches_live_agent = pending_participant_tab_matches(live_agent, pending)
+            has_recorded_pane = bool(recorded_pane_id)
             if not live_agent_kind_matches(live_agent, participant.kind):
                 failures.append(
                     f"@{role}: {name} is already running with a different agent kind; "
@@ -1482,7 +1512,8 @@ def start_participants(
                 str(live_agent.get("workspace_id")) != agents_workspace_id
                 or not live_cwd
                 or not same_cwd(live_cwd, agent_cwd)
-                or recorded_pane_id != str(live_agent.get("pane_id"))
+                or (has_recorded_pane and recorded_pane_id != str(live_agent.get("pane_id")))
+                or (not has_recorded_pane and not pending_matches_live_agent)
             ):
                 reasons = ", ".join(
                     ownership_mismatch_reasons(
@@ -1508,8 +1539,10 @@ def start_participants(
                 continue
             participant_panes[role] = str(live_agent["pane_id"])
             participant_tabs[role] = str(live_agent["tab_id"])
-            pending = pending_tabs.get(role)
-            if pending and pending.get("tab_id") != live_agent.get("tab_id"):
+            if has_recorded_pane and pending and pending.get("tab_id") != live_agent.get("tab_id"):
+                # A verified recorded participant retains its prior stale-tab
+                # cleanup behavior. Exact pending promotion is only for roles
+                # that did not yet record a participant pane.
                 try:
                     close_pending_participant_tab(
                         herdr_bin, agents_workspace_id, pending, state_dir, state_path
@@ -1519,7 +1552,11 @@ def start_participants(
                     print(f"cleanup @{role} pending", flush=True)
                     save_launcher_state(state_dir, state, state_path)
                     continue
-            pending_tabs.pop(role, None)
+            if pending is not None:
+                # A pending tab is promoted only after the exact live pane and
+                # tab pair passed every ownership and native-proof check above,
+                # or a recorded participant's stale pending tab was closed.
+                pending_tabs.pop(role, None)
             save_launcher_state(state_dir, state, state_path)
             print(f"ready  @{role} (existing {name})", flush=True)
             continue
@@ -1638,6 +1675,14 @@ def start_participants(
                     dismiss_inactive_hook_notice(herdr_bin, name, pane_id)
             print(f"ready  @{role}", flush=True)
         except (BootstrapError, KeyError, TypeError) as error:
+            if isinstance(error, BootstrapError) and error.code == "agent_not_ready":
+                # Herdr has started the native agent but it is blocked in its
+                # own trust UI. Preserve the recorded pane/tab so a later
+                # setup retry can prove and promote that exact surface.
+                save_launcher_state(state_dir, state, state_path)
+                failures.append(blocked_startup_prompt_guidance(participant))
+                print(f"pending @{role} trust", flush=True)
+                continue
             if not isinstance(error, BootstrapError) or error.code not in INDETERMINATE_OPEN_CODES:
                 pending = pending_tabs.get(role)
                 if pending:
@@ -2049,7 +2094,9 @@ def reverify_profile_participants(
     participant_tabs = state.get("participant_tab_ids", {})
     for participant in participants:
         live_agent = live_agents.get(participant.name)
-        live_cwd = str((live_agent or {}).get("cwd") or "")
+        live_cwd = str(
+            (live_agent or {}).get("cwd") or (live_agent or {}).get("foreground_cwd") or ""
+        )
         recorded_pane = participant_panes.get(participant.role)
         if (
             live_agent is None
