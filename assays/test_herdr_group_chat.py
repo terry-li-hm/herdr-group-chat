@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import tomllib
+from collections.abc import Callable
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from os import X_OK, access
@@ -1028,9 +1029,15 @@ def test_delivery_controller_wait_is_bounded_for_an_uncooperative_worker(tmp_pat
 
 
 class ScriptedTuiScreen:
-    def __init__(self, keys: list[object], client: BlockingOrdinaryClient) -> None:
+    def __init__(
+        self,
+        keys: list[object],
+        client: BlockingOrdinaryClient,
+        release_wait: Callable[[], bool] | None = None,
+    ) -> None:
         self.keys = keys
         self.client = client
+        self.release_wait = release_wait
 
     def keypad(self, _enabled: bool) -> None:
         pass
@@ -1043,26 +1050,40 @@ class ScriptedTuiScreen:
         if key == "WAIT_FOR_TURN":
             assert self.client.started.wait(HARNESS_WAIT_S)
             return self.keys.pop(0)
+        if key == "RELEASE_WORKER":
+            self.client.release.set()
+            assert self.release_wait is not None
+            assert self.release_wait()
+            return module.curses.KEY_RESIZE
         return key
 
 
 def test_tui_shows_delivery_rejection_while_worker_drains_and_keeps_views_responsive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    chat, client, transcript = make_cancellation_aware_ordinary_chat(tmp_path)
+    chat, client, _ = make_blocking_ordinary_chat(tmp_path)
     draws: list[tuple[str, str, bool]] = []
     controllers: list[DeliveryController] = []
     keys = [
         *list("@pi slow\n"),
         "WAIT_FOR_TURN",
-        *list("/lanes\n/inbox\n/room\n@claude blocked second send\n/cancel\n\x11"),
+        *list("/lanes\n/inbox\n/room\n@claude blocked second send\n"),
+        "RELEASE_WORKER",
+        *list("/inbox\n"),
+        *list("@nobody invalid route\n"),
+        "\x11",
     ]
-    screen = ScriptedTuiScreen(keys, client)
 
     class TrackingDeliveryController(DeliveryController):
         def __init__(self, tracked_chat: object) -> None:
             super().__init__(tracked_chat)
             controllers.append(self)
+
+    screen = ScriptedTuiScreen(
+        keys,
+        client,
+        lambda: _wait_until(lambda: not controllers[0].is_active(), HARNESS_WAIT_S),
+    )
 
     def track_draw(
         _screen: object,
@@ -1096,14 +1117,18 @@ def test_tui_shows_delivery_rejection_while_worker_drains_and_keeps_views_respon
         == "Ordinary delivery is still draining; use /cancel or wait before starting more work."
         for _, status, active in draws
     )
-    assert _wait_until(
-        lambda: (
-            transcript.read()
-            and transcript.read()[-1]["body"]
-            == "Ordinary delivery cancelled locally; participants may continue working."
-        ),
-        HARNESS_WAIT_S,
+    assert any(
+        status == "Delivered. @pi working · @claude ready" and not active
+        for _, status, active in draws
     )
+    assert any(
+        view == "inbox"
+        and status
+        == "Inbox shows final replies, syntheses, and attention items. Use /room to return."
+        and not active
+        for view, status, active in draws
+    )
+    assert draws[-1][1:] == ("unknown participant: @nobody", False)
 
 
 def test_tui_ctrl_q_waits_for_ordinary_cancellation_outcome_before_returning(

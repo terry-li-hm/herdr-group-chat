@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 from urllib.parse import quote
 
 import regex
@@ -4633,7 +4633,7 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
     deliveries = DeliveryController(chat)
     view = "room"
     status = participant_status(chat, "Ready.")
-    status_override = False
+    status_override: Literal["delivery", "independent"] | None = None
     picker_dismissed_start: int | None = None
     picker_index = 0
     while True:
@@ -4652,16 +4652,18 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
             shown_status = mention_display(suggestions, picker_index)
         else:
             delivery_status = deliveries.status()
-            shown_status = (
-                status
-                if status_override
-                else (
-                    delivery_status
-                    if deliveries.is_active()
-                    or (delivery_status and status.startswith("Delivery:"))
-                    else (review_status or status)
-                )
-            )
+            if status_override == "independent":
+                shown_status = status
+            elif status_override == "delivery" and deliveries.is_active():
+                shown_status = status
+            elif deliveries.is_active():
+                shown_status = delivery_status
+            elif reviews.is_active() and review_status:
+                shown_status = review_status
+            elif delivery_status:
+                shown_status = delivery_status
+            else:
+                shown_status = review_status or status
         max_scroll = draw_tui(
             screen,
             chat.transcript,
@@ -4717,20 +4719,25 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
             if not buffer.strip():
                 continue
             reviews.clear_notice()
-            status_override = False
+            status_override = None
             view_result = handle_view_command(buffer)
             if view_result is not None:
                 view, status = view_result
-                status_override = not reviews.is_active() and not deliveries.is_active()
+                status_override = (
+                    "independent"
+                    if not reviews.is_active() and not deliveries.is_active()
+                    else None
+                )
                 scroll_offset = 0
                 buffer = ""
                 continue
             if buffer.strip() == "/cancel" and deliveries.is_active():
                 try:
                     status = deliveries.cancel()
+                    status_override = "delivery"
                 except ChatError as error:
                     status = str(error)
-                status_override = True
+                    status_override = "independent"
                 buffer = ""
                 continue
             if deliveries.is_active():
@@ -4738,31 +4745,31 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
                     "Ordinary delivery is still draining; use /cancel or wait before "
                     "starting more work."
                 )
-                status_override = True
+                status_override = "delivery"
                 buffer = ""
                 continue
             try:
                 command_status = handle_local_command(buffer, chat, reviews)
             except ChatError as error:
                 command_status = str(error)
-                status_override = True
+                status_override = "independent"
             if command_status is not None:
                 status = command_status
-                status_override = status_override or not reviews.is_active()
+                status_override = "independent" if not reviews.is_active() else None
                 buffer = ""
                 continue
             if reviews.is_active():
                 status = "A council round is running; use /cancel or wait before sending."
-                status_override = True
+                status_override = "independent"
                 buffer = ""
                 continue
             try:
                 deliveries.start(buffer)
                 status = deliveries.status()
-                status_override = False
+                status_override = None
             except ChatError as error:
                 status = str(error)
-                status_override = True
+                status_override = "independent"
             buffer = ""
             scroll_offset = 0
             continue
