@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## [0.10.2] - 2026-08-30
+
+- Preserve promotable trust-prompt tabs across launch and reopen, including
+  stale blocked prompts, while reusing the foreground cwd only when its native
+  evidence remains exact.
+- Make human terminal output safe and readable with word-preferring,
+  grapheme- and display-cell-aware wrapping, visible bidi-control escapes, and
+  one flat output record per `--once` transcript item.
+- Run ordinary TUI delivery asynchronously with per-recipient progress,
+  overlap blocking, local `/cancel`, bounded Ctrl-Q draining, and late-reply
+  dropping without closing participant tabs.
+- Keep status handoffs current between ordinary delivery and reviews, and keep
+  delivery controls responsive while final participant state is read.
+
 ## [0.10.1] - 2026-08-30
 
 - Verify a reused live peer in the setup path with its reopen evidence rather

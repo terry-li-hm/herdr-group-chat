@@ -31,7 +31,7 @@ provider (`glm-5.3`).
 Install the pinned release from GitHub:
 
 ```bash
-herdr plugin install terry-li-hm/herdr-group-chat --ref v0.10.1
+herdr plugin install terry-li-hm/herdr-group-chat --ref v0.10.2
 herdr plugin action invoke new --plugin terry.herdr-group-chat
 ```
 
@@ -75,14 +75,16 @@ participants review. Pi synthesizes by default.
 /retry synthesis
 ```
 
-The room stays responsive while a review runs and shows each participant as
-queued, working, blocked, done, failed, timed out, cancelled, synthesizing, or
-skipped. `/cancel` stops only the room's local orchestration; it never sends
-Ctrl-C or other keys, so a participant may continue working and its later reply
-is not collected by the cancelled round. A failed, blocked, timed-out, or
-cancelled first pass can be retried without rerunning the other reviewers; a
-successful retry triggers a fresh synthesis. Use Page Up and Page
-Down to scroll the active room, inbox, or lane presentation while work continues.
+The room stays responsive while ordinary sends and review rounds run. It shows
+each participant as queued, working, blocked, done, failed, timed out,
+cancelled, synthesizing, or skipped. During ordinary delivery, `/cancel`
+requests local cancellation and stops collecting later replies without closing
+or interrupting participant tabs, so a participant may continue working.
+Ctrl-Q waits up to five seconds for local work to drain before the TUI exits.
+A failed, blocked, timed-out, or cancelled first pass can be retried without
+rerunning the other reviewers; a successful retry triggers a fresh synthesis.
+Use Page Up and Page Down to scroll the active room, inbox, or lane presentation
+while work continues.
 
 Typing `@` at the start of the recipient token — at the beginning of the line
 or right after `/review `, `/anneal `, `/consensus `, or a comma still inside that token —
