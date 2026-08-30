@@ -4,6 +4,9 @@ All notable changes to this project are documented here.
 
 ## [0.10.1] - 2026-08-30
 
+- Verify a reused live peer in the setup path with its reopen evidence rather
+  than the fresh startup proof: a Fable or Grok peer that has already taken
+  turns no longer fails `native-ui verification` and aborts an atomic launch.
 - Fix native process proofs on the protocol-21 Herdr server, which reports the
   foreground executable as `name` instead of `argv0`: the proof now accepts
   `argv0`, then `name`, then `argv[0]`, still requiring the exact identity. On the

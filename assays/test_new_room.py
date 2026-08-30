@@ -3291,6 +3291,22 @@ def install_role_replacement_host(
         if arguments == ["agent", "list"]:
             return {"result": {"agents": live_agents}}
         if arguments[:2] == ["pane", "process-info"]:
+            # A reused Fable peer has taken turns, so its startup banner is gone;
+            # the setup path must accept its reopen evidence (pane text plus the
+            # exact foreground argv under the protocol-21 ``name`` field).
+            if arguments[-1] == "w-agents:p-fable":
+                return {
+                    "result": {
+                        "process_info": {
+                            "foreground_processes": [
+                                {
+                                    "name": "claude",
+                                    "argv": ["claude", "--model", "fable", "--effort", "high"],
+                                }
+                            ]
+                        }
+                    }
+                }
             return {"result": {"process_info": {"foreground_processes": [{"name": "zsh"}]}}}
         if arguments[:2] == ["tab", "create"]:
             created += 1

@@ -1499,7 +1499,7 @@ def start_participants(
                 continue
             if needs_native_proof(participant) and not (
                 catalog_proof(participant)
-                and pane_proof(herdr_bin, participant, str(live_agent["pane_id"]))
+                and reopen_pane_proof(herdr_bin, participant, str(live_agent["pane_id"]))
             ):
                 failures.append(
                     f"@{role}: {name} failed native-ui verification; the session was left open"
