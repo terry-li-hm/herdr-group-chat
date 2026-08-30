@@ -439,6 +439,26 @@ uv run ruff format --check herdr-group-chat new-room orca-group-chat assays
 See [SECURITY.md](SECURITY.md) for private vulnerability reporting and
 [CHANGELOG.md](CHANGELOG.md) for release history.
 
+### Troubleshooting
+
+The setup pane and the room pane are short-lived processes, so a launcher
+failure would otherwise vanish with the pane. Every failure — a known setup
+`BootstrapError` or any unexpected exception — is appended as one JSON line to
+`launcher-errors.jsonl` inside the plugin state directory
+(`$HERDR_PLUGIN_STATE_DIR`, or `~/.local/state/herdr-group-chat` by default).
+The file is created `0600` and capped at 200 records, dropping the oldest under
+an exclusive lock on the errors file itself, so rotation never blocks on the
+launcher state lock. Interactive panes also hold themselves open after an
+error with `Press Enter to close (auto-closes in 60s)`; set
+`HERDR_GROUP_CHAT_NO_HOLD=1` to skip that hold.
+
+Inspect recorded failures read-only with:
+
+```bash
+./new-room --last-error   # the most recent failure, pretty-printed
+./new-room --errors 20    # the last 20 failures, one JSON line each
+```
+
 ## Experimental Orca adapter
 
 `orca-group-chat` is an experimental adapter that reuses this project's core

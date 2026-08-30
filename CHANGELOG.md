@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Record launcher failures durably: the setup pane, `--room-entrypoint`, and
+  the `--launch`/`--open` action now append every `BootstrapError` and every
+  unexpected exception as one JSON line to `launcher-errors.jsonl` in the
+  plugin state directory (created `0600`, capped at 200 records, never raised
+  from the logger). Bootstrap failures keep their stderr line and exit code 2;
+  unexpected exceptions print their traceback and exit 1. Interactive setup or
+  room panes hold themselves open after an error with a 60-second Enter prompt,
+  skipped when not on a TTY or when `HERDR_GROUP_CHAT_NO_HOLD=1`. Read-only
+  inspection: `new-room --last-error` and `new-room --errors N`.
 - Add the exact presentation-only `/lanes` command beside `/room` and `/inbox`.
   It keeps one stable column per configured participant and projects only human
   turns addressed to that participant or all, the participant's own replies
