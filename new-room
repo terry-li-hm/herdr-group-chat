@@ -1789,7 +1789,7 @@ def adopt_stale_peers() -> int:
             if needs_native_proof(participant) and not (
                 pane_id
                 and catalog_proof(participant)
-                and pane_proof(herdr_bin, participant, pane_id)
+                and reopen_pane_proof(herdr_bin, participant, pane_id)
             ):
                 problems.append(
                     f"@{participant.role}: {participant.name} failed native-ui "

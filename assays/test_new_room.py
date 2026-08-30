@@ -3810,13 +3810,22 @@ def install_adopt_host(
 ) -> list[list[str]]:
     """Fake Herdr for --adopt-peers: live peers, one agents workspace, proofs."""
     calls: list[list[str]] = []
+    # Adopted peers have already taken turns, so Fable and Grok present their
+    # reopen evidence — post-turn pane text plus the exact native foreground
+    # process argv — wherever they are live; Sol keeps its persistent footer.
+    reopen_processes: dict[str, list[dict]] = {}
+    for agent in live:
+        if agent.get("name") == "fable-peer":
+            reopen_processes[str(agent["pane_id"])] = CLAUDE_FABLE_PROCESS
+        if agent.get("name") == "grok46-peer":
+            reopen_processes[str(agent["pane_id"])] = GROK_PROCESS
     screens = (
         pane_screens
         if pane_screens is not None
         else {
             "w1E:p-sol": SOL_SCREEN,
-            "w1E:p-fable": FABLE_SCREEN,
-            "w1E:p-grok46": GROK_SCREEN,
+            "w1E:p-fable": FABLE_POST_TURN_SCREEN,
+            "w1E:p-grok46": GROK_POST_TURN_SCREEN,
         }
     )
     install_profile_host(
@@ -3824,6 +3833,7 @@ def install_adopt_host(
         calls,
         screens,
         live_agents=live,
+        process_infos=reopen_processes,
         workspaces=workspaces
         if workspaces is not None
         else [{"workspace_id": "w1E", "label": "agents · group-chat"}],
@@ -3938,6 +3948,7 @@ def _adopt_kind_mismatch_live() -> list[dict]:
         ),
         pytest.param(
             adopt_live_agents("w1E", "/gone", names=("sol-peer",)),
+            # No fresh footer and no reopen evidence for Sol: adoption must refuse.
             {"w1E:p-sol": "Pi\nmodel gpt-5.6-sol-01 • high\n"},
             None,
             "@sol: sol-peer failed native-ui verification",
@@ -3949,7 +3960,7 @@ def _adopt_kind_mismatch_live() -> list[dict]:
                 *adopt_live_agents("w1E", "/gone", names=("sol-peer",)),
                 *adopt_live_agents("w2E", "/gone", names=("fable-peer",)),
             ],
-            {"w1E:p-sol": SOL_SCREEN, "w2E:p-fable": FABLE_SCREEN},
+            {"w1E:p-sol": SOL_SCREEN, "w2E:p-fable": FABLE_POST_TURN_SCREEN},
             [
                 {"workspace_id": "w1E", "label": "agents · group-chat"},
                 {"workspace_id": "w2E", "label": "agents · group-chat"},
@@ -3971,7 +3982,11 @@ def _adopt_kind_mismatch_live() -> list[dict]:
                 *adopt_live_agents("w1E", "/gone", names=("sol-peer", "fable-peer")),
                 *adopt_live_agents("w1E", "/elsewhere", names=("grok46-peer",)),
             ],
-            {"w1E:p-sol": SOL_SCREEN, "w1E:p-fable": FABLE_SCREEN, "w1E:p-grok46": GROK_SCREEN},
+            {
+                "w1E:p-sol": SOL_SCREEN,
+                "w1E:p-fable": FABLE_POST_TURN_SCREEN,
+                "w1E:p-grok46": GROK_POST_TURN_SCREEN,
+            },
             None,
             "grok46-peer (/elsewhere)",
             None,
@@ -4042,6 +4057,14 @@ def test_adopt_then_atomic_profile_launch_succeeds_against_the_same_fake(
             *adopt_live_agents("w1E", str(tmp_path), names=("sol-peer", "fable-peer")),
             *adopt_live_agents("w1E", str(tmp_path), names=("grok46-peer",)),
         ],
+        # The launch after adoption re-verifies Fable on reuse with the fresh
+        # banner, so its pane keeps the startup screen, which also carries the
+        # reopen `Fable 5` sequence; the reopen process argv is still supplied.
+        pane_screens={
+            "w1E:p-sol": SOL_SCREEN,
+            "w1E:p-fable": FABLE_SCREEN,
+            "w1E:p-grok46": GROK_POST_TURN_SCREEN,
+        },
     )
     state = sfg_room_state(tmp_path)
     state.pop("agents_workspace_id")  # the restart wiped this launcher's records
