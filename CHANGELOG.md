@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [0.10.0] - 2026-08-30
 
 - Record launcher failures durably: the setup pane, `--room-entrypoint`, and
   the `--launch`/`--open` action now append every `BootstrapError` and every
