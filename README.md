@@ -37,6 +37,74 @@ herdr plugin action invoke new --plugin terry.herdr-group-chat
 
 For local development, use `herdr plugin link .` from the checkout instead.
 
+## Release smoke
+
+The deterministic `release-smoke` harness replaces the manual candidate and
+post-install smoke setup. Both subcommands use argv Herdr subprocesses only,
+print human-readable progress to stderr, and print exactly one stable JSON
+result to stdout (`"ok": true` and exit 0 on success; failures name the
+failed stage — including a cleanup stage — and cleanup still runs; a failed
+cleanup can never report success with a surviving session or temp link).
+Invalid paths and unexpected runtime errors also produce the same stable JSON
+with a nonzero exit.
+
+```bash
+# Candidate checkout: exports the staged Git index (run `git add` first),
+# links it under a unique temporary plugin id, and unlinks only that id.
+./release-smoke candidate --plugin-root . --agent-cwd <isolated caller cwd>
+
+# Installed plugin: verifies the exact version and never links or unlinks.
+./release-smoke installed --plugin-id terry.herdr-group-chat \
+  --expected-version 0.10.5 --agent-cwd <isolated caller cwd>
+```
+
+Each run starts a unique named Herdr session (its name is preflighted for
+absence with a full-UUID suffix, and spawn and readiness are separate steps,
+so a crashing or never-ready server is still cleaned up), the temporary
+plugin id is preflighted for absence before linking, and the registration
+verification checks that the entry carries exactly the requested plugin id
+and version, with the full action contracts (id, command, and contexts for
+all seven actions) and pane contracts (id, command, and placement for both
+panes), and, for candidates, exactly the exported copy as its plugin root.
+It runs the default `new` (sol/fable/grok) and
+`new-classic` (pi/claude/codex/grok) actions with a synthetic `@all` round,
+and validates that every participant replies with exactly `SMOKE-OK`. The
+candidate export uses `git write-tree` plus `git archive` over the staged
+index, extracted with traversal-safe filtering that rejects escaping or
+absolute symlinks; unstaged worktree content is deliberately not exported,
+so candidate files must be staged (`git add`) first. Because the export only
+reads the Git index, a `TMPDIR` nested under the plugin root cannot recurse.
+
+After each launch the harness polls only supported live Herdr surfaces —
+`workspace list`, `agent list`, `pane list --workspace`, and
+`pane read --source recent-unwrapped` — never launcher state files,
+`plugin config-dir`, or the room relay executable directly. Readiness
+requires the caller to remain the sole focused workspace, exactly one
+`group-chat` and one `agents · group-chat` workspace to exist unfocused,
+every expected peer to be live in the backstage workspace and settled
+(`idle` or `done`; stale peers from the prior default room are allowed during
+classic replacement), and exactly one current room pane whose text reports
+the expected room handles ready, with a new pane and tab id for the
+replacement room. The synthetic `@all` round runs through the actual room
+pane with `pane send-text` and `pane send-keys enter`, then polls
+`pane read` until, after this round's unique marker message, exactly one
+complete post-marker message body per expected role appears, equal to
+`SMOKE-OK`; prior chatter from the same roles is ignored, while duplicate
+replies and continuation or explanatory text fail. A visible system
+delivery error fails immediately, as do missing, extra, prefixed, or
+suffixed replies. The caller's focus is verified inside every poll as well
+as after every launch and round, without ever issuing a focus command. Cleanup unlinks the temporary
+plugin id first, then stops the session, reaps the owned server, and deletes
+only the named session the harness created (retrying the delete once after
+the server is gone), all scoped to that session. Named sessions share the global plugin
+registry, so candidate smoke must run under a temporary plugin id and never
+touches the installed `terry.herdr-group-chat` registration. The harness
+neither requires nor modifies `HERDR_ENV` and never uses the UI-focused
+default session. Vivesca callers should create a
+`deleo --create-session-temp-dir` root and set `TMPDIR` inside it before
+running, so the internal candidate copy lands in the audited session temp
+root. See [RELEASING.md](RELEASING.md) for the release gate.
+
 ## Hotkey
 
 The plugin actions appear in Herdr's action palette. To bind the default room

@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented here.
 
+## [0.10.5] - 2026-08-31
+
+- Add the deterministic `release-smoke` harness. `release-smoke candidate
+  --plugin-root PATH --agent-cwd PATH` exports the staged Git index of the
+  candidate into an internal temporary directory, rewrites only the copied
+  manifest's plugin id to a unique temporary id (preflighted for absence),
+  links it, and drives an isolated named Herdr session through the default
+  `new` and `new-classic` actions. `release-smoke installed --plugin-id ID
+  --expected-version VERSION --agent-cwd PATH` runs the same smoke against
+  the installed plugin without ever linking or unlinking it. Both modes
+  verify the exact version, plugin identity and root, the full action and
+  pane contracts (id, command, contexts/placement), and the exact
+  participant replies (sol/fable/grok and pi/claude/codex/grok): after each
+  launch they poll only supported live surfaces (workspace, agent, pane
+  list/read, session-scoped, wall-clock budgeted, focus checked inside
+  every poll), and each synthetic `@all` round runs through the actual room
+  pane and requires exactly one complete post-marker message body per
+  expected role equal to `SMOKE-OK` — prior chatter is ignored, duplicates
+  and continuation or explanatory text fail. Cleanup unlinks only the
+  temporary id, then stops, reaps, and deletes only the created named
+  session; any cleanup failure fails the run. Because named sessions share
+  the global plugin registry, candidate smoke must run under a temporary
+  plugin id; the installed `terry.herdr-group-chat` registration is never
+  touched.
+
 ## [0.10.4] - 2026-08-31
 
 - Fresh **New group chat** launches no longer steal focus: the plugin pane

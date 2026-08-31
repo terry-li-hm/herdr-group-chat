@@ -1,0 +1,1239 @@
+#!/usr/bin/env -S uv run --script --python 3.13
+# /// script
+# requires-python = ">=3.13"
+# dependencies = []
+# ///
+"""Deterministic Herdr Group Chat release-smoke harness.
+
+Drives the candidate checkout and the installed plugin through an isolated
+named Herdr session using argv subprocesses only. Human-readable progress goes
+to stderr; stdout carries exactly one stable JSON result object, including on
+invalid paths and unexpected runtime failures.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import uuid
+from contextlib import suppress
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
+INSTALLED_PLUGIN_ID = "terry.herdr-group-chat"
+ACTION_CONTEXTS = ("workspace", "tab", "pane")
+EXPECTED_ACTION_CONTRACTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "new": (("./new-room", "--launch", "--profile", "sol-fable-grok-pi"), ACTION_CONTEXTS),
+    "new-sol-fable": (("./new-room", "--launch", "--profile", "sol-fable"), ACTION_CONTEXTS),
+    "new-sol-fable-grok-native": (
+        ("./new-room", "--launch", "--profile", "sol-fable-grok"),
+        ACTION_CONTEXTS,
+    ),
+    "new-sol-fable-glm": (
+        ("./new-room", "--launch", "--profile", "sol-fable-glm"),
+        ACTION_CONTEXTS,
+    ),
+    "new-classic": (("./new-room", "--launch"), ACTION_CONTEXTS),
+    "open": (("./new-room", "--open"), ACTION_CONTEXTS),
+    "adopt-peers": (("./new-room", "--adopt-peers"), ACTION_CONTEXTS),
+}
+EXPECTED_PANE_CONTRACTS: dict[str, tuple[tuple[str, ...], str]] = {
+    "new-room": (("./new-room",), "tab"),
+    "room": (("./new-room", "--room-entrypoint"), "tab"),
+}
+DEFAULT_PROFILE = "sol-fable-grok-pi"
+DEFAULT_PARTICIPANTS = (
+    ("sol", "sol-peer"),
+    ("fable", "fable-peer"),
+    ("grok", "grok46pi-peer"),
+)
+CLASSIC_PARTICIPANTS = (
+    ("pi", "pi-peer"),
+    ("claude", "claude-peer"),
+    ("codex", "codex-peer"),
+    ("grok", "grok-peer"),
+)
+CHAT_WORKSPACE_LABEL = "group-chat"
+AGENTS_WORKSPACE_LABEL = "agents · group-chat"
+GROUP_WORKSPACE_LABELS = (CHAT_WORKSPACE_LABEL, AGENTS_WORKSPACE_LABEL)
+SETTLED_AGENT_STATUSES = ("idle", "done")
+SYSTEM_ERROR_MARKERS = ("failed", "blocked", "timed out", "cancelled")
+PANE_READ_LINES = 200
+CALLER_LABEL_PREFIX = "smoke-caller-"
+SESSION_PREFIX = "group-chat-smoke-"
+TEMP_ID_PREFIX = "terry.herdr-group-chat.smoke."
+SMOKE_REPLY = "SMOKE-OK"
+POLL_SECONDS = 0.05
+SETTLE_SECONDS = 0.2
+GIT_TREE_PATTERN = re.compile(r"[0-9a-f]{40}")
+
+
+class StageError(Exception):
+    """A named smoke stage failed; cleanup must still run."""
+
+    def __init__(self, stage: str, message: str) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.message = message
+
+
+@dataclass
+class SmokeResult:
+    ok: bool
+    mode: str
+    plugin_id: str
+    session: str
+    expected_version: str | None = None
+    observed_version: str | None = None
+    temporary_plugin_id: str | None = None
+    caller_workspace_id: str | None = None
+    rooms: list[dict[str, Any]] = field(default_factory=list)
+    stages_completed: list[str] = field(default_factory=list)
+    cleanup: dict[str, str] = field(default_factory=dict)
+    error: dict[str, str] | None = None
+
+    def to_json(self) -> str:
+        return json.dumps(self.__dict__, sort_keys=True, separators=(",", ":"))
+
+
+def note(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def unique_suffix(length: int = 12) -> str:
+    return uuid.uuid4().hex[:length]
+
+
+class Herdr:
+    """argv-only Herdr driver. Never issues a focus command.
+
+    Every call names its own stage; there is no ambient stage fallback.
+    """
+
+    def __init__(self, herdr_bin: str, timeout: float) -> None:
+        self.herdr_bin = herdr_bin
+        self.timeout = timeout
+
+    @staticmethod
+    def failing(stage: str, message: str) -> StageError:
+        return StageError(stage, message)
+
+    def session_argv(self, session: str | None, arguments: Sequence[str]) -> list[str]:
+        argv: list[str] = [self.herdr_bin]
+        if session is not None:
+            argv.extend(["--session", session])
+        argv.extend(arguments)
+        return list(argv)
+
+    def run(
+        self,
+        arguments: Sequence[str],
+        session: str | None = None,
+        *,
+        stage: str,
+        timeout: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        argv = self.session_argv(session, arguments)
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=self.timeout if timeout is None else timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise self.failing(stage, f"herdr timed out: {argv}") from error
+        except OSError as error:
+            raise self.failing(stage, f"herdr failed to launch: {error}") from error
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            raise self.failing(stage, f"herdr {' '.join(arguments)} failed: {detail}")
+        return result
+
+    def json(
+        self,
+        arguments: Sequence[str],
+        session: str | None,
+        *,
+        stage: str,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        result = self.run(arguments, session, stage=stage, timeout=timeout)
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise self.failing(
+                stage, f"herdr {' '.join(arguments)} returned invalid JSON"
+            ) from error
+        if not isinstance(payload, dict):
+            raise self.failing(stage, f"herdr {' '.join(arguments)} returned an invalid response")
+        if "result" in payload and "id" in payload:
+            unwrapped = payload["result"]
+            if not isinstance(unwrapped, dict):
+                raise self.failing(
+                    stage, f"herdr {' '.join(arguments)} returned an invalid result envelope"
+                )
+            return unwrapped
+        return payload
+
+    def text(
+        self,
+        arguments: Sequence[str],
+        session: str | None,
+        *,
+        stage: str,
+        timeout: float | None = None,
+    ) -> str:
+        return self.run(arguments, session, stage=stage, timeout=timeout).stdout.strip()
+
+
+def spawn_server(herdr: Herdr, session: str) -> subprocess.Popen[str]:
+    """Spawn the named session's headless server; ownership starts here."""
+    try:
+        return subprocess.Popen(
+            [herdr.herdr_bin, "--session", session, "server"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError as error:
+        raise StageError("start-session", f"the session server failed to spawn: {error}") from error
+
+
+def wait_ready(herdr: Herdr, session: str, server: subprocess.Popen[str]) -> None:
+    """Wait until the named session's API socket answers a read-only probe."""
+    deadline = time.monotonic() + herdr.timeout
+    while time.monotonic() < deadline:
+        if server.poll() is not None:
+            raise StageError(
+                "start-session", f"the session server exited early ({server.returncode})"
+            )
+        try:
+            probe = subprocess.run(
+                [herdr.herdr_bin, "--session", session, "workspace", "list"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=herdr.timeout,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise StageError("start-session", f"the readiness probe failed: {error}") from error
+        if probe.returncode == 0:
+            # A probe success is not readiness on its own: the spawned server
+            # must still be alive after a short settle, so an immediately
+            # crashing server is never mistaken for a ready session.
+            time.sleep(SETTLE_SECONDS)
+            if server.poll() is None:
+                return
+            raise StageError(
+                "start-session", f"the session server exited early ({server.returncode})"
+            )
+        time.sleep(POLL_SECONDS)
+    raise StageError("start-session", f"the session server never became ready ({session})")
+
+
+def preflight_session_absent(herdr: Herdr, session: str) -> None:
+    """Prove no session with the generated name exists before spawning."""
+    listing = herdr.json(["session", "list", "--json"], session, stage="start-session")
+    for entry in listing.get("sessions", []):
+        if isinstance(entry, dict) and entry.get("name") == session:
+            raise StageError(
+                "start-session", f"a session named {session!r} already exists; refusing to spawn"
+            )
+
+
+def preflight_plugin_absent(herdr: Herdr, session: str, plugin_id: str) -> None:
+    """Prove the temporary plugin id is unregistered before linking it.
+
+    Absence is proven only by a successful listing whose plugins list is
+    exactly empty. Any Herdr failure - timeout, transport error, malformed or
+    invalid JSON - fails closed: the run refuses to link, and because
+    ownership is never accepted it never unlinks a possibly pre-existing id.
+    """
+    listing = herdr.json(
+        ["plugin", "list", "--plugin", plugin_id, "--json"], session, stage="link-candidate"
+    )
+    plugins = listing.get("plugins")
+    if not isinstance(plugins, list):
+        raise StageError(
+            "link-candidate",
+            f"cannot prove the temporary plugin id {plugin_id!r} is absent: "
+            "Herdr returned a malformed plugin list",
+        )
+    if plugins:
+        raise StageError(
+            "link-candidate",
+            f"the temporary plugin id {plugin_id!r} is already registered; refusing to link",
+        )
+
+
+def extract_tar_safe(fileobj: io.BytesIO, destination: Path) -> None:
+    """Extract a tar stream, rejecting absolute paths, traversal, and bad links."""
+    root = destination.resolve()
+    with tarfile.open(fileobj=fileobj, mode="r:") as archive:
+        for member in archive:
+            pure = PurePosixPath(member.name)
+            if pure.is_absolute() or ".." in pure.parts or not pure.parts:
+                raise StageError("export-candidate", f"unsafe archive member: {member.name!r}")
+            target = root.joinpath(*pure.parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif member.issym():
+                link = PurePosixPath(member.linkname)
+                if link.is_absolute():
+                    raise StageError(
+                        "export-candidate", f"absolute symlink in candidate: {member.name!r}"
+                    )
+                resolved = (target.parent / member.linkname).resolve()
+                if root != resolved and root not in resolved.parents:
+                    raise StageError(
+                        "export-candidate", f"escaping symlink in candidate: {member.name!r}"
+                    )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.is_symlink() or target.exists():
+                    target.unlink()
+                os.symlink(member.linkname, target)
+            elif member.isfile():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                stream = archive.extractfile(member)
+                if stream is None:  # pragma: no cover - guarded by isfile
+                    raise StageError("export-candidate", f"unreadable member: {member.name!r}")
+                with stream, open(target, "wb") as output:
+                    shutil.copyfileobj(stream, output)
+                os.chmod(target, 0o755 if member.mode & 0o111 else 0o644)
+            else:
+                raise StageError("export-candidate", f"unsupported archive member: {member.name!r}")
+
+
+def export_candidate(plugin_root: Path, destination: Path, herdr: Herdr) -> None:
+    """Export the staged Git index of the candidate into destination.
+
+    Uses `git write-tree` plus `git archive`, so candidate files must be staged
+    (`git add`); unstaged worktree content is deliberately not exported. The
+    export never walks plugin_root's filesystem, so a TMPDIR nested under the
+    checkout cannot recurse.
+    """
+    git_bin = shutil.which("git")
+    if git_bin is None:
+        raise StageError("export-candidate", "git is not available for the staged export")
+    try:
+        tree = subprocess.run(
+            [git_bin, "-C", str(plugin_root), "write-tree"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=herdr.timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise StageError("export-candidate", f"git write-tree failed: {error}") from error
+    if tree.returncode != 0:
+        detail = tree.stderr.strip() or "unknown git error"
+        raise StageError(
+            "export-candidate",
+            f"git write-tree failed (stage the candidate files with git add): {detail}",
+        )
+    tree_id = tree.stdout.strip()
+    if not GIT_TREE_PATTERN.fullmatch(tree_id):
+        raise StageError(
+            "export-candidate", f"git write-tree returned an invalid tree: {tree_id!r}"
+        )
+    try:
+        archive = subprocess.run(
+            [git_bin, "-C", str(plugin_root), "archive", "--format=tar", tree_id],
+            capture_output=True,
+            timeout=herdr.timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise StageError("export-candidate", f"git archive failed: {error}") from error
+    if archive.returncode != 0:
+        raise StageError("export-candidate", "git archive failed for the staged candidate tree")
+    try:
+        extract_tar_safe(io.BytesIO(archive.stdout), destination)
+    except (tarfile.TarError, OSError) as error:
+        raise StageError(
+            "export-candidate", f"the candidate archive is unreadable: {error}"
+        ) from error
+    if not (destination / "herdr-plugin.toml").is_file():
+        raise StageError("export-candidate", "the staged candidate has no herdr-plugin.toml")
+
+
+def rewrite_manifest_id(manifest_path: Path, temporary_id: str) -> str:
+    """Replace only the plugin id line in the copied manifest; return the original."""
+    import tomllib
+
+    original = manifest_path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(original)
+    installed_id = parsed.get("id")
+    if installed_id != INSTALLED_PLUGIN_ID:
+        raise StageError(
+            "copy-candidate",
+            f"candidate manifest id {installed_id!r} is not the installed {INSTALLED_PLUGIN_ID!r}",
+        )
+    old_line = f'id = "{INSTALLED_PLUGIN_ID}"'
+    if original.count(old_line) != 1:
+        raise StageError("copy-candidate", "candidate manifest id line is not unique")
+    rewritten = original.replace(old_line, f'id = "{temporary_id}"', 1)
+    reparsed = tomllib.loads(rewritten)
+    if reparsed.get("id") != temporary_id or {
+        key: value for key, value in reparsed.items() if key != "id"
+    } != {key: value for key, value in parsed.items() if key != "id"}:
+        raise StageError("copy-candidate", "manifest rewrite changed more than the id")
+    manifest_path.write_text(rewritten, encoding="utf-8")
+    return str(installed_id)
+
+
+def focused_workspace(workspaces: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+    focused = [item for item in workspaces if item.get("focused")]
+    if len(focused) != 1:
+        raise StageError(
+            "verify-focus", f"expected exactly one focused workspace, got {len(focused)}"
+        )
+    return focused[0]
+
+
+def verify_focus(
+    herdr: Herdr,
+    session: str,
+    caller_workspace_id: str,
+    caller_tab_id: str,
+) -> None:
+    listing = herdr.json(["workspace", "list"], session, stage="verify-focus")
+    workspaces = listing.get("workspaces")
+    if not isinstance(workspaces, list):
+        raise StageError("verify-focus", "workspace list returned no workspaces")
+    focused = focused_workspace(workspaces)
+    if focused.get("workspace_id") != caller_workspace_id:
+        raise StageError(
+            "verify-focus",
+            f"focused workspace {focused.get('workspace_id')!r} is not the caller "
+            f"{caller_workspace_id!r}",
+        )
+    if str(focused.get("label", "")) in GROUP_WORKSPACE_LABELS:
+        raise StageError(
+            "verify-focus",
+            f"a group-chat workspace {focused.get('label')!r} took focus",
+        )
+    if focused.get("active_tab_id") != caller_tab_id:
+        raise StageError(
+            "verify-focus",
+            f"caller active tab changed: {focused.get('active_tab_id')!r} != {caller_tab_id!r}",
+        )
+
+
+def create_caller_workspace(herdr: Herdr, session: str, agent_cwd: Path) -> tuple[str, str]:
+    response = herdr.json(
+        [
+            "workspace",
+            "create",
+            "--cwd",
+            str(agent_cwd),
+            "--label",
+            f"{CALLER_LABEL_PREFIX}{unique_suffix(6)}",
+            "--focus",
+        ],
+        session,
+        stage="create-caller-workspace",
+    )
+    workspace = response.get("workspace", response)
+    workspace_id = workspace.get("workspace_id") if isinstance(workspace, dict) else None
+    tab_id = workspace.get("active_tab_id") if isinstance(workspace, dict) else None
+    if not isinstance(workspace_id, str) or not workspace_id:
+        raise StageError("create-caller-workspace", "workspace create returned no workspace id")
+    if not isinstance(tab_id, str) or not tab_id:
+        raise StageError("create-caller-workspace", "workspace create returned no active tab id")
+    return workspace_id, tab_id
+
+
+def verify_registration(
+    herdr: Herdr,
+    session: str,
+    plugin_id: str,
+    expected_version: str | None,
+    expected_plugin_root: Path | None,
+    result: SmokeResult,
+) -> str:
+    """Verify exact version, identity, plugin root, and action/pane contracts."""
+    listing = herdr.json(
+        ["plugin", "list", "--plugin", plugin_id, "--json"], session, stage="verify-registration"
+    )
+    plugins = listing.get("plugins")
+    if not isinstance(plugins, list) or len(plugins) != 1:
+        raise StageError(
+            "verify-registration", f"plugin {plugin_id!r} is not registered exactly once"
+        )
+    entry = plugins[0]
+    if entry.get("plugin_id") != plugin_id:
+        raise StageError(
+            "verify-registration",
+            f"registry returned plugin id {entry.get('plugin_id')!r} for request {plugin_id!r}",
+        )
+    plugin_root = entry.get("plugin_root")
+    if not isinstance(plugin_root, str) or not plugin_root:
+        raise StageError("verify-registration", "plugin entry returned no plugin root")
+    if expected_plugin_root is not None and Path(plugin_root).resolve() != (
+        expected_plugin_root.resolve()
+    ):
+        raise StageError(
+            "verify-registration",
+            f"plugin root {plugin_root!r} is not the exported candidate "
+            f"{str(expected_plugin_root)!r}",
+        )
+    observed = entry.get("version")
+    result.observed_version = str(observed) if observed is not None else None
+    if expected_version is not None and str(observed) != expected_version:
+        raise StageError(
+            "verify-registration",
+            f"plugin version {observed!r} does not match expected {expected_version!r}",
+        )
+    problems: list[str] = []
+    for kind, expected, listed in (
+        ("action", EXPECTED_ACTION_CONTRACTS, entry.get("actions")),
+        ("pane", EXPECTED_PANE_CONTRACTS, entry.get("panes")),
+    ):
+        by_id: dict[str, Any] = {}
+        if not isinstance(listed, list):
+            raise StageError("verify-registration", f"plugin entry returned no {kind} list")
+        ids: list[str] = []
+        for item in listed:
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                ids.append(item["id"])
+                by_id[item["id"]] = item
+            else:
+                problems.append(f"a {kind} entry has no id")
+        if len(set(ids)) != len(ids):
+            problems.append(f"duplicate {kind} ids in {sorted(ids)}")
+        if len(ids) != len(expected):
+            problems.append(f"{len(ids)} {kind} entries listed, expected exactly {len(expected)}")
+        if set(by_id) != set(expected):
+            problems.append(f"{kind} ids {sorted(by_id)} do not match {sorted(expected)}")
+        if set(by_id) != set(expected):
+            continue
+        for entry_id, contract in expected.items():
+            item = by_id[entry_id]
+            command = tuple(item.get("command") or ())
+            if command != contract[0]:
+                problems.append(
+                    f"{kind} {entry_id!r} command {list(command)!r} != {list(contract[0])!r}"
+                )
+            if kind == "action":
+                contexts = tuple(sorted(item.get("contexts") or ()))
+                if contexts != tuple(sorted(contract[1])):
+                    problems.append(
+                        f"action {entry_id!r} contexts {list(item.get('contexts') or [])!r} "
+                        f"!= {list(contract[1])!r}"
+                    )
+            elif item.get("placement") != contract[1]:
+                problems.append(
+                    f"pane {entry_id!r} placement {item.get('placement')!r} != {contract[1]!r}"
+                )
+    if problems:
+        raise StageError("verify-registration", "; ".join(problems))
+    return plugin_root
+
+
+def run_action(herdr: Herdr, session: str, plugin_id: str, action: str) -> None:
+    herdr.run(
+        ["plugin", "action", "invoke", action, "--plugin", plugin_id],
+        session,
+        stage=f"launch-{action}",
+    )
+
+
+def workspaces_by_label(
+    workspaces: Sequence[Mapping[str, Any]], label: str
+) -> list[Mapping[str, Any]]:
+    return [item for item in workspaces if str(item.get("label", "")) == label]
+
+
+def check_workspaces(
+    herdr: Herdr,
+    session: str,
+    caller_workspace_id: str,
+    caller_tab_id: str,
+    stage: str,
+    timeout: float | None = None,
+) -> tuple[str, str]:
+    """Verify focus and that exactly one chat and one backstage workspace exist."""
+    listing = herdr.json(["workspace", "list"], session, stage=stage, timeout=timeout)
+    workspaces = listing.get("workspaces")
+    if not isinstance(workspaces, list):
+        raise StageError(stage, "workspace list returned no workspaces")
+    focused = focused_workspace(workspaces)
+    if focused.get("workspace_id") != caller_workspace_id:
+        raise StageError(
+            stage,
+            f"focused workspace {focused.get('workspace_id')!r} is not the caller "
+            f"{caller_workspace_id!r}",
+        )
+    if str(focused.get("label", "")) in GROUP_WORKSPACE_LABELS:
+        raise StageError(stage, f"a group-chat workspace {focused.get('label')!r} took focus")
+    if focused.get("active_tab_id") != caller_tab_id:
+        raise StageError(
+            stage,
+            f"caller active tab changed: {focused.get('active_tab_id')!r} != {caller_tab_id!r}",
+        )
+    chat = workspaces_by_label(workspaces, CHAT_WORKSPACE_LABEL)
+    backstage = workspaces_by_label(workspaces, AGENTS_WORKSPACE_LABEL)
+    if len(chat) != 1 or len(backstage) != 1:
+        return "", ""
+    if chat[0].get("focused") or backstage[0].get("focused"):
+        return "", ""
+    chat_id = chat[0].get("workspace_id")
+    backstage_id = backstage[0].get("workspace_id")
+    if not isinstance(chat_id, str) or not isinstance(backstage_id, str):
+        return "", ""
+    return chat_id, backstage_id
+
+
+def agent_entry(agents: Sequence[Mapping[str, Any]], name: str) -> Mapping[str, Any] | None:
+    for item in agents:
+        if isinstance(item, dict) and item.get("name") == name:
+            return item
+    return None
+
+
+def agent_status(entry: Mapping[str, Any]) -> str:
+    """Protocol-21 `agent_status`, with the legacy `status` spelling accepted."""
+    status = entry.get("agent_status", entry.get("status"))
+    return str(status) if status is not None else ""
+
+
+def peers_settled(
+    herdr: Herdr,
+    session: str,
+    backstage_id: str,
+    expected_peers: Sequence[str],
+    stage: str,
+    timeout: float | None = None,
+) -> bool:
+    listing = herdr.json(["agent", "list"], session, stage=stage, timeout=timeout)
+    agents = listing.get("agents")
+    if not isinstance(agents, list):
+        raise StageError(stage, "agent list returned no agents")
+    for name in expected_peers:
+        entry = agent_entry(agents, name)
+        if entry is None:
+            return False
+        if entry.get("workspace_id") != backstage_id:
+            return False
+        if agent_status(entry) not in SETTLED_AGENT_STATUSES:
+            return False
+    return True
+
+
+ROOM_PANE_LABELS = ("group chat", "new group chat")
+
+
+def is_room_pane(entry: Mapping[str, Any]) -> bool:
+    """The live room pane: the real pane label `New group chat` (the manifest
+    pane title), the descriptive `Group chat`, or an explicit `room` entrypoint."""
+    label = str(entry.get("label", "")).strip().lower()
+    return label in ROOM_PANE_LABELS or entry.get("entrypoint") == "room"
+
+
+def room_pane_identity(entry: Mapping[str, Any], stage: str) -> tuple[str, str]:
+    pane_id = entry.get("pane_id", entry.get("id"))
+    tab_id = entry.get("tab_id")
+    if not isinstance(pane_id, str) or not pane_id:
+        raise StageError(stage, "room pane entry has no pane id")
+    if not isinstance(tab_id, str) or not tab_id:
+        raise StageError(stage, "room pane entry has no tab id")
+    return pane_id, tab_id
+
+
+def current_room_pane(
+    herdr: Herdr,
+    session: str,
+    chat_workspace_id: str,
+    previous_pane_id: str,
+    previous_tab_id: str,
+    stage: str,
+    timeout: float | None = None,
+) -> tuple[str, str]:
+    listing = herdr.json(
+        ["pane", "list", "--workspace", chat_workspace_id],
+        session,
+        stage=stage,
+        timeout=timeout,
+    )
+    panes = listing.get("panes")
+    if not isinstance(panes, list):
+        raise StageError(stage, "pane list returned no panes")
+    rooms = [item for item in panes if isinstance(item, dict) and is_room_pane(item)]
+    if len(rooms) != 1:
+        return "", ""
+    pane_id, tab_id = room_pane_identity(rooms[0], stage)
+    # A replacement room must take both a new pane and a new tab.
+    if pane_id == previous_pane_id or tab_id == previous_tab_id:
+        return "", ""
+    return pane_id, tab_id
+
+
+def pane_text(
+    herdr: Herdr, session: str, pane_id: str, stage: str, timeout: float | None = None
+) -> str:
+    result = herdr.run(
+        ["pane", "read", pane_id, "--source", "recent-unwrapped", "--lines", str(PANE_READ_LINES)],
+        session,
+        stage=stage,
+        timeout=timeout,
+    )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return result.stdout
+    if not isinstance(payload, dict):
+        raise StageError(stage, "pane read returned an invalid response")
+    inner = payload.get("result", payload)
+    if isinstance(inner, dict):
+        for key in ("text", "content", "output"):
+            if isinstance(inner.get(key), str):
+                return inner[key]
+        lines = inner.get("lines")
+        if isinstance(lines, list):
+            return "\n".join(str(line) for line in lines)
+    raise StageError(stage, "pane read returned no text")
+
+
+SYSTEM_LINE_PREFIXES = ("system>", "system:", "setup:")
+STATUS_ROW_PREFIXES = ("delivery failed", "reply marker")
+
+
+def system_error_lines(text: str) -> list[str]:
+    """Leading whitespace is normalized before any system-error matching."""
+    offenders = []
+    for raw in text.splitlines():
+        line = raw.strip().lower()
+        if not line:
+            continue
+        if (
+            any(line.startswith(prefix) for prefix in SYSTEM_LINE_PREFIXES)
+            and any(marker in line for marker in SYSTEM_ERROR_MARKERS)
+        ) or any(line.startswith(prefix) for prefix in STATUS_ROW_PREFIXES):
+            offenders.append(line)
+    return offenders
+
+
+def visible_system_error(text: str, stage: str) -> None:
+    errors = system_error_lines(text)
+    if errors:
+        raise StageError(stage, f"the room reported a system error: {errors[0].strip()}")
+
+
+def poll_room_ready(
+    herdr: Herdr,
+    session: str,
+    caller_workspace_id: str,
+    caller_tab_id: str,
+    expected_peers: Sequence[str],
+    expected_roles: Sequence[str],
+    previous_pane_id: str,
+    previous_tab_id: str,
+    timeout: float,
+    stage: str,
+) -> tuple[str, str]:
+    """Poll supported live surfaces until the launched room is fully ready.
+
+    The configured timeout is a wall-clock budget: every nested command is
+    given only the time remaining until the deadline.
+    """
+    deadline = time.monotonic() + timeout
+
+    def budget() -> float:
+        """Fresh remaining wall clock; never reused across sequential calls."""
+        remaining = deadline - time.monotonic()
+        if remaining <= POLL_SECONDS:
+            raise StageError(
+                stage,
+                "the room never became ready: workspaces, settled peers "
+                f"{list(expected_peers)}, or the room pane with handles "
+                f"{list(expected_roles)} were incomplete (budget exhausted)",
+            )
+        return remaining
+
+    while True:
+        chat_id, backstage_id = check_workspaces(
+            herdr, session, caller_workspace_id, caller_tab_id, stage, timeout=budget()
+        )
+        pane_id = tab_id = ""
+        if (
+            chat_id
+            and backstage_id
+            and peers_settled(herdr, session, backstage_id, expected_peers, stage, timeout=budget())
+        ):
+            pane_id, tab_id = current_room_pane(
+                herdr,
+                session,
+                chat_id,
+                previous_pane_id,
+                previous_tab_id,
+                stage,
+                timeout=budget(),
+            )
+        if pane_id:
+            text = pane_text(herdr, session, pane_id, stage, timeout=budget())
+            visible_system_error(text, stage)
+            lowered = text.lower()
+            if all(role.lower() in lowered for role in expected_roles):
+                return pane_id, tab_id
+        if time.monotonic() >= deadline:
+            raise StageError(
+                stage,
+                "the room never became ready: workspaces, settled peers "
+                f"{list(expected_peers)}, or the room pane with handles "
+                f"{list(expected_roles)} were incomplete",
+            )
+        time.sleep(POLL_SECONDS)
+
+
+MESSAGE_HEAD = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)>\s?(.*)$")
+
+
+def message_blocks(text: str) -> list[tuple[str, str]]:
+    """Parse ordered complete TUI message blocks as (sender, body) pairs.
+
+    A block starts at a `<sender>` head line and collects continuation lines
+    until the next message head or a blank boundary. Blocks stay in transcript
+    order and historical blocks from the same sender are kept separate, so
+    only this round's post-marker blocks are ever evaluated.
+    """
+    blocks: list[tuple[str, list[str]]] = []
+    current: tuple[str, list[str]] | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            current = None
+            continue
+        head = MESSAGE_HEAD.match(line)
+        if head:
+            current = (head.group(1), [head.group(2)])
+            blocks.append(current)
+        elif current is not None:
+            current[1].append(line)
+    return [(label, "\n".join(body).strip()) for label, body in blocks]
+
+
+def run_round(
+    herdr: Herdr,
+    session: str,
+    caller_workspace_id: str,
+    caller_tab_id: str,
+    action: str,
+    profile: str | None,
+    participants: Sequence[tuple[str, str]],
+    previous_pane_id: str,
+    previous_tab_id: str,
+) -> dict[str, Any]:
+    """Drive one synthetic @all round through the live room pane."""
+    stage = f"round-{action}"
+    expected_peers = tuple(target for _role, target in participants)
+    expected_roles = tuple(role for role, _target in participants)
+    pane_id, tab_id = poll_room_ready(
+        herdr,
+        session,
+        caller_workspace_id,
+        caller_tab_id,
+        expected_peers,
+        expected_roles,
+        previous_pane_id,
+        previous_tab_id,
+        herdr.timeout,
+        stage,
+    )
+
+    marker = unique_suffix(16)
+    message = f"@all release-smoke {marker}: reply with exactly {SMOKE_REPLY}."
+    herdr.run(["pane", "send-text", pane_id, message], session, stage=stage)
+    herdr.run(["pane", "send-keys", pane_id, "enter"], session, stage=stage)
+
+    deadline = time.monotonic() + herdr.timeout
+
+    def budget() -> float:
+        """Fresh remaining wall clock; never reused across sequential calls."""
+        remaining = deadline - time.monotonic()
+        if remaining <= POLL_SECONDS:
+            missing = [role for role in expected_roles if role not in replies]
+            raise StageError(
+                stage,
+                f"the @all round never settled; missing exact replies from "
+                f"{missing} for marker {marker}",
+            )
+        return remaining
+
+    replies: dict[str, str] = {}
+    while True:
+        # Focus is verified inside every reply poll, not only before or after.
+        check_workspaces(
+            herdr, session, caller_workspace_id, caller_tab_id, stage, timeout=budget()
+        )
+        text = pane_text(herdr, session, pane_id, stage, timeout=budget())
+        visible_system_error(text, stage)
+        blocks = message_blocks(text)
+        marker_index = next(
+            (index for index, (_label, body) in enumerate(blocks) if marker in body), None
+        )
+        if marker_index is not None:
+            current_round = blocks[marker_index + 1 :]
+            replies = {}
+            for role in expected_roles:
+                role_blocks = [body for label, body in current_round if label == role]
+                if len(role_blocks) > 1:
+                    raise StageError(
+                        stage,
+                        f"@{role} replied {len(role_blocks)} times after the marker; "
+                        "exactly one reply is required",
+                    )
+                if role_blocks:
+                    if role_blocks[0] != SMOKE_REPLY:
+                        raise StageError(
+                            stage,
+                            f"@{role} replied {role_blocks[0]!r}, not exactly {SMOKE_REPLY}",
+                        )
+                    replies[role] = SMOKE_REPLY
+            unexpected = [
+                label
+                for label, body in current_round
+                if label not in expected_roles and body == SMOKE_REPLY
+            ]
+            if unexpected:
+                raise StageError(
+                    stage,
+                    f"unexpected participant reply from {sorted(set(unexpected))}",
+                )
+            if len(replies) == len(expected_roles):
+                return {
+                    "room_id": pane_id,
+                    "room_tab_id": tab_id,
+                    "profile": profile,
+                    "participants": list(expected_roles),
+                    "replies": dict(replies),
+                }
+        if time.monotonic() >= deadline:
+            missing = [role for role in expected_roles if role not in replies]
+            raise StageError(
+                stage,
+                f"the @all round never settled; missing exact replies from "
+                f"{missing} for marker {marker}",
+            )
+        time.sleep(POLL_SECONDS)
+
+
+def reap_server(server: subprocess.Popen[str] | None) -> None:
+    if server is None or server.poll() is not None:
+        return
+    server.terminate()
+    try:
+        server.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        server.kill()
+        with suppress(subprocess.TimeoutExpired):
+            server.wait(timeout=5)
+
+
+def cleanup(
+    herdr: Herdr,
+    session: str,
+    server: subprocess.Popen[str] | None,
+    linked_temp_id: str | None,
+    temp_dir: tempfile.TemporaryDirectory[str] | None,
+    session_owned: bool,
+    result: SmokeResult,
+) -> None:
+    """Unlink the temporary id, stop the session, reap the server, delete it.
+
+    Session stop and delete run only when this process proved the session name
+    absent and spawned the server itself. The order is fixed: temp-id unlink,
+    session stop, reap/kill the owned server, then session delete; if delete
+    fails while the server was still alive it is retried once after the reap.
+    Any cleanup failure turns a would-be success into a named failure: the run
+    must never report success with a surviving session or temp plugin link.
+    """
+    problems: list[tuple[str, str]] = []
+    if linked_temp_id is not None:
+        try:
+            herdr.run(["plugin", "unlink", linked_temp_id], session, stage="cleanup-link")
+            result.cleanup["plugin_unlink"] = "ok"
+            note(f"[cleanup-link] unlinked only {linked_temp_id}")
+        except StageError as error:
+            result.cleanup["plugin_unlink"] = f"failed: {error.message}"
+            problems.append(("cleanup-link", error.message))
+    if session_owned:
+        try:
+            herdr.run(["session", "stop", session], session, stage="cleanup-session-stop")
+            result.cleanup["session_stop"] = "ok"
+        except StageError as error:
+            result.cleanup["session_stop"] = f"failed: {error.message}"
+            problems.append(("cleanup-session-stop", error.message))
+        # The owned server must be dead before deletion, whatever stop did.
+        reap_server(server)
+        try:
+            herdr.run(
+                ["session", "delete", session, "--json"], session, stage="cleanup-session-delete"
+            )
+            result.cleanup["session_delete"] = "ok"
+        except StageError:
+            # Retry exactly once after the server is provably gone.
+            reap_server(server)
+            try:
+                herdr.run(
+                    ["session", "delete", session, "--json"],
+                    session,
+                    stage="cleanup-session-delete",
+                )
+                result.cleanup["session_delete"] = "ok (after retry)"
+            except StageError as retry_error:
+                result.cleanup["session_delete"] = f"failed: {retry_error.message}"
+                problems.append(("cleanup-session-delete", retry_error.message))
+    if temp_dir is not None:
+        try:
+            temp_dir.cleanup()
+        except OSError as error:
+            result.cleanup["temp_dir"] = f"failed: {error}"
+            problems.append(("cleanup-temp-dir", str(error)))
+    if problems:
+        stage, message = problems[0]
+        if result.error is None:
+            result.error = {"stage": stage, "message": message}
+        result.ok = False
+    note(
+        f"[cleanup] unlink={result.cleanup.get('plugin_unlink', 'skipped')}, "
+        f"session stop={result.cleanup.get('session_stop', 'not owned')}, "
+        f"delete={result.cleanup.get('session_delete', 'not owned')}"
+    )
+
+
+def smoke(
+    mode: str,
+    herdr_bin: str,
+    agent_cwd: Path,
+    timeout: float,
+    plugin_root: Path | None = None,
+    plugin_id: str | None = None,
+    expected_version: str | None = None,
+) -> SmokeResult:
+    session = f"{SESSION_PREFIX}{uuid.uuid4().hex}"
+    result = SmokeResult(
+        ok=False,
+        mode=mode,
+        plugin_id=plugin_id or INSTALLED_PLUGIN_ID,
+        session=session,
+        expected_version=expected_version,
+    )
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise StageError("usage", f"--timeout must be a positive finite number: {timeout!r}")
+    herdr = Herdr(herdr_bin, timeout)
+    session_owned = False
+    temp_dir: tempfile.TemporaryDirectory[str] | None = None
+    linked_temp_id: str | None = None
+    server: subprocess.Popen[str] | None = None
+    try:
+        if mode == "candidate":
+            temp_dir = tempfile.TemporaryDirectory(prefix="herdr-group-chat-smoke-")
+            temporary_id = f"{TEMP_ID_PREFIX}{unique_suffix()}"
+            result.temporary_plugin_id = temporary_id
+            copy_root = Path(temp_dir.name) / "plugin"
+            export_candidate(plugin_root, copy_root, herdr)
+            rewrite_manifest_id(copy_root / "herdr-plugin.toml", temporary_id)
+            note(f"[copy-candidate] exported the staged candidate as {temporary_id}")
+            result.stages_completed.extend(["export-candidate", "copy-candidate"])
+            verify_id = temporary_id
+        else:
+            verify_id = result.plugin_id
+
+        preflight_session_absent(herdr, session)
+        server = spawn_server(herdr, session)
+        session_owned = True
+        wait_ready(herdr, session, server)
+        result.stages_completed.append("start-session")
+        note(f"[start-session] named session {session} is ready")
+
+        if mode == "candidate":
+            preflight_plugin_absent(herdr, session, temporary_id)
+            # The link may have partially mutated the registry before it
+            # returns or fails, so the exact temporary id is owned for cleanup
+            # from this point on regardless of the link outcome.
+            linked_temp_id = temporary_id
+            herdr.run(["plugin", "link", str(copy_root)], session, stage="link-candidate")
+            note(f"[link-candidate] linked {temporary_id}")
+            result.stages_completed.append("link-candidate")
+            verify_registration(herdr, session, verify_id, None, copy_root, result)
+        else:
+            verify_registration(herdr, session, verify_id, expected_version, None, result)
+        result.stages_completed.append("verify-registration")
+        note(
+            f"[verify-registration] {verify_id} matches the exact action and pane contracts"
+            + (f", version {result.observed_version}" if result.observed_version else "")
+        )
+
+        caller_workspace_id, caller_tab_id = create_caller_workspace(herdr, session, agent_cwd)
+        result.caller_workspace_id = caller_workspace_id
+        result.stages_completed.append("create-caller-workspace")
+        verify_focus(herdr, session, caller_workspace_id, caller_tab_id)
+        note(f"[create-caller-workspace] caller workspace {caller_workspace_id} is focused")
+
+        previous_pane_id = ""
+        previous_tab_id = ""
+        for action, profile, participants in (
+            ("new", DEFAULT_PROFILE, DEFAULT_PARTICIPANTS),
+            ("new-classic", None, CLASSIC_PARTICIPANTS),
+        ):
+            run_action(herdr, session, verify_id, action)
+            result.stages_completed.append(f"launch-{action}")
+            note(f"[launch-{action}] invoked")
+            round_result = run_round(
+                herdr,
+                session,
+                caller_workspace_id,
+                caller_tab_id,
+                action,
+                profile,
+                participants,
+                previous_pane_id,
+                previous_tab_id,
+            )
+            previous_pane_id = round_result["room_id"]
+            previous_tab_id = round_result["room_tab_id"]
+            result.rooms.append(round_result)
+            result.stages_completed.append(f"round-{action}")
+            verify_focus(herdr, session, caller_workspace_id, caller_tab_id)
+            note(f"[round-{action}] exact replies from {', '.join(round_result['participants'])}")
+
+        result.ok = True
+        return result
+    except StageError as error:
+        result.error = {"stage": error.stage, "message": error.message}
+        note(f"[{error.stage}] FAILED: {error.message}")
+        return result
+    except Exception as error:  # converted into the stable JSON result
+        message = f"{type(error).__name__}: {error}"
+        result.error = {"stage": "internal", "message": message}
+        note(f"[internal] FAILED: {message}")
+        return result
+    finally:
+        cleanup(herdr, session, server, linked_temp_id, temp_dir, session_owned, result)
+
+
+class JsonArgumentParser(argparse.ArgumentParser):
+    """Argument parser whose usage failures become the stable JSON result."""
+
+    def error(self, message: str) -> None:
+        raise StageError("usage", message)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = JsonArgumentParser(prog="release-smoke", description=__doc__)
+    subparsers = parser.add_subparsers(dest="mode", required=True, parser_class=JsonArgumentParser)
+
+    def common(sub: argparse.ArgumentParser) -> None:
+        sub.add_argument("--agent-cwd", type=Path, required=True)
+        sub.add_argument("--timeout", type=float, default=300.0)
+        sub.add_argument(
+            "--herdr-bin",
+            default=os.environ.get("HERDR_BIN_PATH", "herdr"),
+            help="Herdr executable (default: HERDR_BIN_PATH or herdr)",
+        )
+
+    candidate = subparsers.add_parser(
+        "candidate", help="smoke a staged candidate checkout through a temporary plugin id"
+    )
+    candidate.add_argument("--plugin-root", type=Path, required=True)
+    common(candidate)
+
+    installed = subparsers.add_parser(
+        "installed", help="smoke the already-installed plugin without touching its registration"
+    )
+    installed.add_argument("--plugin-id", required=True)
+    installed.add_argument("--expected-version", required=True)
+    common(installed)
+    return parser
+
+
+def resolve_existing_directory(argument: str, value: Path) -> Path:
+    """Resolve an explicit directory path, distinguishing a missing path
+    (usage) from an unresolvable one such as a symlink loop (internal)."""
+    resolved = value.resolve()
+    if resolved.is_dir():
+        return resolved
+    try:
+        value.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise StageError("usage", f"{argument} is not a directory: {value}") from error
+    except (RuntimeError, OSError):
+        # Unresolvable path (symlink loop, permission fault): surface as the
+        # stable internal stage via main's unexpected-fault handler.
+        raise
+    raise StageError("usage", f"{argument} is not a directory: {value}")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    mode = "unknown"
+    plugin_id = INSTALLED_PLUGIN_ID
+    try:
+        args = build_parser().parse_args(argv)
+        mode = str(args.mode)
+        plugin_id = getattr(args, "plugin_id", None) or INSTALLED_PLUGIN_ID
+        agent_cwd = resolve_existing_directory("--agent-cwd", args.agent_cwd)
+        if mode == "candidate":
+            plugin_root = args.plugin_root.resolve()
+            if not (plugin_root / ".git").exists():
+                raise StageError("usage", f"--plugin-root is not a Git checkout: {plugin_root}")
+            result = smoke(
+                "candidate",
+                args.herdr_bin,
+                agent_cwd,
+                args.timeout,
+                plugin_root=plugin_root,
+            )
+        else:
+            result = smoke(
+                "installed",
+                args.herdr_bin,
+                agent_cwd,
+                args.timeout,
+                plugin_id=plugin_id,
+                expected_version=args.expected_version,
+            )
+    except StageError as error:
+        result = SmokeResult(
+            ok=False,
+            mode=mode,
+            plugin_id=plugin_id,
+            session="",
+            error={"stage": error.stage, "message": error.message},
+        )
+        note(f"[{error.stage}] FAILED: {error.message}")
+    except Exception as error:  # path resolution loops and other runtime faults
+        message = f"{type(error).__name__}: {error}"
+        result = SmokeResult(
+            ok=False,
+            mode=mode,
+            plugin_id=plugin_id,
+            session="",
+            error={"stage": "internal", "message": message},
+        )
+        note(f"[internal] FAILED: {message}")
+    print(result.to_json())
+    return 0 if result.ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

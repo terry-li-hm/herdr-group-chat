@@ -1,6 +1,6 @@
 [project]
 name = "herdr-group-chat"
-version = "0.10.4"
+version = "0.10.5"
 description = "A Herdr plugin for shared local rooms of full native AI coding agents."
 readme = "README.md"
 requires-python = ">=3.13"
@@ -30,7 +30,10 @@ select = ["E", "F", "I", "W", "B", "UP", "RUF", "SIM", "S"]
 
 [tool.ruff.lint.per-file-ignores]
 "assays/*" = ["S101"]
+"assays/test_release_smoke.py" = ["S101", "S603"]
 # The bootstrap executes only argv-based Herdr commands and its adjacent checked-in effector.
 "new-room" = ["S603", "S606"]
+# The smoke harness executes only argv-based Herdr and Git commands, never the room relay directly.
+"release-smoke" = ["S603", "S606"]
 # The adapter executes only argv-based Orca commands and its adjacent checked-in effector.
 "orca-group-chat" = ["S101", "S603", "S606"]
