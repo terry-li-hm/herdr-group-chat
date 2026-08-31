@@ -55,7 +55,7 @@ with a nonzero exit.
 
 # Installed plugin: verifies the exact version and never links or unlinks.
 ./release-smoke installed --plugin-id terry.herdr-group-chat \
-  --expected-version 0.10.5 --agent-cwd <isolated caller cwd>
+  --expected-version 0.10.6 --agent-cwd <isolated caller cwd>
 ```
 
 Each run starts a unique named Herdr session (its name is preflighted for
@@ -104,6 +104,15 @@ default session. Vivesca callers should create a
 `deleo --create-session-temp-dir` root and set `TMPDIR` inside it before
 running, so the internal candidate copy lands in the audited session temp
 root. See [RELEASING.md](RELEASING.md) for the release gate.
+
+The harness is built for offline deterministic assays: its core accepts
+injectable runtime dependencies for command execution, process spawning,
+monotonic time, and sleep, while production CLI runs always use the real
+primitives as definition-time defaults, so an injected fake cannot leak into a
+real smoke. The assays exercise the core in-process on a virtual clock with a
+fake Herdr runner and reserve black-box subprocess checks for the executable
+entrypoint, argparse/stable-JSON behavior, and the staged Git export
+boundaries; Git itself always runs for real.
 
 ## Hotkey
 

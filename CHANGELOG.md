@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## [0.10.6] - 2026-08-31
+
+- Refactor the `release-smoke` harness around injectable runtime
+  dependencies (command execution, process spawning, monotonic time, sleep)
+  with the real primitives bound as production defaults, so injected fakes
+  can never reach a CLI run. Rewrite the offline assays to exercise the core
+  in-process on a virtual clock with a fake Herdr command runner, cutting
+  the focused suite from roughly 164 seconds to under 3 seconds wall time
+  while preserving all 45 behavioral contracts and adding regressions for
+  the production-default and fake-leak guarantees (50 assays total). Only
+  the executable entrypoint, argparse/stable-JSON handling, and the staged
+  Git export boundaries remain black-box CLI checks. Add the harness
+  development discipline to RELEASING.md: probe real Herdr response shapes
+  before implementation, at most two model-led audit passes per patch,
+  focused checks during iteration with the full suite at milestones, and a
+  sub-30-second focused-suite budget.
+
 ## [0.10.5] - 2026-08-31
 
 - Add the deterministic `release-smoke` harness. `release-smoke candidate

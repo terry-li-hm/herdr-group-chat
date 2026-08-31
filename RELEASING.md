@@ -70,6 +70,30 @@
    plugin id.
 4. Commit the release candidate and create the annotated release tag.
 
+## Harness development discipline
+
+The harness core takes injectable runtime dependencies — command execution,
+process spawning, monotonic time, and sleep — with the real primitives as the
+production defaults, bound at definition time so an injected fake can never
+reach a CLI run. The offline assays drive the core in-process on a virtual
+clock and a fake Herdr runner, and keep only the minimum black-box CLI checks:
+the executable entrypoint, argparse/stable-JSON behavior, and the staged Git
+export boundaries. Git always runs for real.
+
+When changing the harness:
+
+- Probe the real Herdr response shapes against a live session before
+  implementing; never code against a guessed envelope, field name, or status
+  spelling.
+- Spend at most two model-led audit passes per patch on the harness. Beyond
+  that, extend the deterministic assays instead of re-reviewing prose.
+- While iterating, run the focused suite
+  (`python3 -m pytest assays/test_release_smoke.py -q`) and run the complete
+  project suite only at milestones.
+- Keep the focused suite under 30 seconds. If it drifts past that budget,
+  move the waiting behind the injectable runtime and the virtual clock rather
+  than adding real sleeps or extra subprocesses.
+
 ## Standing publication authority
 
 Terry granted standing release authority for the existing public personal

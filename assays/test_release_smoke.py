@@ -1,14 +1,27 @@
-"""Deterministic offline assays for the release-smoke harness."""
+"""Deterministic offline assays for the release-smoke harness.
+
+The core runs in-process against a virtual clock and a fake Herdr command
+runner, so every behavioral contract is exercised without real sleeps or
+spawns. Only the executable entrypoint, argparse/stable-JSON handling, and
+the staged Git export boundaries run as black-box CLI subprocesses. Git
+commands always dispatch to the real git executable, so the staged export
+path is exercised for real.
+"""
 
 from __future__ import annotations
 
+import inspect
+import io
 import json
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import dataclass
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
@@ -47,459 +60,556 @@ ROOM_PEERS = {
     "new-classic": ["pi-peer", "claude-peer", "codex-peer", "grok-peer"],
 }
 
-FAKE_HERDR = r"""#!/usr/bin/env python3
-ROOM_ROLES = {
-    "new": ["sol", "fable", "grok"],
-    "new-classic": ["pi", "claude", "codex", "grok"],
-}
-ROOM_PEERS = {
-    "new": ["sol-peer", "fable-peer", "grok46pi-peer"],
-    "new-classic": ["pi-peer", "claude-peer", "codex-peer", "grok-peer"],
-}
-import json
-import os
-import shutil
-import sys
-import threading
-import time
-from pathlib import Path
-
-argv = sys.argv[1:]
-home = Path(os.environ["FAKE_HERDR_HOME"])
-registry = home / "registry"
-state_path = home / "state.json"
-rooms_path = home / "rooms.json"
-socket_path = home / "herdr.sock"
-with open(os.environ["FAKE_HERDR_LOG"], "a") as log:
-    log.write(json.dumps(argv) + "\n")
-
-args = list(argv)
-session = None
-if args[:1] == ["--session"]:
-    session = args[1]
-    args = args[2:]
-cmd = args[0] if args else ""
-
-fail = os.environ.get("FAKE_HERDR_FAIL", "")
-if fail and " ".join(args[: len(fail.split())]) == fail:
-    if fail == "server":
-        time.sleep(0.05)
-        print("fake herdr injected failure", file=sys.stderr)
-        sys.exit(1)
-    print("fake herdr injected failure", file=sys.stderr)
-    sys.exit(1)
-
-slow_patterns = [
-    pattern
-    for pattern in os.environ.get("FAKE_HERDR_SLOW", "").split(";")
-    if pattern.strip()
-]
-if any(" ".join(args[: len(pattern.split())]) == pattern for pattern in slow_patterns):
-    time.sleep(float(os.environ.get("FAKE_HERDR_SLOW_SECONDS", "10")))
+# Virtual-time room lifecycles: the fake Herdr promotes a room purely from
+# elapsed virtual time, so polling loops spin without any real sleeping.
+WORKSPACES_AT = 0.15
+AGENTS_AT = 0.3
+READY_AT = 0.5
+REPLIES_AT = 0.4
+COMMAND_LATENCY = 0.16
 
 
-def load_state():
-    if state_path.exists():
-        return json.loads(state_path.read_text())
-    return {"rooms": 0, "stopped": [], "deleted": []}
+class VirtualClock:
+    """Monotonic clock whose sleep advances time instead of blocking."""
+
+    def __init__(self) -> None:
+        self.now = 10_000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += max(seconds, 0.0)
 
 
-def save_state(state):
-    state_path.write_text(json.dumps(state))
+class FakePopen:
+    """Popen-like handle for the spawned fake session server."""
+
+    def __init__(self, fake: FakeHerdr, session: str, returncode: int | None) -> None:
+        self._fake = fake
+        self._session = session
+        self.returncode = returncode
+
+    def _die(self, code: int) -> None:
+        if self.returncode is None:
+            self.returncode = code
+        self._fake.live_sessions.discard(self._session)
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self._die(-15)
+
+    def kill(self) -> None:
+        self._die(-9)
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        return self.returncode
 
 
-def load_rooms():
-    if rooms_path.exists():
-        return json.loads(rooms_path.read_text())
-    return {"rooms": []}
+class FakeHerdr:
+    """In-process port of the fake Herdr CLI, driven by the virtual clock.
 
+    Failure-injection flags mirror the old subprocess fake's environment
+    variables one for one; state (rooms, registry, sessions) persists across
+    runs within one test, exactly like the old on-disk JSON state.
+    """
 
-def save_rooms(rooms):
-    rooms_path.write_text(json.dumps(rooms))
-
-
-def envelope(payload):
-    print(json.dumps({"id": "cli:fake", "result": payload}))
-
-
-state = load_state()
-
-if cmd == "server":
-    socket_path.touch()
-    (home / f"server-{session}.pid").write_text(str(os.getpid()))
-    time.sleep(3600)
-    sys.exit(0)
-
-STAGES = ("invoked", "workspaces", "agents", "ready")
-
-
-def stage_index(room):
-    return STAGES.index(room.get("stage", "invoked"))
-
-
-def all_agents():
-    agents = []
-    seen = set()
-    # Peers are unique live agents: the most recent room owns the mapping and
-    # stale peers keep their earlier backstage workspace.
-    for room in reversed(load_rooms()["rooms"]):
-        if stage_index(room) < STAGES.index("agents"):
-            continue
-        for peer in room["peers"]:
-            if peer["name"] in seen:
-                continue
-            seen.add(peer["name"])
-            entry = {
-                "name": peer["name"],
-                "kind": "peer",
-                "workspace_id": room["agents_ws"],
-                "cwd": "/agent",
-            }
-            if stage_index(room) >= STAGES.index("ready"):
-                entry["agent_status"] = peer.get("status", "idle")
-            else:
-                entry["agent_status"] = "working"
-            agents.append(entry)
-    agents.reverse()
-    return agents
-
-
-if cmd == "workspace":
-    sub = args[1]
-    if sub == "list":
-        if os.environ.get("FAKE_HERDR_RUNTIME_MALFORMED"):
-            envelope({"workspaces": ["bogus"]})
-            sys.exit(0)
-        focused = state.get("focus", "caller")
-        workspaces = [
-            {
-                "workspace_id": "w-caller",
-                "label": "smoke caller",
-                "focused": focused == "caller",
-                "active_tab_id": "w-caller:t1",
-            }
-        ]
-        latest = load_rooms()["rooms"][-1] if load_rooms()["rooms"] else None
-        if latest and stage_index(latest) >= STAGES.index("workspaces"):
-            workspaces.extend(
-                [
-                    {
-                        "workspace_id": latest["chat_ws"],
-                        "label": "group-chat",
-                        "focused": focused == "group",
-                        "active_tab_id": f"{latest['chat_ws']}:t1",
-                    },
-                    {
-                        "workspace_id": latest["agents_ws"],
-                        "label": "agents · group-chat",
-                        "focused": False,
-                        "active_tab_id": f"{latest['agents_ws']}:t1",
-                    },
-                ]
+    def __init__(self, clock: VirtualClock, registry: Path, log: list[list[str]]) -> None:
+        self.clock = clock
+        self.registry = registry
+        self.log = log
+        self.rooms: list[dict[str, Any]] = []
+        self.linked: list[dict[str, Any]] = []
+        self.state: dict[str, Any] = {"rooms": 0, "stopped": [], "deleted": []}
+        self.live_sessions: set[str] = set()
+        # Injection flags.
+        self.fail = ""
+        self.slow: list[str] = []
+        self.slow_seconds = 10.0
+        self.malformed_workspaces = False
+        self.bad_json = False
+        self.preflight_fail = ""
+        self.id_collision = False
+        self.duplicate_action = False
+        self.focus_steal = ""
+        self.focus_steal_during_reply = False
+        self.system_error = ""
+        self.reply_mode = ""
+        self.reply_drop: set[str] = set()
+        self.reply_extra = ""
+        self.reply_duplicate = False
+        self.reply_prior_chatter = False
+        self.blocked_peer = ""
+        self.missing_peer = ""
+        self.reuse_tab = False
+        self.session_collision = False
+        self.delete_once = False
+        self._defaults = {
+            key: getattr(self, key)
+            for key in (
+                "fail",
+                "slow",
+                "slow_seconds",
+                "malformed_workspaces",
+                "bad_json",
+                "preflight_fail",
+                "id_collision",
+                "duplicate_action",
+                "focus_steal",
+                "focus_steal_during_reply",
+                "system_error",
+                "reply_mode",
+                "reply_drop",
+                "reply_extra",
+                "reply_duplicate",
+                "reply_prior_chatter",
+                "blocked_peer",
+                "missing_peer",
+                "reuse_tab",
+                "session_collision",
+                "delete_once",
             )
-        envelope({"workspaces": workspaces})
-    elif sub == "create":
-        state.setdefault("focus", "caller")
-        save_state(state)
-        envelope({"workspace": {"workspace_id": "w-caller", "active_tab_id": "w-caller:t1"}})
-    else:
-        print(f"unknown workspace subcommand {sub}", file=sys.stderr)
-        sys.exit(1)
-elif cmd == "agent":
-    sub = args[1]
-    if sub == "list":
-        envelope({"agents": all_agents()})
-    else:
-        print(f"unknown agent subcommand {sub}", file=sys.stderr)
-        sys.exit(1)
-elif cmd == "pane":
-    sub = args[1]
-    rooms = load_rooms()
-    if sub == "list":
-        workspace_id = args[args.index("--workspace") + 1]
-        panes = [
-            {
-                "pane_id": room["pane"],
-                "tab_id": room["tab"],
-                "label": "New group chat",
-                "workspace_id": room["chat_ws"],
-            }
-            for room in rooms["rooms"]
-            if stage_index(room) >= STAGES.index("ready") and room["chat_ws"] == workspace_id
-        ]
-        envelope({"panes": panes})
-    elif sub == "read":
-        pane_id = args[2]
-        room = next((r for r in rooms["rooms"] if r["pane"] == pane_id), None)
-        if room is None:
-            print(f"unknown pane {pane_id}", file=sys.stderr)
-            sys.exit(1)
-        print(room.get("text", ""))
-    elif sub == "send-text":
-        pane_id = args[2]
-        text = args[3]
-        room = next((r for r in rooms["rooms"] if r["pane"] == pane_id), None)
-        if room is None:
-            print(f"unknown pane {pane_id}", file=sys.stderr)
-            sys.exit(1)
-        room["pending_text"] = text
-        save_rooms(rooms)
-    elif sub == "send-keys":
-        pane_id = args[2]
-        keys = args[3:]
-        room = next((r for r in rooms["rooms"] if r["pane"] == pane_id), None)
-        if room is None:
-            print(f"unknown pane {pane_id}", file=sys.stderr)
-            sys.exit(1)
-        if "enter" in keys and room.get("pending_text"):
-            message = room.pop("pending_text")
-            room.setdefault("text", "")
-            room["text"] += f"human> {message}\n"
-            if os.environ.get("FAKE_HERDR_FOCUS_STEAL_DURING_REPLY"):
-                live_state = load_state()
-                live_state["focus"] = "group"
-                save_state(live_state)
-            system_mode = os.environ.get("FAKE_SYSTEM_ERROR", "")
-            if system_mode == "indent":
-                room["text"] += "  system> delivery failed for this round\n"
-            elif system_mode == "status":
-                room["text"] += "Delivery failed: @grok\n"
-            elif system_mode:
-                room["text"] += "system: delivery failed for this round\n"
-            save_rooms(rooms)
-            mode = os.environ.get("FAKE_REPLY_MODE", "")
-            drop = set(filter(None, os.environ.get("FAKE_REPLY_DROP", "").split(",")))
-            extra = os.environ.get("FAKE_REPLY_EXTRA", "")
-
-            def deliver():
-                rooms_now = load_rooms()
-                target = next(
-                    (r for r in rooms_now["rooms"] if r["pane"] == pane_id), None
-                )
-                if target is None:
-                    return
-                lines = []
-                for role in target["roles"]:
-                    if role in drop:
-                        continue
-                    if mode == "prefix":
-                        body = "ok: SMOKE-OK"
-                    elif mode == "suffix":
-                        body = f"SMOKE-OK from {role}"
-                    elif mode == "text":
-                        body = f"the smoke passed for {role}"
-                    elif mode == "explain":
-                        lines.append(f"{role}> SMOKE-OK")
-                        lines.append("because the smoke passed overall")
-                        continue
-                    else:
-                        body = "SMOKE-OK"
-                    lines.append(f"{role}> {body}")
-                    if os.environ.get("FAKE_REPLY_DUPLICATE") and role == target["roles"][0]:
-                        lines.append(f"{role}> {body}")
-                if extra:
-                    lines.append(f"{extra}> SMOKE-OK")
-                target["text"] += "\n".join(lines) + "\n"
-                save_rooms(rooms_now)
-
-            threading.Timer(0.4, deliver).start()
-        save_rooms(rooms)
-    else:
-        print(f"unknown pane subcommand {sub}", file=sys.stderr)
-        sys.exit(1)
-elif cmd == "plugin":
-    sub = args[1]
-    if sub == "link":
-        root = Path(args[2])
-        import tomllib
-
-        manifest = tomllib.loads((root / "herdr-plugin.toml").read_text())
-        target = registry / manifest["id"]
-        if target.exists():
-            shutil.rmtree(target)
-        shutil.copytree(root, target)
-        (target / ".link-source").write_text(str(root))
-        save_state(state)
-    elif sub == "unlink":
-        plugin_id = args[2]
-        target = registry / plugin_id
-        if not target.exists():
-            print(f"unknown plugin {plugin_id}", file=sys.stderr)
-            sys.exit(1)
-        shutil.rmtree(target)
-        save_state(state)
-    elif sub == "list":
-        if os.environ.get("FAKE_HERDR_BAD_JSON"):
-            print("this is not json")
-            sys.exit(0)
-        plugin_id = args[args.index("--plugin") + 1]
-        target = registry / plugin_id
-        if not target.exists():
-            mode = os.environ.get("FAKE_HERDR_PREFLIGHT_FAIL", "")
-            if mode == "json":
-                print("definitely not json")
-                sys.exit(0)
-            if mode == "transport":
-                print("connection refused", file=sys.stderr)
-                sys.exit(1)
-            if mode == "timeout":
-                time.sleep(30)
-            if os.environ.get("FAKE_HERDR_ID_COLLISION"):
-                envelope(
-                    {
-                        "plugins": [
-                            {
-                                "plugin_id": plugin_id,
-                                "version": "0.0.1",
-                                "actions": [],
-                                "panes": [],
-                                "plugin_root": str(registry / "other-root"),
-                            }
-                        ]
-                    }
-                )
-                sys.exit(0)
-            envelope({"plugins": []})
-            sys.exit(0)
-        import tomllib
-
-        manifest = tomllib.loads((target / "herdr-plugin.toml").read_text())
-        link_source = target / ".link-source"
-        plugin_root = link_source.read_text() if link_source.exists() else str(target)
-        actions = [
-            {"id": a["id"], "command": a["command"], "contexts": a["contexts"]}
-            for a in manifest["actions"]
-        ]
-        if os.environ.get("FAKE_HERDR_DUPLICATE_ACTION") and actions:
-            actions.append(dict(actions[0]))
-        envelope(
-            {
-                "plugins": [
-                    {
-                        "plugin_id": plugin_id,
-                        "version": manifest["version"],
-                        "actions": actions,
-                        "panes": [
-                            {"id": p["id"], "command": p["command"], "placement": p["placement"]}
-                            for p in manifest["panes"]
-                        ],
-                        "plugin_root": plugin_root,
-                    }
-                ]
-            }
-        )
-    elif sub == "action":
-        action = args[3]
-        state["rooms"] += 1
-        room_no = state["rooms"]
-        if os.environ.get("FAKE_HERDR_FOCUS_STEAL") == action:
-            state["focus"] = "group"
-        save_state(state)
-        roles = list(ROOM_ROLES[action])
-        peers = []
-        for peer in ROOM_PEERS[action]:
-            status = "idle"
-            if os.environ.get("FAKE_HERDR_BLOCKED_PEER") == peer:
-                status = "blocked"
-            if os.environ.get("FAKE_HERDR_MISSING_PEER") == peer:
-                continue
-            peers.append({"name": peer, "status": status})
-        tab = f"tab-room-{room_no}"
-        if os.environ.get("FAKE_HERDR_REUSE_TAB") and room_no > 1:
-            tab = f"tab-room-{room_no - 1}"
-        room = {
-            "no": room_no,
-            "action": action,
-            "stage": "invoked",
-            "chat_ws": f"w-chat-{room_no}",
-            "agents_ws": f"w-agents-{room_no}",
-            "pane": f"pane-room-{room_no}",
-            "tab": tab,
-            "roles": roles,
-            "peers": peers,
-            "text": "",
         }
-        rooms_now = load_rooms()
-        rooms_now["rooms"].append(room)
-        save_rooms(rooms_now)
 
-        def promote(stage_name):
-            rooms_now = load_rooms()
-            target = next(r for r in rooms_now["rooms"] if r["no"] == room_no)
-            target["stage"] = stage_name
-            if stage_name == "ready":
-                target["text"] = f"room {room_no} ready: " + " ".join(
-                    f"@{role}" for role in roles
-                ) + "\n"
-                if os.environ.get("FAKE_REPLY_PRIOR_CHATTER"):
-                    target["text"] += (
-                        f"\n{roles[0]}> old business from an earlier round\n"
-                        "because it looked similar\n"
-                        "human> an old question\n"
-                        f"{roles[-1]}> SMOKE-OK\n"
-                    )
-            save_rooms(rooms_now)
+    # -- plumbing ---------------------------------------------------------
+    def _ok(self, stdout: str = "") -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
 
-        threading.Timer(0.15, lambda: promote("workspaces")).start()
-        threading.Timer(0.3, lambda: promote("agents")).start()
-        threading.Timer(0.5, lambda: promote("ready")).start()
-    else:
-        print(f"unknown plugin subcommand {sub}", file=sys.stderr)
-        sys.exit(1)
-elif cmd == "session":
-    sub = args[1]
-    if sub == "list":
-        sessions = [
-            {
-                "name": "default",
-                "running": True,
-                "socket_path": str(socket_path),
-            }
-        ]
-        if session and (
-            (home / f"server-{session}.pid").exists()
-            or os.environ.get("FAKE_HERDR_SESSION_COLLISION")
-        ):
-            sessions.append({"name": session, "running": True, "socket_path": str(socket_path)})
-        print(json.dumps({"sessions": sessions}))
-    elif sub == "stop":
-        pid_file = home / f"server-{args[2]}.pid"
-        if pid_file.exists():
-            pid = int(pid_file.read_text())
-            try:
-                os.kill(pid, 15)
-            except ProcessLookupError:
-                pass
-            pid_file.unlink()
-        state["stopped"].append(args[2])
-        save_state(state)
-    elif sub == "delete":
-        pid_file = home / f"server-{args[2]}.pid"
-        attempts = state.setdefault("delete_attempts", {})
-        attempts[args[2]] = attempts.get(args[2], 0) + 1
-        save_state(state)
-        if os.environ.get("FAKE_HERDR_DELETE_ONCE") and attempts[args[2]] == 1:
-            print("transient delete failure", file=sys.stderr)
-            sys.exit(1)
-        if pid_file.exists():
-            pid = int(pid_file.read_text())
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                pid_file.unlink()
+    def _err(self, stderr: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 1, stdout="", stderr=stderr)
+
+    def _envelope(self, payload: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+        return self._ok(json.dumps({"id": "cli:fake", "result": payload}))
+
+    def stage_of(self, room: dict[str, Any]) -> str:
+        elapsed = self.clock.monotonic() - room["created"]
+        if elapsed >= READY_AT:
+            stage = "ready"
+        elif elapsed >= AGENTS_AT:
+            stage = "agents"
+        elif elapsed >= WORKSPACES_AT:
+            stage = "workspaces"
+        else:
+            stage = "invoked"
+        if stage == "ready" and not room.get("ready_done"):
+            room["ready_done"] = True
+            room["text"] += (
+                f"room {room['no']} ready: " + " ".join(f"@{role}" for role in room["roles"]) + "\n"
+            )
+            if self.reply_prior_chatter:
+                roles = room["roles"]
+                room["text"] += (
+                    f"\n{roles[0]}> old business from an earlier round\n"
+                    "because it looked similar\n"
+                    "human> an old question\n"
+                    f"{roles[-1]}> SMOKE-OK\n"
+                )
+        return stage
+
+    def _deliver(self, room: dict[str, Any]) -> None:
+        entered = room.get("entered")
+        if entered is None or room.get("delivered"):
+            return
+        if self.clock.monotonic() < entered + REPLIES_AT:
+            return
+        room["delivered"] = True
+        lines: list[str] = []
+        for role in room["roles"]:
+            if role in self.reply_drop:
+                continue
+            if self.reply_mode == "prefix":
+                body = "ok: SMOKE-OK"
+            elif self.reply_mode == "suffix":
+                body = f"SMOKE-OK from {role}"
+            elif self.reply_mode == "text":
+                body = f"the smoke passed for {role}"
+            elif self.reply_mode == "explain":
+                lines.append(f"{role}> SMOKE-OK")
+                lines.append("because the smoke passed overall")
+                continue
             else:
-                print("refusing to delete a running session", file=sys.stderr)
-                sys.exit(1)
-        state["deleted"].append(args[2])
-        save_state(state)
-        print(json.dumps({"deleted": True}))
-    else:
-        print(f"unknown session subcommand {sub}", file=sys.stderr)
-        sys.exit(1)
-else:
-    print(f"unknown command {cmd}", file=sys.stderr)
-    sys.exit(1)
-"""
+                body = "SMOKE-OK"
+            lines.append(f"{role}> {body}")
+            if self.reply_duplicate and role == room["roles"][0]:
+                lines.append(f"{role}> {body}")
+        if self.reply_extra:
+            lines.append(f"{self.reply_extra}> SMOKE-OK")
+        room["text"] += "\n".join(lines) + "\n"
+
+    def _room_by_pane(self, pane_id: str) -> dict[str, Any] | None:
+        return next((room for room in self.rooms if room["pane"] == pane_id), None)
+
+    def spawn(self, argv: list[str]) -> FakePopen:
+        """Popen for `herdr --session <s> server`."""
+        session = argv[argv.index("--session") + 1]
+        self.log.append(list(argv[1:]))
+        if self.fail == "server":
+            return FakePopen(self, session, 1)
+        self.live_sessions.add(session)
+        return FakePopen(self, session, None)
+
+    def call(
+        self, argv: list[str], timeout: float | None = None
+    ) -> subprocess.CompletedProcess[Any]:
+        self.log.append(list(argv[1:]))
+        args = list(argv[1:])
+        if args[:1] == ["--session"]:
+            args = args[2:]
+        cmd = args[0] if args else ""
+
+        if self.fail and " ".join(args[: len(self.fail.split())]) == self.fail:
+            return self._err("fake herdr injected failure")
+
+        # A real invocation pays subprocess latency plus any slow-command
+        # delay; both count against the caller's budget. When the budget is
+        # exhausted, only the remaining budget is spent before timing out.
+        cost = COMMAND_LATENCY
+        for pattern in self.slow:
+            if " ".join(args[: len(pattern.split())]) == pattern:
+                cost += self.slow_seconds
+                break
+        if (
+            self.preflight_fail == "timeout"
+            and cmd == "plugin"
+            and args[1:2] == ["list"]
+            and "--plugin" in args
+            and not (self.registry / args[args.index("--plugin") + 1]).exists()
+        ):
+            cost += 30.0
+        if timeout is not None and cost > timeout:
+            self.clock.sleep(timeout)
+            raise subprocess.TimeoutExpired(argv, timeout)
+        self.clock.sleep(cost)
+
+        if cmd == "workspace":
+            return self._workspace(args)
+        if cmd == "agent":
+            return self._agent(args)
+        if cmd == "pane":
+            return self._pane(args)
+        if cmd == "plugin":
+            return self._plugin(args)
+        if cmd == "session":
+            return self._session(args, argv)
+        return self._err(f"unknown command {cmd}")
+
+    # -- command groups ----------------------------------------------------
+    def _workspace(self, args: list[str]) -> subprocess.CompletedProcess[Any]:
+        sub = args[1]
+        if sub == "list":
+            if self.malformed_workspaces:
+                return self._envelope({"workspaces": ["bogus"]})
+            focused = self.state.get("focus", "caller")
+            workspaces = [
+                {
+                    "workspace_id": "w-caller",
+                    "label": "smoke caller",
+                    "focused": focused == "caller",
+                    "active_tab_id": "w-caller:t1",
+                }
+            ]
+            latest = self.rooms[-1] if self.rooms else None
+            if latest and self.stage_of(latest) != "invoked":
+                workspaces.extend(
+                    [
+                        {
+                            "workspace_id": latest["chat_ws"],
+                            "label": "group-chat",
+                            "focused": focused == "group",
+                            "active_tab_id": f"{latest['chat_ws']}:t1",
+                        },
+                        {
+                            "workspace_id": latest["agents_ws"],
+                            "label": "agents · group-chat",
+                            "focused": False,
+                            "active_tab_id": f"{latest['agents_ws']}:t1",
+                        },
+                    ]
+                )
+            return self._envelope({"workspaces": workspaces})
+        if sub == "create":
+            self.state.setdefault("focus", "caller")
+            return self._envelope(
+                {"workspace": {"workspace_id": "w-caller", "active_tab_id": "w-caller:t1"}}
+            )
+        return self._err(f"unknown workspace subcommand {sub}")
+
+    def _agent(self, args: list[str]) -> subprocess.CompletedProcess[Any]:
+        if args[1] != "list":
+            return self._err(f"unknown agent subcommand {args[1]}")
+        agents: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        # Peers are unique live agents: the most recent room owns the mapping
+        # and stale peers keep their earlier backstage workspace.
+        for room in reversed(self.rooms):
+            if self.stage_of(room) in ("invoked", "workspaces"):
+                continue
+            for peer in room["peers"]:
+                if peer["name"] in seen:
+                    continue
+                seen.add(peer["name"])
+                settled = self.stage_of(room) == "ready"
+                agents.append(
+                    {
+                        "name": peer["name"],
+                        "kind": "peer",
+                        "workspace_id": room["agents_ws"],
+                        "cwd": "/agent",
+                        "agent_status": peer.get("status", "idle") if settled else "working",
+                    }
+                )
+        agents.reverse()
+        return self._envelope({"agents": agents})
+
+    def _pane(self, args: list[str]) -> subprocess.CompletedProcess[Any]:
+        sub = args[1]
+        if sub == "list":
+            workspace_id = args[args.index("--workspace") + 1]
+            panes = [
+                {
+                    "pane_id": room["pane"],
+                    "tab_id": room["tab"],
+                    "label": "New group chat",
+                    "workspace_id": room["chat_ws"],
+                }
+                for room in self.rooms
+                if self.stage_of(room) == "ready" and room["chat_ws"] == workspace_id
+            ]
+            return self._envelope({"panes": panes})
+        if sub == "read":
+            room = self._room_by_pane(args[2])
+            if room is None:
+                return self._err(f"unknown pane {args[2]}")
+            self.stage_of(room)
+            self._deliver(room)
+            return self._ok(room.get("text", ""))
+        if sub == "send-text":
+            room = self._room_by_pane(args[2])
+            if room is None:
+                return self._err(f"unknown pane {args[2]}")
+            room["pending_text"] = args[3]
+            return self._ok()
+        if sub == "send-keys":
+            room = self._room_by_pane(args[2])
+            if room is None:
+                return self._err(f"unknown pane {args[2]}")
+            if "enter" in args[3:] and room.get("pending_text"):
+                message = room.pop("pending_text")
+                room.setdefault("text", "")
+                room["text"] += f"human> {message}\n"
+                room["entered"] = self.clock.monotonic()
+                if self.focus_steal_during_reply:
+                    self.state["focus"] = "group"
+                if self.system_error == "indent":
+                    room["text"] += "  system> delivery failed for this round\n"
+                elif self.system_error == "status":
+                    room["text"] += "Delivery failed: @grok\n"
+                elif self.system_error:
+                    room["text"] += "system: delivery failed for this round\n"
+            return self._ok()
+        return self._err(f"unknown pane subcommand {sub}")
+
+    def _plugin(self, args: list[str]) -> subprocess.CompletedProcess[Any]:
+        import tomllib
+
+        sub = args[1]
+        if sub == "link":
+            root = Path(args[2])
+            manifest = tomllib.loads((root / "herdr-plugin.toml").read_text())
+            target = self.registry / manifest["id"]
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(root, target)
+            (target / ".link-source").write_text(str(root))
+            # Snapshot the linked candidate at link time, before cleanup can
+            # delete the export, so staged-export evidence survives the run.
+            self.linked.append(
+                {
+                    "plugin_id": manifest["id"],
+                    "source": str(root),
+                    "files": sorted(
+                        str(item.relative_to(target))
+                        for item in target.rglob("*")
+                        if item.is_file() and item.name != ".link-source"
+                    ),
+                }
+            )
+            return self._ok()
+        if sub == "unlink":
+            plugin_id = args[2]
+            target = self.registry / plugin_id
+            if not target.exists():
+                return self._err(f"unknown plugin {plugin_id}")
+            shutil.rmtree(target)
+            return self._ok()
+        if sub == "list":
+            if self.bad_json:
+                return self._ok("this is not json")
+            plugin_id = args[args.index("--plugin") + 1]
+            target = self.registry / plugin_id
+            if not target.exists():
+                if self.preflight_fail == "json":
+                    return self._ok("definitely not json")
+                if self.preflight_fail == "transport":
+                    return self._err("connection refused")
+                if self.id_collision:
+                    return self._envelope(
+                        {
+                            "plugins": [
+                                {
+                                    "plugin_id": plugin_id,
+                                    "version": "0.0.1",
+                                    "actions": [],
+                                    "panes": [],
+                                    "plugin_root": str(self.registry / "other-root"),
+                                }
+                            ]
+                        }
+                    )
+                return self._envelope({"plugins": []})
+            manifest = tomllib.loads((target / "herdr-plugin.toml").read_text())
+            link_source = target / ".link-source"
+            plugin_root = link_source.read_text() if link_source.exists() else str(target)
+            actions = [
+                {"id": a["id"], "command": a["command"], "contexts": a["contexts"]}
+                for a in manifest["actions"]
+            ]
+            if self.duplicate_action and actions:
+                actions.append(dict(actions[0]))
+            return self._envelope(
+                {
+                    "plugins": [
+                        {
+                            "plugin_id": plugin_id,
+                            "version": manifest["version"],
+                            "actions": actions,
+                            "panes": [
+                                {
+                                    "id": p["id"],
+                                    "command": p["command"],
+                                    "placement": p["placement"],
+                                }
+                                for p in manifest["panes"]
+                            ],
+                            "plugin_root": plugin_root,
+                        }
+                    ]
+                }
+            )
+        if sub == "action":
+            action = args[3]
+            self.state["rooms"] += 1
+            room_no = self.state["rooms"]
+            if self.focus_steal == action:
+                self.state["focus"] = "group"
+            roles = list(ROOM_ROLES[action])
+            peers = []
+            for peer in ROOM_PEERS[action]:
+                status = "idle"
+                if self.blocked_peer == peer:
+                    status = "blocked"
+                if self.missing_peer == peer:
+                    continue
+                peers.append({"name": peer, "status": status})
+            tab = f"tab-room-{room_no}"
+            if self.reuse_tab and room_no > 1:
+                tab = f"tab-room-{room_no - 1}"
+            self.rooms.append(
+                {
+                    "no": room_no,
+                    "action": action,
+                    "stage": "invoked",
+                    "chat_ws": f"w-chat-{room_no}",
+                    "agents_ws": f"w-agents-{room_no}",
+                    "pane": f"pane-room-{room_no}",
+                    "tab": tab,
+                    "roles": roles,
+                    "peers": peers,
+                    "text": "",
+                    "created": self.clock.monotonic(),
+                }
+            )
+            return self._ok()
+        return self._err(f"unknown plugin subcommand {sub}")
+
+    def _session(self, args: list[str], argv: list[str]) -> subprocess.CompletedProcess[Any]:
+        sub = args[1]
+        session = argv[2] if len(argv) > 2 and argv[1] == "--session" else None
+        if sub == "list":
+            sessions = [{"name": "default", "running": True, "socket_path": "/fake/herdr.sock"}]
+            if session and (session in self.live_sessions or self.session_collision):
+                sessions.append(
+                    {"name": session, "running": True, "socket_path": "/fake/herdr.sock"}
+                )
+            return self._ok(json.dumps({"sessions": sessions}))
+        if sub == "stop":
+            self.live_sessions.discard(args[2])
+            self.state["stopped"].append(args[2])
+            return self._ok()
+        if sub == "delete":
+            attempts = self.state.setdefault("delete_attempts", {})
+            attempts[args[2]] = attempts.get(args[2], 0) + 1
+            if self.delete_once and attempts[args[2]] == 1:
+                return self._err("transient delete failure")
+            if args[2] in self.live_sessions:
+                return self._err("refusing to delete a running session")
+            self.state["deleted"].append(args[2])
+            return self._ok(json.dumps({"deleted": True}))
+        return self._err(f"unknown session subcommand {sub}")
+
+
+class FakeRuntime:
+    """Runtime whose Herdr commands hit the fake and Git commands hit reality."""
+
+    def __init__(self, fake: FakeHerdr, clock: VirtualClock, git_bin: str) -> None:
+        self.fake = fake
+        self.clock = clock
+        self.git_bin = git_bin
+        self.calls: list[list[str]] = []
+
+    def run(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+        if argv and argv[0] == self.git_bin:
+            return subprocess.run(argv, **kwargs)
+        self.calls.append(list(argv))
+        return self.fake.call(list(argv), kwargs.get("timeout"))
+
+    def popen(self, argv: list[str], **kwargs: Any) -> FakePopen:
+        self.calls.append(list(argv))
+        return self.fake.spawn(list(argv))
+
+    def monotonic(self) -> float:
+        return self.clock.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        self.clock.sleep(seconds)
+
+
+# Old environment-variable injection names, mapped to fake flags one for one.
+ENV_TO_FLAG = {
+    "FAKE_HERDR_FAIL": "fail",
+    "FAKE_HERDR_SLOW": "slow",
+    "FAKE_HERDR_SLOW_SECONDS": "slow_seconds",
+    "FAKE_HERDR_RUNTIME_MALFORMED": "malformed_workspaces",
+    "FAKE_HERDR_BAD_JSON": "bad_json",
+    "FAKE_HERDR_PREFLIGHT_FAIL": "preflight_fail",
+    "FAKE_HERDR_ID_COLLISION": "id_collision",
+    "FAKE_HERDR_DUPLICATE_ACTION": "duplicate_action",
+    "FAKE_HERDR_FOCUS_STEAL": "focus_steal",
+    "FAKE_HERDR_FOCUS_STEAL_DURING_REPLY": "focus_steal_during_reply",
+    "FAKE_SYSTEM_ERROR": "system_error",
+    "FAKE_REPLY_MODE": "reply_mode",
+    "FAKE_REPLY_DROP": "reply_drop",
+    "FAKE_REPLY_EXTRA": "reply_extra",
+    "FAKE_REPLY_DUPLICATE": "reply_duplicate",
+    "FAKE_REPLY_PRIOR_CHATTER": "reply_prior_chatter",
+    "FAKE_HERDR_BLOCKED_PEER": "blocked_peer",
+    "FAKE_HERDR_MISSING_PEER": "missing_peer",
+    "FAKE_HERDR_REUSE_TAB": "reuse_tab",
+    "FAKE_HERDR_SESSION_COLLISION": "session_collision",
+    "FAKE_HERDR_DELETE_ONCE": "delete_once",
+}
 
 
 def make_executable(path: Path, content: str) -> None:
@@ -567,22 +677,53 @@ def make_candidate_repo(path: Path, version: str = "0.10.5") -> Path:
     return root
 
 
+@dataclass
+class RunResult:
+    """One in-process harness run: the parsed stable JSON plus captured stderr."""
+
+    payload: dict[str, Any]
+    stderr: str
+    exit_code: int
+
+    @property
+    def returncode(self) -> int:
+        return self.exit_code
+
+
 class Harness:
-    """A fully faked, offline environment for running release-smoke end to end."""
+    """A fully faked, offline environment for running release-smoke in-process."""
 
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.tmp_path = tmp_path
         self.home = tmp_path / "fake-herdr"
-        self.bin_dir = tmp_path / "bin"
-        self.bin_dir.mkdir()
-        self.log = tmp_path / "commands.jsonl"
-        self.log.write_text("")
-        make_executable(self.bin_dir / "herdr", FAKE_HERDR)
         self.registry = self.home / "registry"
         self.agent_cwd = tmp_path / "agent-cwd"
         self.agent_cwd.mkdir()
-        monkeypatch.setenv("FAKE_HERDR_HOME", str(self.home))
-        monkeypatch.setenv("FAKE_HERDR_LOG", str(self.log))
+        self.log: list[list[str]] = []
+        self.clock = VirtualClock()
+        self.fake = FakeHerdr(self.clock, self.registry, self.log)
+        git_bin = shutil.which("git")
+        assert git_bin is not None, "git is required for these assays"
+        self.git_bin = git_bin
+        self.runtime = FakeRuntime(self.fake, self.clock, git_bin)
         monkeypatch.delenv("HERDR_ENV", raising=False)
+
+    def inject(self, env_extra: dict[str, str] | None) -> None:
+        # Injection flags last for exactly one run, like the old per-run env.
+        for key, value in self.fake._defaults.items():
+            setattr(self.fake, key, value)
+        for key, value in (env_extra or {}).items():
+            if key == "TMPDIR":
+                continue  # applied and restored by run_smoke itself
+            flag = ENV_TO_FLAG[key]
+            if flag == "slow":
+                self.fake.slow = [p.strip() for p in value.split(";") if p.strip()]
+            elif flag == "slow_seconds":
+                self.fake.slow_seconds = float(value)
+            elif flag == "reply_drop":
+                self.fake.reply_drop = {v for v in value.split(",") if v}
+            else:
+                setattr(self.fake, flag, value)
 
     def install_plugin(self, version: str = "0.10.5") -> Path:
         source = make_plugin_root(self.home / "source" / "installed", version)
@@ -598,71 +739,84 @@ class Harness:
             make_candidate_repo(self.home / "source" / "candidate", version)
         return self.home / "source" / "candidate"
 
-    def env(self, **extra: str) -> dict[str, str]:
-        env = {key: value for key, value in os.environ.items() if key != "HERDR_ENV"}
-        env.update(extra)
-        return env
+    def run_smoke(self, arguments: list[Any], env_extra: dict[str, str] | None = None) -> RunResult:
+        """Run module.smoke in-process with the fake runtime injected.
 
-    def run(
-        self, *arguments: str, env_extra: dict[str, str] | None = None
-    ) -> subprocess.CompletedProcess[str]:
-        env = self.env(**(env_extra or {}))
-        return subprocess.run(
-            [sys.executable, str(EFFECTOR), *arguments],
-            capture_output=True,
-            text=True,
-            errors="replace",
-            env=env,
-            timeout=180,
-            check=False,
-        )
+        An injected TMPDIR applies only inside this run; the inherited
+        environment value and the inherited tempfile.tempdir cache are
+        restored exactly afterward, even when the run fails.
+        """
+        inherited_env = os.environ.get("TMPDIR")
+        inherited_cache = tempfile.tempdir
+        injected = (env_extra or {}).get("TMPDIR")
+        buffer = io.StringIO()
+        try:
+            if injected is not None:
+                os.environ["TMPDIR"] = injected
+                # In-process tempfile caches its root; reset it so the run's
+                # internal candidate copy genuinely lands under the new root.
+                tempfile.tempdir = injected
+            self.inject(env_extra)
+            with redirect_stderr(buffer):
+                result = module.smoke(*arguments, runtime=self.runtime)
+            return RunResult(
+                payload=json.loads(result.to_json()),
+                stderr=buffer.getvalue(),
+                exit_code=0 if result.ok else 1,
+            )
+        finally:
+            if inherited_env is None:
+                os.environ.pop("TMPDIR", None)
+            else:
+                os.environ["TMPDIR"] = inherited_env
+            tempfile.tempdir = inherited_cache
 
     def run_candidate(
         self, env_extra: dict[str, str] | None = None, timeout: str = "30"
-    ) -> subprocess.CompletedProcess[str]:
-        return self.run(
-            "candidate",
-            "--plugin-root",
-            str(self.candidate_repo()),
-            "--agent-cwd",
-            str(self.agent_cwd),
-            "--timeout",
-            timeout,
-            "--herdr-bin",
-            str(self.bin_dir / "herdr"),
+    ) -> RunResult:
+        return self.run_smoke(
+            ["candidate", "herdr", self.agent_cwd, float(timeout), self.candidate_repo()],
             env_extra=env_extra,
         )
 
     def run_installed(
         self, version: str = "0.10.5", env_extra: dict[str, str] | None = None
-    ) -> subprocess.CompletedProcess[str]:
-        return self.run(
-            "installed",
-            "--plugin-id",
-            "terry.herdr-group-chat",
-            "--expected-version",
-            version,
-            "--agent-cwd",
-            str(self.agent_cwd),
-            "--timeout",
-            "30",
-            "--herdr-bin",
-            str(self.bin_dir / "herdr"),
+    ) -> RunResult:
+        return self.run_smoke(
+            [
+                "installed",
+                "herdr",
+                self.agent_cwd,
+                30.0,
+                None,
+                "terry.herdr-group-chat",
+                version,
+            ],
             env_extra=env_extra,
         )
 
+    def run_main(self, argv: list[str]) -> RunResult:
+        """Run module.main in-process, capturing the stable JSON from stdout."""
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = module.main(argv)
+        try:
+            payload = json.loads(out.getvalue())
+        except json.JSONDecodeError:
+            payload = {"ok": False, "error": {"stage": "internal", "message": out.getvalue()}}
+        return RunResult(payload=payload, stderr=err.getvalue(), exit_code=code)
+
     def commands(self) -> list[list[str]]:
-        return [json.loads(line) for line in self.log.read_text().splitlines() if line.strip()]
+        return list(self.log)
 
     def rooms(self) -> list[dict[str, Any]]:
-        path = self.home / "rooms.json"
-        if not path.exists():
-            return []
-        return json.loads(path.read_text())["rooms"]
+        return self.fake.rooms
+
+    def linked_snapshots(self) -> list[dict[str, Any]]:
+        return list(self.fake.linked)
 
     def state(self) -> dict[str, Any]:
-        path = self.home / "state.json"
-        return json.loads(path.read_text()) if path.exists() else {}
+        return self.fake.state
 
 
 @pytest.fixture
@@ -670,12 +824,12 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Harness:
     made = Harness(tmp_path, monkeypatch)
     made.install_plugin()
     made.candidate_repo()
-    return made
+    yield made
 
 
-def assert_candidate_ok(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+def assert_candidate_ok(result: RunResult) -> dict[str, Any]:
     assert result.returncode == 0, result.stderr
-    payload = json.loads(result.stdout)
+    payload = result.payload
     assert payload["ok"] is True
     assert payload["error"] is None
     assert payload["mode"] == "candidate"
@@ -697,40 +851,94 @@ def test_candidate_temporary_id_differs_from_installed(harness: Harness) -> None
 
 def test_candidate_uses_staged_git_export_only(harness: Harness) -> None:
     root = harness.candidate_repo()
+    (root / "tracked-room-marker").write_text("tracked\n")
+    git(root, "add", "tracked-room-marker")
     junk = root / "junk"
     junk.mkdir()
     (junk / "blob.bin").write_bytes(b"x" * 1024)
     assert_candidate_ok(harness.run_candidate())
+    snapshots = harness.linked_snapshots()
+    assert len(snapshots) == 1
+    files = snapshots[0]["files"]
+    # Only the staged Git index was exported and linked: tracked files are
+    # present, unstaged worktree junk never reaches the linked candidate.
+    assert "herdr-plugin.toml" in files
+    assert "tracked-room-marker" in files
+    assert "junk/blob.bin" not in files
+    assert not [name for name in files if name.startswith("junk/")]
 
 
-def test_export_rejects_escaping_and_absolute_symlinks(harness: Harness) -> None:
-    root = harness.candidate_repo()
-    os.symlink("../../outside", root / "escape")
-    git(root, "add", "-A")
-    result = harness.run_candidate()
+def test_export_rejects_escaping_and_absolute_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Black-box: the staged Git export boundary is proven through the real
+    # executable; the run fails inside the export before any Herdr call.
+    agent_cwd = tmp_path / "agent-cwd"
+    agent_cwd.mkdir()
+    repo = make_candidate_repo(tmp_path / "candidate")
+    monkeypatch.delenv("HERDR_ENV", raising=False)
+
+    def run() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(EFFECTOR),
+                "candidate",
+                "--plugin-root",
+                str(repo),
+                "--agent-cwd",
+                str(agent_cwd),
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
+
+    os.symlink("../../outside", repo / "escape")
+    git(repo, "add", "-A")
+    result = run()
     failure = json.loads(result.stdout)
     assert result.returncode == 1
     assert failure["error"]["stage"] == "export-candidate"
     assert "escaping symlink" in failure["error"]["message"]
 
-    escape = root / "escape"
+    escape = repo / "escape"
     escape.unlink()
     os.symlink("/etc/passwd", escape)
-    git(root, "add", "-A")
-    result = harness.run_candidate()
+    git(repo, "add", "-A")
+    result = run()
     failure = json.loads(result.stdout)
     assert result.returncode == 1
     assert failure["error"]["stage"] == "export-candidate"
     assert "absolute symlink" in failure["error"]["message"]
 
 
-def test_tmpdir_nested_under_plugin_root_does_not_recurse(harness: Harness) -> None:
+def test_tmpdir_nested_under_plugin_root_does_not_recurse(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Seed distinct inherited values for both the environment and the cached
+    # tempfile root so exact restoration is observable.
+    inherited_env = str(tmp_path / "inherited-env-tmp")
+    monkeypatch.setenv("TMPDIR", inherited_env)
+    inherited_cache = str(tmp_path / "inherited-cache-tmp")
+    monkeypatch.setattr(tempfile, "tempdir", inherited_cache)
     root = harness.candidate_repo()
     nested = root / "tmp"
     nested.mkdir(exist_ok=True)
     result = harness.run_candidate(env_extra={"TMPDIR": str(nested)}, timeout="60")
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["ok"] is True
+    assert result.payload["ok"] is True
+    # The link command saw the internal candidate copy inside the nested
+    # TMPDIR while it was active, proving the export really landed there.
+    links = [c for c in harness.commands() if c[2:4] == ["plugin", "link"]]
+    assert links and Path(links[0][4]).is_relative_to(nested)
+    # Owned cleanup removed the internal copy, and nothing leaks afterward.
+    assert not list(nested.glob("herdr-group-chat-smoke-*"))
+    # Both exact inherited values are restored after the run.
+    assert os.environ["TMPDIR"] == inherited_env
+    assert tempfile.tempdir == inherited_cache
 
 
 def test_exact_action_and_pane_validation(harness: Harness) -> None:
@@ -739,7 +947,7 @@ def test_exact_action_and_pane_validation(harness: Harness) -> None:
 
     result = harness.run_installed(version="0.9.9")
     assert result.returncode == 1
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert failure["ok"] is False
     assert failure["error"]["stage"] == "verify-registration"
     assert failure["observed_version"] == "0.10.5"
@@ -755,7 +963,7 @@ def test_wrong_action_command_fails_registration(harness: Harness) -> None:
     manifest.write_text(corrupted)
     git(root, "add", "-A")
     result = harness.run_candidate()
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "verify-registration"
     assert "'new'" in failure["error"]["message"]
@@ -769,7 +977,7 @@ def test_wrong_pane_contract_fails_registration(harness: Harness) -> None:
     manifest.write_text(corrupted)
     git(root, "add", "-A")
     result = harness.run_candidate()
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "verify-registration"
     assert "placement" in failure["error"]["message"]
@@ -777,7 +985,7 @@ def test_wrong_pane_contract_fails_registration(harness: Harness) -> None:
 
 def test_duplicate_action_ids_fail_registration(harness: Harness) -> None:
     result = harness.run_candidate(env_extra={"FAKE_HERDR_DUPLICATE_ACTION": "1"})
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "verify-registration"
     assert "duplicate action ids" in failure["error"]["message"]
@@ -786,7 +994,7 @@ def test_duplicate_action_ids_fail_registration(harness: Harness) -> None:
 
 def test_temporary_id_collision_is_rejected_before_ownership(harness: Harness) -> None:
     result = harness.run_candidate(env_extra={"FAKE_HERDR_ID_COLLISION": "1"})
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "link-candidate"
     assert "already registered" in failure["error"]["message"]
@@ -796,7 +1004,7 @@ def test_temporary_id_collision_is_rejected_before_ownership(harness: Harness) -
 
 def test_session_name_collision_is_rejected_before_spawn(harness: Harness) -> None:
     result = harness.run_candidate(env_extra={"FAKE_HERDR_SESSION_COLLISION": "1"})
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "start-session"
     assert "already exists" in failure["error"]["message"]
@@ -815,13 +1023,49 @@ def test_session_names_use_a_full_uuid_suffix(harness: Harness) -> None:
     int(suffix, 16)
 
 
+def test_fake_call_enforces_timeout_against_command_latency(tmp_path: Path) -> None:
+    clock = VirtualClock()
+    fake = FakeHerdr(clock, tmp_path / "registry", [])
+    before = clock.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        fake.call(["herdr", "session", "list", "--json"], timeout=0.1)
+    # Only the remaining budget is spent before the timeout fires.
+    assert clock.monotonic() - before == pytest.approx(0.1)
+
+
+def test_fake_call_charges_latency_and_slow_cost_within_budget(tmp_path: Path) -> None:
+    clock = VirtualClock()
+    fake = FakeHerdr(clock, tmp_path / "registry", [])
+    fake.slow = ["agent list"]
+    fake.slow_seconds = 1.0
+    before = clock.monotonic()
+    result = fake.call(["herdr", "--session", "s", "agent", "list"], timeout=2.0)
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["result"] == {"agents": []}
+    # Both the command latency and the slow-command delay are charged.
+    assert clock.monotonic() - before == pytest.approx(COMMAND_LATENCY + 1.0)
+
+    # The same combined cost against a budget of exactly that size fits.
+    before = clock.monotonic()
+    result = fake.call(["herdr", "--session", "s", "agent", "list"], timeout=COMMAND_LATENCY + 1.0)
+    assert result.returncode == 0
+    # One budget-second short, it times out after spending the budget.
+    before = clock.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        fake.call(
+            ["herdr", "--session", "s", "agent", "list"],
+            timeout=COMMAND_LATENCY + 1.0 - 0.001,
+        )
+    assert clock.monotonic() - before == pytest.approx(COMMAND_LATENCY + 1.0 - 0.001)
+
+
 def test_readiness_polls_live_surfaces_until_the_room_is_ready(harness: Harness) -> None:
-    started = time.monotonic()
+    started = harness.clock.monotonic()
     payload = assert_candidate_ok(harness.run_candidate())
     # Workspaces land at 0.15s, peers at 0.3s, the room pane at 0.5s per room,
     # so a passing run proves the harness polled every surface instead of
-    # reading partial state.
-    assert time.monotonic() - started >= 1.0
+    # reading partial state; two rooms cost at least a virtual second.
+    assert harness.clock.monotonic() - started >= 1.0
     assert [room["participants"] for room in payload["rooms"]] == [
         ["sol", "fable", "grok"],
         ["pi", "claude", "codex", "grok"],
@@ -839,9 +1083,12 @@ def test_blocked_and_missing_peers_time_out_bounded(harness: Harness) -> None:
     ):
         result = harness.run_candidate(env_extra=env_extra, timeout="2")
         assert result.returncode == 1, env_extra
-        failure = json.loads(result.stdout)
+        failure = result.payload
         assert failure["error"]["stage"] == expected_stage, env_extra
-        assert "never became ready" in failure["error"]["message"], env_extra
+        # The bounded round fails either at the explicit budget guard or at a
+        # command whose combined latency exceeds its remaining budget share.
+        message = failure["error"]["message"]
+        assert "never became ready" in message or "timed out" in message, env_extra
         # The failing round never started: no text was sent to its pane. Only
         # commands from this run's named session are considered.
         sends = [
@@ -878,7 +1125,7 @@ def test_replacement_requires_a_new_room_pane_identity(harness: Harness) -> None
 
 def test_focus_theft_fails_the_round_stage(harness: Harness) -> None:
     result = harness.run_candidate(env_extra={"FAKE_HERDR_FOCUS_STEAL": "new"})
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "round-new"
     assert (
@@ -889,7 +1136,7 @@ def test_focus_theft_fails_the_round_stage(harness: Harness) -> None:
 
 def test_visible_system_delivery_error_fails_immediately(harness: Harness) -> None:
     result = harness.run_candidate(env_extra={"FAKE_SYSTEM_ERROR": "1"})
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "round-new"
     assert "system error" in failure["error"]["message"]
@@ -897,20 +1144,20 @@ def test_visible_system_delivery_error_fails_immediately(harness: Harness) -> No
 
 def test_reply_validation_fails_closed(harness: Harness) -> None:
     missing = harness.run_candidate(env_extra={"FAKE_REPLY_DROP": "grok"})
-    failure = json.loads(missing.stdout)
+    failure = missing.payload
     assert missing.returncode == 1
     assert failure["error"]["stage"] == "round-new"
     assert "missing exact replies" in failure["error"]["message"]
     assert "grok" in failure["error"]["message"]
 
     extra = harness.run_candidate(env_extra={"FAKE_REPLY_EXTRA": "intruder"})
-    failure = json.loads(extra.stdout)
+    failure = extra.payload
     assert extra.returncode == 1
     assert "unexpected participant reply" in failure["error"]["message"]
 
     for mode in ("prefix", "suffix", "text"):
         result = harness.run_candidate(env_extra={"FAKE_REPLY_MODE": mode})
-        failure = json.loads(result.stdout)
+        failure = result.payload
         assert result.returncode == 1, mode
         assert failure["error"]["stage"] == "round-new", mode
         message = failure["error"]["message"]
@@ -942,7 +1189,7 @@ def test_candidate_commands_are_session_scoped_and_never_use_default(harness: Ha
 def test_installed_mode_never_links_or_unlinks(harness: Harness) -> None:
     result = harness.run_installed()
     assert result.returncode == 0, result.stderr
-    payload = json.loads(result.stdout)
+    payload = result.payload
     assert payload["ok"] is True
     assert payload["temporary_plugin_id"] is None
     commands = harness.commands()
@@ -962,7 +1209,7 @@ def test_session_stop_and_delete_on_success_and_failure(harness: Harness) -> Non
     result = harness.run_candidate(
         env_extra={"FAKE_HERDR_FAIL": "plugin action invoke new-classic"}
     )
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "launch-new-classic"
     assert failure["cleanup"]["session_stop"] == "ok"
@@ -979,7 +1226,7 @@ def test_cleanup_order_is_unlink_then_session_stop_and_delete(harness: Harness) 
 
 def test_ambiguous_server_startup_failure_cleans_the_session(harness: Harness) -> None:
     result = harness.run_candidate(env_extra={"FAKE_HERDR_FAIL": "server"})
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "start-session"
     assert failure["cleanup"]["session_stop"] == "ok"
@@ -989,7 +1236,7 @@ def test_ambiguous_server_startup_failure_cleans_the_session(harness: Harness) -
 
 def test_ambiguous_link_failure_still_attempts_exact_temp_id_unlink(harness: Harness) -> None:
     result = harness.run_candidate(env_extra={"FAKE_HERDR_FAIL": "plugin link"})
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "link-candidate"
     unlinks = [c for c in harness.commands() if c[2:4] == ["plugin", "unlink"]]
@@ -1000,7 +1247,7 @@ def test_ambiguous_link_failure_still_attempts_exact_temp_id_unlink(harness: Har
 
 def test_cleanup_failure_turns_success_into_named_failure(harness: Harness) -> None:
     result = harness.run_candidate(env_extra={"FAKE_HERDR_FAIL": "plugin unlink"})
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["rooms"] and failure["stages_completed"][-1] == "round-new-classic"
     assert failure["error"]["stage"] == "cleanup-link"
@@ -1009,7 +1256,7 @@ def test_cleanup_failure_turns_success_into_named_failure(harness: Harness) -> N
     assert failure["cleanup"]["session_delete"] == "ok"
 
     stop = harness.run_candidate(env_extra={"FAKE_HERDR_FAIL": "session stop"})
-    failure = json.loads(stop.stdout)
+    failure = stop.payload
     session = failure["session"]
     assert stop.returncode == 1
     assert failure["error"]["stage"] == "cleanup-session-stop"
@@ -1020,7 +1267,7 @@ def test_cleanup_failure_turns_success_into_named_failure(harness: Harness) -> N
 
     retry = harness.run_candidate(env_extra={"FAKE_HERDR_DELETE_ONCE": "1"})
     assert retry.returncode == 0, retry.stderr
-    retry_payload = json.loads(retry.stdout)
+    retry_payload = retry.payload
     assert retry_payload["cleanup"]["session_delete"] == "ok (after retry)"
     retry_deletes = [
         c for c in harness.commands() if c[2:5] == ["session", "delete", retry_payload["session"]]
@@ -1028,7 +1275,7 @@ def test_cleanup_failure_turns_success_into_named_failure(harness: Harness) -> N
     assert len(retry_deletes) == 2
 
     delete = harness.run_candidate(env_extra={"FAKE_HERDR_FAIL": "session delete"})
-    failure = json.loads(delete.stdout)
+    failure = delete.payload
     assert delete.returncode == 1
     assert failure["error"]["stage"] == "cleanup-session-delete"
 
@@ -1036,7 +1283,7 @@ def test_cleanup_failure_turns_success_into_named_failure(harness: Harness) -> N
 def test_stable_json_and_exit_behavior(harness: Harness) -> None:
     result = harness.run_candidate()
     assert result.returncode == 0
-    payload = json.loads(result.stdout)
+    payload = result.payload
     assert set(payload) == {
         "ok",
         "mode",
@@ -1056,58 +1303,67 @@ def test_stable_json_and_exit_behavior(harness: Harness) -> None:
 
     other = harness.run_installed()
     assert other.returncode == 0
-    assert json.loads(other.stdout)["session"] != payload["session"]
+    assert other.payload["session"] != payload["session"]
 
 
 def test_invalid_json_output_preserves_the_requested_stage(harness: Harness) -> None:
     result = harness.run_installed(env_extra={"FAKE_HERDR_BAD_JSON": "1"})
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "verify-registration"
     assert "invalid JSON" in failure["error"]["message"]
 
 
 def test_invalid_paths_emit_stable_json(harness: Harness) -> None:
-    result = harness.run(
-        "candidate",
-        "--plugin-root",
-        str(harness.home / "nonexistent"),
-        "--agent-cwd",
-        str(harness.agent_cwd),
-        "--herdr-bin",
-        str(harness.bin_dir / "herdr"),
+    result = harness.run_main(
+        [
+            "candidate",
+            "--plugin-root",
+            str(harness.home / "nonexistent"),
+            "--agent-cwd",
+            str(harness.agent_cwd),
+        ]
     )
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["ok"] is False
     assert failure["error"]["stage"] == "usage"
     assert "Git checkout" in failure["error"]["message"]
 
-    bad_cwd = harness.run(
-        "candidate",
-        "--plugin-root",
-        str(harness.candidate_repo()),
-        "--agent-cwd",
-        str(harness.home / "missing-cwd"),
-        "--herdr-bin",
-        str(harness.bin_dir / "herdr"),
+    bad_cwd = harness.run_main(
+        [
+            "candidate",
+            "--plugin-root",
+            str(harness.candidate_repo()),
+            "--agent-cwd",
+            str(harness.home / "missing-cwd"),
+        ]
     )
-    failure = json.loads(bad_cwd.stdout)
+    failure = bad_cwd.payload
     assert bad_cwd.returncode == 1
     assert failure["error"]["stage"] == "usage"
     assert "agent-cwd" in failure["error"]["message"]
 
 
-def test_malformed_invocations_emit_stable_json(harness: Harness) -> None:
+def test_malformed_invocations_emit_stable_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Black-box: argparse and the stable JSON contract are proven through the
+    # real executable; every case fails in argument handling before any Herdr
+    # subprocess could run.
+    agent_cwd = tmp_path / "agent-cwd"
+    agent_cwd.mkdir()
+    repo = make_candidate_repo(tmp_path / "candidate")
+    monkeypatch.delenv("HERDR_ENV", raising=False)
     cases = [
-        ("candidate", "--agent-cwd", str(harness.agent_cwd)),
-        ("candidate", "--plugin-root", str(harness.candidate_repo())),
+        ("candidate", "--agent-cwd", str(agent_cwd)),
+        ("candidate", "--plugin-root", str(repo)),
         (
             "candidate",
             "--plugin-root",
-            str(harness.candidate_repo()),
+            str(repo),
             "--agent-cwd",
-            str(harness.agent_cwd),
+            str(agent_cwd),
             "--timeout",
             "not-a-number",
         ),
@@ -1116,12 +1372,19 @@ def test_malformed_invocations_emit_stable_json(harness: Harness) -> None:
             "--plugin-id",
             "terry.herdr-group-chat",
             "--agent-cwd",
-            str(harness.agent_cwd),
+            str(agent_cwd),
         ),
         ("bogus-subcommand",),
     ]
     for case in cases:
-        result = harness.run(*case)
+        result = subprocess.run(
+            [sys.executable, str(EFFECTOR), *case],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
         assert result.returncode == 1, case
         failure = json.loads(result.stdout)
         assert failure["ok"] is False, case
@@ -1131,7 +1394,7 @@ def test_malformed_invocations_emit_stable_json(harness: Harness) -> None:
 
 def test_malformed_runtime_reports_the_internal_stage(harness: Harness) -> None:
     result = harness.run_candidate(env_extra={"FAKE_HERDR_RUNTIME_MALFORMED": "1"})
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "internal"
 
@@ -1146,7 +1409,7 @@ def test_preflight_fails_closed_on_any_herdr_failure(harness: Harness) -> None:
     for mode in ("json", "transport", "timeout"):
         result = harness.run_candidate(env_extra={"FAKE_HERDR_PREFLIGHT_FAIL": mode}, timeout="2")
         assert result.returncode == 1, mode
-        failure = json.loads(result.stdout)
+        failure = result.payload
         assert failure["error"]["stage"] == "link-candidate", mode
         assert (
             "cannot prove" not in failure["error"]["message"]
@@ -1167,7 +1430,7 @@ def test_preflight_accepts_only_an_exact_empty_list(harness: Harness) -> None:
 
 def test_explanatory_reply_after_marker_line_fails(harness: Harness) -> None:
     result = harness.run_candidate(env_extra={"FAKE_REPLY_MODE": "explain"})
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "round-new"
     assert "not exactly SMOKE-OK" in failure["error"]["message"]
@@ -1182,7 +1445,7 @@ def test_system_error_detection_normalizes_whitespace_and_status_rows(
         ("1", "system error"),
     ):
         result = harness.run_candidate(env_extra={"FAKE_SYSTEM_ERROR": mode})
-        failure = json.loads(result.stdout)
+        failure = result.payload
         assert result.returncode == 1, mode
         assert failure["error"]["stage"] == "round-new", mode
         assert fragment in failure["error"]["message"], mode
@@ -1190,7 +1453,7 @@ def test_system_error_detection_normalizes_whitespace_and_status_rows(
 
 def test_tab_reuse_blocks_replacement_readiness(harness: Harness) -> None:
     result = harness.run_candidate(env_extra={"FAKE_HERDR_REUSE_TAB": "1"}, timeout="3")
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "round-new-classic"
     assert "never became ready" in failure["error"]["message"]
@@ -1199,19 +1462,22 @@ def test_tab_reuse_blocks_replacement_readiness(harness: Harness) -> None:
 
 
 def test_timeout_is_a_wall_clock_budget(harness: Harness) -> None:
-    started = time.monotonic()
+    started = harness.clock.monotonic()
     result = harness.run_candidate(env_extra={"FAKE_HERDR_SLOW": "agent list"}, timeout="2")
-    elapsed = time.monotonic() - started
-    failure = json.loads(result.stdout)
+    virtual_elapsed = harness.clock.monotonic() - started
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "round-new"
     assert "timed out" in failure["error"]["message"]
-    assert elapsed < 6, elapsed
+    # The whole 2-second round budget was consumed, bounded by the fixed
+    # startup and cleanup command latency on either side of it.
+    assert virtual_elapsed >= 2.0
+    assert virtual_elapsed < 2.0 + 16 * COMMAND_LATENCY
 
 
 def test_transient_focus_theft_during_reply_polling_fails(harness: Harness) -> None:
     result = harness.run_candidate(env_extra={"FAKE_HERDR_FOCUS_STEAL_DURING_REPLY": "1"})
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "round-new"
     message = failure["error"]["message"]
@@ -1220,19 +1486,19 @@ def test_transient_focus_theft_during_reply_polling_fails(harness: Harness) -> N
 
 def test_invalid_timeouts_are_rejected_in_stable_json(harness: Harness) -> None:
     for value in ("inf", "nan", "0", "-5"):
-        result = harness.run(
-            "candidate",
-            "--plugin-root",
-            str(harness.candidate_repo()),
-            "--agent-cwd",
-            str(harness.agent_cwd),
-            "--timeout",
-            value,
-            "--herdr-bin",
-            str(harness.bin_dir / "herdr"),
+        result = harness.run_main(
+            [
+                "candidate",
+                "--plugin-root",
+                str(harness.candidate_repo()),
+                "--agent-cwd",
+                str(harness.agent_cwd),
+                "--timeout",
+                value,
+            ]
         )
         assert result.returncode == 1, value
-        failure = json.loads(result.stdout)
+        failure = result.payload
         assert failure["ok"] is False, value
         assert failure["error"]["stage"] == "usage", value
         assert "timeout" in failure["error"]["message"], value
@@ -1241,16 +1507,16 @@ def test_invalid_timeouts_are_rejected_in_stable_json(harness: Harness) -> None:
 def test_symlink_loop_reports_the_internal_stage(harness: Harness, tmp_path: Path) -> None:
     loop = tmp_path / "loop"
     loop.symlink_to(loop)
-    result = harness.run(
-        "candidate",
-        "--plugin-root",
-        str(harness.candidate_repo()),
-        "--agent-cwd",
-        str(loop),
-        "--herdr-bin",
-        str(harness.bin_dir / "herdr"),
+    result = harness.run_main(
+        [
+            "candidate",
+            "--plugin-root",
+            str(harness.candidate_repo()),
+            "--agent-cwd",
+            str(loop),
+        ]
     )
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["ok"] is False
     assert failure["error"]["stage"] == "internal"
@@ -1259,7 +1525,7 @@ def test_symlink_loop_reports_the_internal_stage(harness: Harness, tmp_path: Pat
 def test_budget_is_recomputed_before_each_sequential_command(harness: Harness) -> None:
     # Two different sequential commands each delay 1.2s against a 2s budget:
     # reusing one stale budget would let the second run to 2.4s and beyond.
-    started = time.monotonic()
+    started = harness.clock.monotonic()
     result = harness.run_candidate(
         env_extra={
             "FAKE_HERDR_SLOW": "workspace list;agent list",
@@ -1267,14 +1533,16 @@ def test_budget_is_recomputed_before_each_sequential_command(harness: Harness) -
         },
         timeout="2",
     )
-    elapsed = time.monotonic() - started
-    failure = json.loads(result.stdout)
+    virtual_elapsed = harness.clock.monotonic() - started
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "round-new"
     assert "timed out" in failure["error"]["message"]
-    # Startup (export, boot probe, settle) costs a little over a second; a
-    # stale reused budget would instead let this run stretch past 10 seconds.
-    assert elapsed < 8, elapsed
+    # The slowed startup commands are charged in full, the round budget is
+    # enforced, and a stale reused budget - letting the second slow command
+    # run to completion - would add its full 1.36s past this bound.
+    assert virtual_elapsed >= 2.0
+    assert virtual_elapsed < 7.0
 
 
 def test_prior_role_chatter_does_not_poison_a_valid_reply(harness: Harness) -> None:
@@ -1287,10 +1555,111 @@ def test_prior_role_chatter_does_not_poison_a_valid_reply(harness: Harness) -> N
 
 def test_duplicate_post_marker_reply_fails(harness: Harness) -> None:
     result = harness.run_candidate(env_extra={"FAKE_REPLY_DUPLICATE": "1"})
-    failure = json.loads(result.stdout)
+    failure = result.payload
     assert result.returncode == 1
     assert failure["error"]["stage"] == "round-new"
     assert "replied 2 times" in failure["error"]["message"]
+
+
+def test_production_runtime_is_the_default() -> None:
+    assert module.REAL_RUNTIME.run is subprocess.run
+    assert module.REAL_RUNTIME.popen is subprocess.Popen
+    assert module.REAL_RUNTIME.monotonic is time.monotonic
+    assert module.REAL_RUNTIME.sleep is time.sleep
+    signatures = (
+        inspect.signature(module.Herdr.__init__).parameters["runtime"].default,
+        inspect.signature(module.smoke).parameters["runtime"].default,
+        inspect.signature(module._main).parameters["runtime"].default,
+        inspect.signature(module._cli).parameters["runtime"].default,
+    )
+    for default in signatures:
+        assert default is module.REAL_RUNTIME
+    # The public entrypoint exposes no runtime injection of any kind.
+    assert set(inspect.signature(module.main).parameters) == {"argv"}
+
+
+def test_private_main_seam_runs_end_to_end_on_the_fake_runtime(harness: Harness) -> None:
+    # The private serialization seam accepts an injected runtime, so the full
+    # CLI path - argparse, stages, cleanup, and the stable JSON print - runs
+    # in-process and succeeds on the fake.
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = module._main(
+            [
+                "candidate",
+                "--plugin-root",
+                str(harness.candidate_repo()),
+                "--agent-cwd",
+                str(harness.agent_cwd),
+                "--herdr-bin",
+                "herdr",
+            ],
+            runtime=harness.runtime,
+        )
+    raw = out.getvalue()
+    payload = json.loads(raw)
+    assert code == 0
+    assert payload["ok"] is True
+    assert payload["error"] is None
+    assert len(payload["rooms"]) == 2
+    # Raw stdout is exactly the canonical stable JSON object.
+    assert raw.strip() == json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    assert err.getvalue().strip()
+
+
+def test_fake_runtime_cannot_leak_into_cli_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Swap the module-level runtime name for a recording fake: the CLI path
+    # must still execute real subprocesses, because the production defaults
+    # are bound at definition time and never re-read from the module global.
+    agent_cwd = tmp_path / "agent-cwd"
+    agent_cwd.mkdir()
+    repo = make_candidate_repo(tmp_path / "candidate")
+    marker = tmp_path / "real-subprocess-ran"
+    sentinel = tmp_path / "herdr-sentinel"
+    make_executable(
+        sentinel,
+        '#!/bin/sh\ntouch "$SMOKE_SENTINEL_MARKER"\nexit 0\n',
+    )
+    monkeypatch.delenv("HERDR_ENV", raising=False)
+    monkeypatch.setenv("SMOKE_SENTINEL_MARKER", str(marker))
+    recording: list[list[str]] = []
+
+    class RecordingRuntime:
+        def run(self, argv, **kwargs):
+            recording.append(list(argv))
+            raise AssertionError("fake runtime must not execute CLI commands")
+
+        def popen(self, argv, **kwargs):
+            recording.append(list(argv))
+            raise AssertionError("fake runtime must not spawn CLI processes")
+
+        def monotonic(self):
+            return 0.0
+
+        def sleep(self, seconds):
+            return None
+
+    monkeypatch.setattr(module, "REAL_RUNTIME", RecordingRuntime())
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = module.main(
+            [
+                "candidate",
+                "--plugin-root",
+                str(repo),
+                "--agent-cwd",
+                str(agent_cwd),
+                "--herdr-bin",
+                str(sentinel),
+            ]
+        )
+    payload = json.loads(out.getvalue())
+    assert marker.is_file(), "the CLI executed a real subprocess, not the fake runtime"
+    assert recording == []
+    assert code == 1
+    assert payload["ok"] is False
 
 
 def test_help() -> None:

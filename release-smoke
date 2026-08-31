@@ -32,7 +32,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
 INSTALLED_PLUGIN_ID = "terry.herdr-group-chat"
 ACTION_CONTEXTS = ("workspace", "tab", "pane")
@@ -82,6 +82,30 @@ SETTLE_SECONDS = 0.2
 GIT_TREE_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
+@dataclass(frozen=True)
+class Runtime:
+    """Injectable execution primitives for the harness.
+
+    Production uses REAL_RUNTIME everywhere: real argv subprocesses, real
+    process spawning, and the real monotonic clock and sleep. Assays inject a
+    virtual-clock fake; the defaults below are bound at definition time so a
+    swapped module-level name can never leak into a CLI run.
+    """
+
+    run: Callable[..., subprocess.CompletedProcess[Any]]
+    popen: Callable[..., subprocess.Popen[Any]]
+    monotonic: Callable[[], float]
+    sleep: Callable[[float], None]
+
+
+REAL_RUNTIME = Runtime(
+    run=subprocess.run,
+    popen=subprocess.Popen,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+)
+
+
 class StageError(Exception):
     """A named smoke stage failed; cleanup must still run."""
 
@@ -124,9 +148,10 @@ class Herdr:
     Every call names its own stage; there is no ambient stage fallback.
     """
 
-    def __init__(self, herdr_bin: str, timeout: float) -> None:
+    def __init__(self, herdr_bin: str, timeout: float, runtime: Runtime = REAL_RUNTIME) -> None:
         self.herdr_bin = herdr_bin
         self.timeout = timeout
+        self.runtime = runtime
 
     @staticmethod
     def failing(stage: str, message: str) -> StageError:
@@ -149,7 +174,7 @@ class Herdr:
     ) -> subprocess.CompletedProcess[str]:
         argv = self.session_argv(session, arguments)
         try:
-            result = subprocess.run(
+            result = self.runtime.run(
                 argv,
                 capture_output=True,
                 text=True,
@@ -203,10 +228,10 @@ class Herdr:
         return self.run(arguments, session, stage=stage, timeout=timeout).stdout.strip()
 
 
-def spawn_server(herdr: Herdr, session: str) -> subprocess.Popen[str]:
+def spawn_server(herdr: Herdr, session: str) -> Any:
     """Spawn the named session's headless server; ownership starts here."""
     try:
-        return subprocess.Popen(
+        return herdr.runtime.popen(
             [herdr.herdr_bin, "--session", session, "server"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -216,16 +241,16 @@ def spawn_server(herdr: Herdr, session: str) -> subprocess.Popen[str]:
         raise StageError("start-session", f"the session server failed to spawn: {error}") from error
 
 
-def wait_ready(herdr: Herdr, session: str, server: subprocess.Popen[str]) -> None:
+def wait_ready(herdr: Herdr, session: str, server: Any) -> None:
     """Wait until the named session's API socket answers a read-only probe."""
-    deadline = time.monotonic() + herdr.timeout
-    while time.monotonic() < deadline:
+    deadline = herdr.runtime.monotonic() + herdr.timeout
+    while herdr.runtime.monotonic() < deadline:
         if server.poll() is not None:
             raise StageError(
                 "start-session", f"the session server exited early ({server.returncode})"
             )
         try:
-            probe = subprocess.run(
+            probe = herdr.runtime.run(
                 [herdr.herdr_bin, "--session", session, "workspace", "list"],
                 capture_output=True,
                 text=True,
@@ -239,13 +264,13 @@ def wait_ready(herdr: Herdr, session: str, server: subprocess.Popen[str]) -> Non
             # A probe success is not readiness on its own: the spawned server
             # must still be alive after a short settle, so an immediately
             # crashing server is never mistaken for a ready session.
-            time.sleep(SETTLE_SECONDS)
+            herdr.runtime.sleep(SETTLE_SECONDS)
             if server.poll() is None:
                 return
             raise StageError(
                 "start-session", f"the session server exited early ({server.returncode})"
             )
-        time.sleep(POLL_SECONDS)
+        herdr.runtime.sleep(POLL_SECONDS)
     raise StageError("start-session", f"the session server never became ready ({session})")
 
 
@@ -334,7 +359,7 @@ def export_candidate(plugin_root: Path, destination: Path, herdr: Herdr) -> None
     if git_bin is None:
         raise StageError("export-candidate", "git is not available for the staged export")
     try:
-        tree = subprocess.run(
+        tree = herdr.runtime.run(
             [git_bin, "-C", str(plugin_root), "write-tree"],
             capture_output=True,
             text=True,
@@ -356,7 +381,7 @@ def export_candidate(plugin_root: Path, destination: Path, herdr: Herdr) -> None
             "export-candidate", f"git write-tree returned an invalid tree: {tree_id!r}"
         )
     try:
-        archive = subprocess.run(
+        archive = herdr.runtime.run(
             [git_bin, "-C", str(plugin_root), "archive", "--format=tar", tree_id],
             capture_output=True,
             timeout=herdr.timeout,
@@ -756,11 +781,11 @@ def poll_room_ready(
     The configured timeout is a wall-clock budget: every nested command is
     given only the time remaining until the deadline.
     """
-    deadline = time.monotonic() + timeout
+    deadline = herdr.runtime.monotonic() + timeout
 
     def budget() -> float:
         """Fresh remaining wall clock; never reused across sequential calls."""
-        remaining = deadline - time.monotonic()
+        remaining = deadline - herdr.runtime.monotonic()
         if remaining <= POLL_SECONDS:
             raise StageError(
                 stage,
@@ -795,14 +820,14 @@ def poll_room_ready(
             lowered = text.lower()
             if all(role.lower() in lowered for role in expected_roles):
                 return pane_id, tab_id
-        if time.monotonic() >= deadline:
+        if herdr.runtime.monotonic() >= deadline:
             raise StageError(
                 stage,
                 "the room never became ready: workspaces, settled peers "
                 f"{list(expected_peers)}, or the room pane with handles "
                 f"{list(expected_roles)} were incomplete",
             )
-        time.sleep(POLL_SECONDS)
+        herdr.runtime.sleep(POLL_SECONDS)
 
 
 MESSAGE_HEAD = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)>\s?(.*)$")
@@ -865,11 +890,11 @@ def run_round(
     herdr.run(["pane", "send-text", pane_id, message], session, stage=stage)
     herdr.run(["pane", "send-keys", pane_id, "enter"], session, stage=stage)
 
-    deadline = time.monotonic() + herdr.timeout
+    deadline = herdr.runtime.monotonic() + herdr.timeout
 
     def budget() -> float:
         """Fresh remaining wall clock; never reused across sequential calls."""
-        remaining = deadline - time.monotonic()
+        remaining = deadline - herdr.runtime.monotonic()
         if remaining <= POLL_SECONDS:
             missing = [role for role in expected_roles if role not in replies]
             raise StageError(
@@ -927,17 +952,18 @@ def run_round(
                     "participants": list(expected_roles),
                     "replies": dict(replies),
                 }
-        if time.monotonic() >= deadline:
+        if herdr.runtime.monotonic() >= deadline:
             missing = [role for role in expected_roles if role not in replies]
             raise StageError(
                 stage,
                 f"the @all round never settled; missing exact replies from "
                 f"{missing} for marker {marker}",
             )
-        time.sleep(POLL_SECONDS)
+        herdr.runtime.sleep(POLL_SECONDS)
 
 
-def reap_server(server: subprocess.Popen[str] | None) -> None:
+def reap_server(server: Any | None) -> None:
+    """Terminate any Popen-like server handle; never blocks on a fake clock."""
     if server is None or server.poll() is not None:
         return
     server.terminate()
@@ -952,7 +978,7 @@ def reap_server(server: subprocess.Popen[str] | None) -> None:
 def cleanup(
     herdr: Herdr,
     session: str,
-    server: subprocess.Popen[str] | None,
+    server: Any | None,
     linked_temp_id: str | None,
     temp_dir: tempfile.TemporaryDirectory[str] | None,
     session_owned: bool,
@@ -1029,6 +1055,7 @@ def smoke(
     plugin_root: Path | None = None,
     plugin_id: str | None = None,
     expected_version: str | None = None,
+    runtime: Runtime = REAL_RUNTIME,
 ) -> SmokeResult:
     session = f"{SESSION_PREFIX}{uuid.uuid4().hex}"
     result = SmokeResult(
@@ -1040,11 +1067,11 @@ def smoke(
     )
     if not math.isfinite(timeout) or timeout <= 0:
         raise StageError("usage", f"--timeout must be a positive finite number: {timeout!r}")
-    herdr = Herdr(herdr_bin, timeout)
+    herdr = Herdr(herdr_bin, timeout, runtime=runtime)
     session_owned = False
     temp_dir: tempfile.TemporaryDirectory[str] | None = None
     linked_temp_id: str | None = None
-    server: subprocess.Popen[str] | None = None
+    server: Any | None = None
     try:
         if mode == "candidate":
             temp_dir = tempfile.TemporaryDirectory(prefix="herdr-group-chat-smoke-")
@@ -1184,7 +1211,13 @@ def resolve_existing_directory(argument: str, value: Path) -> Path:
     raise StageError("usage", f"{argument} is not a directory: {value}")
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _main(argv: Sequence[str] | None, runtime: Runtime = REAL_RUNTIME) -> int:
+    """Private serialization seam: argument handling plus the stable JSON print.
+
+    Assays may drive the full CLI path in-process by passing a fake runtime;
+    the public `main` never forwards one, and its real default is bound at
+    definition time, so an injected fake cannot reach a production run.
+    """
     mode = "unknown"
     plugin_id = INSTALLED_PLUGIN_ID
     try:
@@ -1202,6 +1235,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 agent_cwd,
                 args.timeout,
                 plugin_root=plugin_root,
+                runtime=runtime,
             )
         else:
             result = smoke(
@@ -1211,6 +1245,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.timeout,
                 plugin_id=plugin_id,
                 expected_version=args.expected_version,
+                runtime=runtime,
             )
     except StageError as error:
         result = SmokeResult(
@@ -1233,6 +1268,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         note(f"[internal] FAILED: {message}")
     print(result.to_json())
     return 0 if result.ok else 1
+
+
+def _cli(argv: Sequence[str] | None, runtime: Runtime = REAL_RUNTIME) -> int:
+    """Route the public CLI through the private seam on the real runtime.
+
+    The real Runtime default is bound here at definition time, so swapping
+    the module-level name can never inject a fake into the public CLI.
+    """
+    return _main(argv, runtime=runtime)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Public entrypoint; offers no runtime injection of any kind."""
+    return _cli(argv)
 
 
 if __name__ == "__main__":
