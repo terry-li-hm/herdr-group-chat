@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [0.10.3] - 2026-08-31
+
+- Make `sol-fable-grok-pi` the default three-role room. It preserves `@sol`
+  and `@fable`, and runs `@grok` as Pi `grok46pi-peer` with only
+  `--provider xai --model grok-4.6 --thinking high`. The launcher fails closed
+  unless `pi --list-models grok-4.6` contains the exact `xai  grok-4.6` row and
+  no competing provider exposes that exact model id. Pi's pane proves the
+  bounded `grok-4.6 • high` sequence on launch and reopen. The receipt carries
+  harness `pi`, provider `xai`, model `grok-4.6`, and effort `high`. Pi-xAI is
+  an external route, so payload eligibility remains task-specific.
+- Retain the native Grok Build `sol-fable-grok` profile for stored rooms and
+  add `new-sol-fable-grok-native` for explicit new native rooms. The `new`
+  action now selects `sol-fable-grok-pi`; classic, Sol/Fable, GLM, open, and
+  adoption actions remain available.
+
 ## [0.10.2] - 2026-08-30
 
 - Preserve promotable trust-prompt tabs across launch and reopen, including

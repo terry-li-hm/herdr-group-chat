@@ -1,6 +1,6 @@
 id = "terry.herdr-group-chat"
 name = "Herdr Group Chat"
-version = "0.10.2"
+version = "0.10.3"
 min_herdr_version = "0.8.0"
 description = "A shared local room for full native AI coding agents managed by Herdr."
 platforms = ["macos", "linux"]
@@ -9,13 +9,19 @@ platforms = ["macos", "linux"]
 id = "new"
 title = "New group chat"
 contexts = ["workspace", "tab", "pane"]
-command = ["./new-room", "--launch", "--profile", "sol-fable-grok"]
+command = ["./new-room", "--launch", "--profile", "sol-fable-grok-pi"]
 
 [[actions]]
 id = "new-sol-fable"
 title = "New Sol + Fable chat"
 contexts = ["workspace", "tab", "pane"]
 command = ["./new-room", "--launch", "--profile", "sol-fable"]
+
+[[actions]]
+id = "new-sol-fable-grok-native"
+title = "New Sol + Fable + Grok native chat"
+contexts = ["workspace", "tab", "pane"]
+command = ["./new-room", "--launch", "--profile", "sol-fable-grok"]
 
 [[actions]]
 id = "new-sol-fable-glm"

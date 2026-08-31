@@ -6,19 +6,20 @@
 2. Run `uv lock --check`, the test suite, Ruff over both executables and all
    assays, and Chaperone.
 3. Export the tracked tree into a temporary directory and link that copy as
-   a Herdr plugin. Verify the manifest has no warnings. Confirm all six
-   actions are present: `new`, `new-sol-fable`, `new-sol-fable-glm`,
-   `new-classic`, `open`, and `adopt-peers`.
+   a Herdr plugin. Verify the manifest has no warnings. Confirm all seven
+   actions are present: `new`, `new-sol-fable`, `new-sol-fable-grok-native`,
+   `new-sol-fable-glm`, `new-classic`, `open`, and `adopt-peers`.
    Check both pane entrypoints, exact workspace ownership, and reopen
    behavior. Also check named-session isolation and partial-failure retry
-   behavior. Run a verified three-agent default (sol-fable-grok) room round
+   behavior. Run a verified three-agent default (sol-fable-grok-pi) room round
    and a classic four-agent room round.
-   Verify the six actions map to their exact commands: `new` runs
-   `./new-room --launch --profile sol-fable-grok`; `new-sol-fable` runs
-   `./new-room --launch --profile sol-fable`; `new-sol-fable-glm` runs
+   Verify the seven actions map to their exact commands: `new` runs
+   `./new-room --launch --profile sol-fable-grok-pi`; `new-sol-fable` runs
+   `./new-room --launch --profile sol-fable`; `new-sol-fable-grok-native` runs
+   `./new-room --launch --profile sol-fable-grok`; `new-sol-fable-glm` runs
    `./new-room --launch --profile sol-fable-glm`; `adopt-peers` runs
-   `./new-room --adopt-peers`; `new-classic` runs
-   `./new-room --launch`; `open` runs `./new-room --open`.
+   `./new-room --adopt-peers`; `new-classic` runs `./new-room --launch`; `open`
+   runs `./new-room --open`.
 4. Commit the release candidate and create the annotated release tag.
 
 ## Standing publication authority
@@ -50,9 +51,9 @@ For an eligible release:
 3. Install that exact tag with
    `herdr plugin install terry-li-hm/herdr-group-chat --ref <tag> --yes`. Read
    back the requested ref and resolved commit, compare the managed checkout's
-   tracked hashes with the tagged source, and verify all six actions and both
+   tracked hashes with the tagged source, and verify all seven actions and both
    pane entrypoints.
-4. Rerun the verified default three-agent (sol-fable-grok) smoke test and the
+4. Rerun the verified default three-agent (sol-fable-grok-pi) smoke test and the
    classic four-agent smoke test from the managed checkout. Read back the
    remote branch, annotated tag target, GitHub release, repository metadata,
    vulnerability-reporting state, and installed plugin before calling the

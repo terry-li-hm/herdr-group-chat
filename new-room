@@ -62,6 +62,7 @@ SOL_PANE_PROOF = (("gpt-5.6-sol",), PANE_BULLETS, ("high",))
 # after the first turn, so the fresh pane proof stays on screen across turns
 # and no separate reopen proof is needed — mirroring Sol.
 GLM_PANE_PROOF = (("glm-5.3",), PANE_BULLETS, ("high",))
+GROK_PI_PANE_PROOF = (("grok-4.6",), PANE_BULLETS, ("high",))
 FABLE_PANE_PROOFS = (("fable",), ("5",)), (("high",), ("effort",))
 GROK_START_ARGS = (
     "--model",
@@ -168,11 +169,31 @@ GLM_PARTICIPANT = Participant(
     model="glm-5.3",
     effort="high",
 )
+
+GROK_PI_PARTICIPANT = Participant(
+    role="grok",
+    kind="pi",
+    name="grok46pi-peer",
+    start_args=(
+        "--provider",
+        "xai",
+        "--model",
+        "grok-4.6",
+        "--thinking",
+        "high",
+    ),
+    pane_proofs=(GROK_PI_PANE_PROOF,),
+    catalog_command=("pi", "--list-models", "grok-4.6"),
+    provider="xai",
+    model="grok-4.6",
+    effort="high",
+)
 # The single profile definition: participants, native launch argv, and the
 # canonical matched evidence the receipt carries. No other source exists.
 PROFILE_PARTICIPANTS: dict[str, tuple[Participant, ...]] = {
     "sol-fable": (SOL_PARTICIPANT, FABLE_PARTICIPANT),
     "sol-fable-grok": (SOL_PARTICIPANT, FABLE_PARTICIPANT, GROK_PARTICIPANT),
+    "sol-fable-grok-pi": (SOL_PARTICIPANT, FABLE_PARTICIPANT, GROK_PI_PARTICIPANT),
     "sol-fable-glm": (SOL_PARTICIPANT, FABLE_PARTICIPANT, GLM_PARTICIPANT),
 }
 
@@ -821,7 +842,7 @@ def sequence_present(tokens: Sequence[str], sequence: tuple[tuple[str, ...], ...
 
 
 def native_catalog_row_present(command: Sequence[str], provider: str, model: str) -> bool:
-    """A row matches only when tokens[0] is the provider and tokens[1] the model."""
+    """Require the model's exact catalog rows to name only its expected provider."""
     try:
         result = subprocess.run(
             list(command), capture_output=True, text=True, errors="replace", timeout=30
@@ -830,11 +851,12 @@ def native_catalog_row_present(command: Sequence[str], provider: str, model: str
         return False
     if result.returncode != 0:
         return False
-    for line in result.stdout.splitlines():
-        tokens = line.split()
-        if len(tokens) >= 2 and tokens[0] == provider and tokens[1] == model:
-            return True
-    return False
+    providers = {
+        tokens[0]
+        for line in result.stdout.splitlines()
+        if len(tokens := line.split()) >= 2 and tokens[1] == model
+    }
+    return providers == {provider}
 
 
 def native_pane_proves(

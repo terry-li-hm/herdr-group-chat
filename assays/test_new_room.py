@@ -3961,6 +3961,74 @@ def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
     assert "ready  @sol (existing sol-peer)" in output
     assert "ready  @fable (existing fable-peer)" in output
 
+    pi_calls = install_role_replacement_host(
+        monkeypatch,
+        tmp_path,
+        [dict(agent) for agent in SFG_LIVE_AGENTS],
+        {
+            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-fable": FABLE_POST_TURN_SCREEN,
+            "w-agents:p-fresh1": GROK_PI_SCREEN,
+        },
+    )
+    pi_state = sfg_room_state(tmp_path)
+    assert (
+        module.start_participants(
+            "herdr",
+            str(tmp_path),
+            "w-agents",
+            tmp_path,
+            launcher_state_path(tmp_path),
+            pi_state,
+            participants=module.resolve_profile("sol-fable-grok-pi"),
+        )
+        == []
+    )
+    assert [call for call in pi_calls if call[:2] == ["tab", "close"]] == [
+        ["tab", "close", "w-agents:t-grok"]
+    ]
+    pi_starts = {call[2]: call for call in pi_calls if call[:2] == ["agent", "start"]}
+    assert set(pi_starts) == {"grok46pi-peer"}
+    assert pi_state["participant_pane_ids"] == {
+        "sol": "w-agents:p-sol",
+        "fable": "w-agents:p-fable",
+        "grok": "w-agents:p-fresh1",
+    }
+
+    native_calls = install_role_replacement_host(
+        monkeypatch,
+        tmp_path,
+        [dict(agent) for agent in SFGPI_LIVE_AGENTS],
+        {
+            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-fable": FABLE_POST_TURN_SCREEN,
+            "w-agents:p-fresh1": GROK_SCREEN,
+        },
+    )
+    native_state = sfgpi_room_state(tmp_path)
+    assert (
+        module.start_participants(
+            "herdr",
+            str(tmp_path),
+            "w-agents",
+            tmp_path,
+            launcher_state_path(tmp_path),
+            native_state,
+            participants=module.resolve_profile("sol-fable-grok"),
+        )
+        == []
+    )
+    assert [call for call in native_calls if call[:2] == ["tab", "close"]] == [
+        ["tab", "close", "w-agents:t-grokpi"]
+    ]
+    native_starts = {call[2]: call for call in native_calls if call[:2] == ["agent", "start"]}
+    assert set(native_starts) == {"grok46-peer"}
+    assert native_state["participant_pane_ids"] == {
+        "sol": "w-agents:p-sol",
+        "fable": "w-agents:p-fable",
+        "grok": "w-agents:p-fresh1",
+    }
+
 
 def test_room_reopen_reverifies_sol_fable_grok_and_execs_with_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -4008,6 +4076,48 @@ def test_room_reopen_reverifies_sol_fable_grok_and_execs_with_receipt(
         call[call.index("--pane") + 1] for call in calls if call[:2] == ["pane", "process-info"]
     }
     assert process_panes == {"w-agents:p-fable", "w-agents:p-grok"}
+
+    pi_captured: dict[str, object] = {}
+    room_reopen_env(tmp_path, monkeypatch, pi_captured, "chat-sfgpi")
+    pi_calls = install_sfgpi_host(
+        monkeypatch,
+        tmp_path,
+        {
+            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-fable": FABLE_POST_TURN_SCREEN,
+            "w-agents:p-grokpi": GROK_PI_POST_TURN_SCREEN,
+        },
+    )
+    pi_state = sfgpi_room_state(tmp_path)
+    for field in (
+        "pending_room_id",
+        "pending_room_operation_id",
+        "pending_room_profile",
+        "pending_room_started_unix_ms",
+    ):
+        pi_state.pop(field)
+    pi_state["selected_profile"] = "sol-fable-grok-pi"
+    pi_state["last_room_id"] = "chat-sfgpi"
+    save_launcher_state(tmp_path, pi_state)
+
+    module.room_entrypoint()
+
+    pi_argv = pi_captured["argv"]
+    assert pi_argv[pi_argv.index("--profile") + 1] == "sol-fable-grok-pi"
+    assert [value for index, value in enumerate(pi_argv) if pi_argv[index - 1] == "--agent"] == [
+        "sol=sol-peer",
+        "fable=fable-peer",
+        "grok=grok46pi-peer",
+    ]
+    assert json.loads(os.environ[module.PROFILE_RECEIPT_ENV]) == module.profile_receipt_payload(
+        "sol-fable-grok-pi", module.resolve_profile("sol-fable-grok-pi")
+    )
+    assert not any(
+        call[:2] in (["agent", "start"], ["tab", "close"], ["pane", "close"]) for call in pi_calls
+    )
+    assert {
+        call[call.index("--pane") + 1] for call in pi_calls if call[:2] == ["pane", "process-info"]
+    } == {"w-agents:p-fable"}
 
 
 # --- sol-fable-glm profile ------------------------------------------------------------
@@ -4325,19 +4435,266 @@ def test_room_reopen_reverifies_sol_fable_glm_and_execs_with_receipt(
     assert process_panes == {"w-agents:p-fable"}
 
 
+# --- default sol-fable-grok-pi profile -----------------------------------------------
+
+GROK_PI_SCREEN = "Pi\nprovider xai\nmodel grok-4.6 • high\n"
+GROK_PI_POST_TURN_SCREEN = "Pi\nturn complete\n╰ grok-4.6 • high ───────────── ctx 2% ╯\n"
+SFGPI_LIVE_AGENTS = [
+    {
+        "name": "sol-peer",
+        "kind": "pi",
+        "workspace_id": "w-agents",
+        "cwd": None,
+        "pane_id": "w-agents:p-sol",
+        "tab_id": "w-agents:t-sol",
+    },
+    {
+        "name": "fable-peer",
+        "kind": "claude",
+        "workspace_id": "w-agents",
+        "cwd": None,
+        "pane_id": "w-agents:p-fable",
+        "tab_id": "w-agents:t-fable",
+    },
+    {
+        "name": "grok46pi-peer",
+        "kind": "pi",
+        "workspace_id": "w-agents",
+        "cwd": None,
+        "pane_id": "w-agents:p-grokpi",
+        "tab_id": "w-agents:t-grokpi",
+    },
+]
+
+
+def sfgpi_room_state(tmp_path: Path, room: str = "chat-sfgpi") -> dict:
+    return {
+        "schema_version": 1,
+        "agents_workspace_id": "w-agents",
+        "agents_cwd": str(tmp_path),
+        "participant_pane_ids": {
+            "sol": "w-agents:p-sol",
+            "fable": "w-agents:p-fable",
+            "grok": "w-agents:p-grokpi",
+        },
+        "participant_tab_ids": {
+            "sol": "w-agents:t-sol",
+            "fable": "w-agents:t-fable",
+            "grok": "w-agents:t-grokpi",
+        },
+        "pending_room_id": room,
+        "pending_room_operation_id": "operation-test",
+        "pending_room_profile": "sol-fable-grok-pi",
+        "pending_room_started_unix_ms": int(module.time.time() * 1000),
+    }
+
+
+def install_sfgpi_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pane_screens: dict[str, str],
+    live_agents: list[dict] | None = None,
+) -> list[list[str]]:
+    calls: list[list[str]] = []
+    live = live_agents if live_agents is not None else SFGPI_LIVE_AGENTS
+    for agent in live:
+        agent["cwd"] = str(tmp_path)
+    install_profile_host(
+        monkeypatch,
+        calls,
+        pane_screens,
+        live_agents=live,
+        process_infos={"w-agents:p-fable": CLAUDE_FABLE_PROCESS},
+    )
+    return calls
+
+
+def test_sol_fable_grok_pi_reuses_sol_fable_and_preserves_native_grok_profile() -> None:
+    sol_fable = module.resolve_profile("sol-fable")
+    pi_grok = module.resolve_profile("sol-fable-grok-pi")
+
+    assert [(p.role, p.name, p.kind) for p in pi_grok] == [
+        ("sol", "sol-peer", "pi"),
+        ("fable", "fable-peer", "claude"),
+        ("grok", "grok46pi-peer", "pi"),
+    ]
+    assert pi_grok[:2] == sol_fable
+    assert pi_grok[0] is sol_fable[0]
+    assert pi_grok[1] is sol_fable[1]
+    assert module.resolve_profile("sol-fable-grok") == (
+        module.SOL_PARTICIPANT,
+        module.FABLE_PARTICIPANT,
+        module.GROK_PARTICIPANT,
+    )
+    _, receipt = module.profile_room_exec("sol-fable-grok-pi", pi_grok)
+    assert next(entry for entry in json.loads(receipt)["verified"] if entry["role"] == "grok") == {
+        "role": "grok",
+        "target": "grok46pi-peer",
+        "harness": "pi",
+        "provider": "xai",
+        "model": "grok-4.6",
+        "effort": "high",
+        "verification": "native-ui verified",
+    }
+
+
+def test_grok_pi_uses_the_exact_xai_argv_and_no_fallback() -> None:
+    grok = module.resolve_profile("sol-fable-grok-pi")[2]
+
+    assert grok.start_args == (
+        "--provider",
+        "xai",
+        "--model",
+        "grok-4.6",
+        "--thinking",
+        "high",
+    )
+    assert grok.catalog_command == ("pi", "--list-models", "grok-4.6")
+    assert (grok.provider, grok.model, grok.effort) == ("xai", "grok-4.6", "high")
+    assert grok.tab_path_prefix == ""
+    assert grok.reopen_pane_proofs == ()
+    assert grok.reopen_process_argv0 == ""
+    assert grok.reopen_process_args == ()
+
+
+def test_grok_pi_catalog_requires_the_exact_xai_grok_46_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    grok = module.resolve_profile("sol-fable-grok-pi")[2]
+
+    def proves(stdout: str) -> bool:
+        monkeypatch.setattr(
+            module.subprocess,
+            "run",
+            lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, stdout, ""),
+        )
+        return module.catalog_proof(grok)
+
+    assert proves("xai  grok-4.6\n")
+    assert proves("xai  grok-4.6\nxai  grok-4.6\n")
+    assert proves("xai  grok-4.6\nother  different-model\n")
+    assert not proves("xai  grok-4.6-fast\n")
+    assert not proves("xai  grok 4.6\n")
+    assert not proves("xai-compatible  grok-4.6\n")
+    assert not proves("other  grok-4.6\n")
+    assert not proves("xai  grok-4.6\nother  grok-4.6\n")
+    assert not proves("other  grok-4.6\nxai  grok-4.6\n")
+
+
+def test_grok_pi_pane_proof_requires_exact_bullet_high_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def proves(screen: str) -> bool:
+        monkeypatch.setattr(module, "run_text", lambda *_args, **_kwargs: screen)
+        monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+        return module.pane_proof("herdr", module.resolve_profile("sol-fable-grok-pi")[2], "p-grok")
+
+    assert proves(GROK_PI_SCREEN)
+    assert proves(GROK_PI_POST_TURN_SCREEN)
+    assert not proves("Pi\nmodel grok-4.6.1 • high\n")
+    assert not proves("Pi\nmodel grok 4.6 • high\n")
+    assert not proves("Pi\nmodel grok-4.6 • highest\n")
+    assert not proves("Pi\nmodel grok-4.6 ─ high\n")
+
+
+def test_grok_pi_catalog_failure_creates_no_tab_and_never_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    install_profile_host(
+        monkeypatch,
+        calls,
+        {"w-agents:p-grok": GROK_PI_SCREEN},
+        catalog_rows={("xai", "grok-4.6"): False},
+    )
+    state: dict = {"schema_version": 1}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=(module.GROK_PI_PARTICIPANT,),
+    )
+
+    assert failures == [
+        "@grok: grok46pi-peer failed the native catalog preflight; no tab was created"
+    ]
+    assert ["pi", "--list-models", "grok-4.6"] in calls
+    assert not any(call[:2] in (["tab", "create"], ["agent", "start"]) for call in calls)
+
+
+def test_grok_pi_starts_with_exact_argv_after_catalog_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    install_profile_host(
+        monkeypatch,
+        calls,
+        {
+            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-fable": FABLE_SCREEN,
+            "w-agents:p-grok": GROK_PI_SCREEN,
+        },
+    )
+    state: dict = {"schema_version": 1}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=module.resolve_profile("sol-fable-grok-pi"),
+    )
+
+    assert failures == []
+    starts = {call[2]: call for call in calls if call[:2] == ["agent", "start"]}
+    assert starts["grok46pi-peer"] == [
+        "agent",
+        "start",
+        "grok46pi-peer",
+        "--kind",
+        "pi",
+        "--pane",
+        "w-agents:p-grok",
+        "--timeout",
+        "120000",
+        "--",
+        "--provider",
+        "xai",
+        "--model",
+        "grok-4.6",
+        "--thinking",
+        "high",
+    ]
+    grok_tab_create = next(
+        index
+        for index, call in enumerate(calls)
+        if call[:2] == ["tab", "create"]
+        and call[call.index("--label") + 1].startswith("hgchat-grok-")
+    )
+    assert calls.index(["pi", "--list-models", "grok-4.6"]) < grok_tab_create
+
+
 # --- adopting stale peers after a Herdr server restart ---------------------------------
 
 
 def adopt_live_agents(workspace_id: str, cwd: str, names: tuple[str, ...] = ()) -> list[dict]:
     """The six live peers the restart orphaned, exact names and kinds."""
-    specs = (
+    specs = [
         ("sol-peer", "pi"),
         ("fable-peer", "claude"),
         ("grok46-peer", "grok"),
         ("pi-peer", "pi"),
         ("claude-peer", "claude"),
         ("codex-peer", "codex"),
-    )
+    ]
+    if "grok46pi-peer" in names:
+        specs.append(("grok46pi-peer", "pi"))
     return [
         {
             "name": name,
@@ -4447,6 +4804,41 @@ def test_adopt_peers_adopts_a_clean_single_workspace_set(
     ]
     assert "adopted 6 peers in workspace w1E (agents · group-chat)" in out[-1]
     assert not any(tuple(call[:2]) in ADOPT_MUTATIONS for call in calls)
+
+
+def test_adopt_peers_recognizes_the_pi_xai_grok_profile_peer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    calls = install_adopt_host(
+        monkeypatch,
+        adopt_live_agents("w1E", str(tmp_path), names=("grok46pi-peer",)),
+        pane_screens={"w1E:p-grok46pi": GROK_PI_POST_TURN_SCREEN},
+    )
+
+    assert module.adopt_stale_peers() == 0
+
+    state = load_launcher_state(tmp_path)
+    assert state["participant_pane_ids"] == {"grok": "w1E:p-grok46pi"}
+    assert state["participant_tab_ids"] == {"grok": "w1E:t-grok46pi"}
+    assert ["pi", "--list-models", "grok-4.6"] in calls
+    assert "adopted @grok (grok46pi-peer, pane w1E:p-grok46pi)" in capsys.readouterr().out
+    assert not any(tuple(call[:2]) in ADOPT_MUTATIONS for call in calls)
+
+    before = load_launcher_state(tmp_path)
+    conflicting_calls = install_adopt_host(
+        monkeypatch,
+        adopt_live_agents("w1E", str(tmp_path), names=("grok46-peer", "grok46pi-peer")),
+        pane_screens={
+            "w1E:p-grok46": GROK_POST_TURN_SCREEN,
+            "w1E:p-grok46pi": GROK_PI_POST_TURN_SCREEN,
+        },
+    )
+    with pytest.raises(BootstrapError, match="grok46-peer, grok46pi-peer are both live"):
+        module.adopt_stale_peers()
+
+    assert load_launcher_state(tmp_path) == before
+    assert not any(tuple(call[:2]) in ADOPT_MUTATIONS for call in conflicting_calls)
 
 
 def test_adopt_peers_leaves_a_previous_placeholder_workspace_untouched(

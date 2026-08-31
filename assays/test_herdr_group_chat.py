@@ -4442,6 +4442,7 @@ def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:
     assert [action["id"] for action in manifest["actions"]] == [
         "new",
         "new-sol-fable",
+        "new-sol-fable-grok-native",
         "new-sol-fable-glm",
         "new-classic",
         "open",
@@ -4453,21 +4454,25 @@ def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:
         "./new-room",
         "--launch",
         "--profile",
-        "sol-fable-grok",
+        "sol-fable-grok-pi",
     ]
     sol_fable = manifest["actions"][1]
     assert sol_fable["title"] == "New Sol + Fable chat"
     assert sol_fable["command"] == ["./new-room", "--launch", "--profile", "sol-fable"]
     assert sol_fable["contexts"] == ["workspace", "tab", "pane"]
-    sol_fable_glm = manifest["actions"][2]
+    native_grok = manifest["actions"][2]
+    assert native_grok["title"] == "New Sol + Fable + Grok native chat"
+    assert native_grok["command"] == ["./new-room", "--launch", "--profile", "sol-fable-grok"]
+    assert native_grok["contexts"] == ["workspace", "tab", "pane"]
+    sol_fable_glm = manifest["actions"][3]
     assert sol_fable_glm["title"] == "New Sol + Fable + GLM chat"
     assert sol_fable_glm["command"] == ["./new-room", "--launch", "--profile", "sol-fable-glm"]
     assert sol_fable_glm["contexts"] == ["workspace", "tab", "pane"]
-    new_classic = manifest["actions"][3]
+    new_classic = manifest["actions"][4]
     assert new_classic["title"] == "New classic four-agent chat"
     assert new_classic["command"] == ["./new-room", "--launch"]
     assert new_classic["contexts"] == ["workspace", "tab", "pane"]
-    adopt_peers = manifest["actions"][5]
+    adopt_peers = manifest["actions"][6]
     assert adopt_peers["title"] == "Adopt stale group-chat peers"
     assert adopt_peers["command"] == ["./new-room", "--adopt-peers"]
     assert adopt_peers["contexts"] == ["workspace", "tab", "pane"]
@@ -7597,6 +7602,89 @@ def test_sol_fable_grok_exact_roster_records_the_verified_receipt_once(
         assert needle in body, needle
     # The stored sol-fable room stays default-able: its profile is unchanged.
     assert namespace["PROFILE_ROLES"]["sol-fable"] == ("sol", "fable")
+
+
+# --- default sol-fable-grok-pi profile ------------------------------------------------
+
+
+class PiGrokClient(ProfileClient):
+    def live_targets(self) -> set[str]:
+        return {"sol-peer", "fable-peer", "grok46pi-peer"}
+
+    def states(self) -> dict[str, str]:
+        return {"sol-peer": "idle", "fable-peer": "idle", "grok46pi-peer": "idle"}
+
+
+VALID_SFGPI_RECEIPT = {
+    "profile": "sol-fable-grok-pi",
+    "verified": [
+        dict(entry)
+        for entry in (
+            *VALID_RECEIPT["verified"][:2],
+            {
+                "role": "grok",
+                "target": "grok46pi-peer",
+                "harness": "pi",
+                "provider": "xai",
+                "model": "grok-4.6",
+                "effort": "high",
+                "verification": "native-ui verified",
+            },
+        )
+    ],
+}
+
+
+def test_sol_fable_grok_pi_has_exact_roles_and_preserves_stored_native_profile() -> None:
+    assert namespace["PROFILE_ROLES"]["sol-fable-grok-pi"] == ("sol", "fable", "grok")
+    assert namespace["PROFILE_SYNTHESIZER"]["sol-fable-grok-pi"] == "sol"
+    assert namespace["PROFILE_ROLES"]["sol-fable-grok"] == ("sol", "fable", "grok")
+    assert namespace["PROFILE_ROLES"]["sol-fable"] == ("sol", "fable")
+
+
+def test_sol_fable_grok_pi_requires_the_exact_roster_and_records_xai_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StaticClient(PiGrokClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(module, "HerdrClient", StaticClient)
+    monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], json.dumps(VALID_SFGPI_RECEIPT))
+    base = [
+        "--state-dir",
+        str(tmp_path),
+        "--room",
+        "receipt-sfgpi",
+        "--profile",
+        "sol-fable-grok-pi",
+        "--agent",
+        "sol=sol-peer",
+        "--agent",
+        "fable=fable-peer",
+        "--agent",
+        "grok=grok46pi-peer",
+    ]
+
+    assert main([*base, "--once", "hello from the human"]) == 0
+    assert main([*base[:-2], "--agent", "grok=grok46-peer", "--once", "wrong peer"]) == 2
+
+    receipts = [
+        item
+        for item in Transcript(tmp_path, "receipt-sfgpi").read()
+        if item["kind"] == namespace["PROFILE_RECEIPT_KIND"]
+    ]
+    assert len(receipts) == 1
+    grok = next(entry for entry in receipts[0]["meta"]["verified"] if entry["role"] == "grok")
+    assert grok == {
+        "role": "grok",
+        "target": "grok46pi-peer",
+        "harness": "pi",
+        "provider": "xai",
+        "model": "grok-4.6",
+        "effort": "high",
+        "verification": "native-ui verified",
+    }
 
 
 # --- sol-fable-glm profile ------------------------------------------------------------

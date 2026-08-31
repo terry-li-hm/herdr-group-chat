@@ -24,14 +24,14 @@ this TUI a thin Cumora client, with one backend owner and no dual writes. See
 Prerequisites are Herdr 0.8.0 or newer, [`uv`](https://docs.astral.sh/uv/), and
 installed, authenticated Pi, Claude Code, Codex, and Grok Build CLIs. The room
 executable uses `uv` to run Python 3.13 and installs `regex` plus `wcwidth` for
-grapheme-safe terminal-cell layout. The `sol-fable-glm` profile additionally
-needs Pi configured and authenticated for its `bigmodel-coding`
-provider (`glm-5.3`).
+grapheme-safe terminal-cell layout. The `sol-fable-glm` and
+`sol-fable-grok-pi` profiles additionally need Pi configured and authenticated
+for their `bigmodel-coding` (`glm-5.3`) and `xai` (`grok-4.6`) providers.
 
 Install the pinned release from GitHub:
 
 ```bash
-herdr plugin install terry-li-hm/herdr-group-chat --ref v0.10.2
+herdr plugin install terry-li-hm/herdr-group-chat --ref v0.10.3
 herdr plugin action invoke new --plugin terry.herdr-group-chat
 ```
 
@@ -277,10 +277,11 @@ Uninstall a GitHub-managed copy with:
 herdr plugin uninstall terry.herdr-group-chat
 ```
 
-The manifest declares five actions and two managed pane entrypoints: **New group
-chat**, **New Sol + Fable chat**, **New Sol + Fable + GLM chat**, **New classic
-four-agent chat**, **Open group chat**, and **Adopt stale group-chat peers**,
-plus the visible setup pane and the room pane. Herdr
+The manifest declares seven actions and two managed pane entrypoints: **New group
+chat**, **New Sol + Fable chat**, **New Sol + Fable + Grok native chat**, **New
+Sol + Fable + GLM chat**, **New classic four-agent chat**, **Open group chat**,
+and **Adopt stale group-chat peers**, plus the visible setup pane and the room
+pane. Herdr
 supplies `HERDR_PLUGIN_STATE_DIR`, so transcripts and the plugin's exact
 workspace and pane identifiers stay in a server-instance-scoped, locked state file. This
 keeps multiple Herdr sessions separate and serializes overlapping launcher and
@@ -292,8 +293,8 @@ is `agents · group-chat` or `group-chat`. Standalone CLI use retains
 `~/.local/state/herdr-group-chat/`; an explicit `--state-dir` always wins.
 
 Invoking **New group chat** opens a visible setup tab for the verified atomic
-Sol/Fable/Grok default, reuses any live named peers, creates tabs for missing
-participants, and then becomes a fresh `group-chat` room. **New classic
+Sol/Fable/Pi-xAI Grok default, reuses any live named peers, creates tabs for
+missing participants, and then becomes a fresh `group-chat` room. **New classic
 four-agent chat** separately opens the Pi/Claude/Codex/Grok composition. New
 launches replace the previous plugin-owned room pane but retain that room's
 transcript. **Open group chat** focuses the exact recorded plugin pane or
@@ -346,8 +347,9 @@ bounded two-role room: `@sol` runs Pi as `sol-peer` with the native arguments
 runs Claude Code as `fable-peer` with `--model fable --effort high` and no
 fallback. Before either participant becomes routable, the launcher verifies
 native host evidence: Sol requires an exact `openai-codex  gpt-5.6-sol` row
-from `pi --list-models gpt-5.6-sol` plus the model and high-thinking tokens in
-the native pane; Fable requires `Fable 5` and `high effort` in its native
+from `pi --list-models gpt-5.6-sol`, with no competing provider for that exact
+model id, plus the model and high-thinking tokens in the native pane; Fable
+requires `Fable 5` and `high effort` in its native
 pane. Reads retry briefly because startup UIs render asynchronously, and both the
 catalog row and the pane evidence are matched as exact tokens and bounded
 sequences, so lookalikes such as `gpt-5.6-sol-01` or `Fable 5-deluxe` never
@@ -361,37 +363,35 @@ this describes what the launcher saw in the native UIs, not a cryptographic or
 model-service attestation. Sol synthesizes reviews by default, and the classic
 four-agent composition is unchanged.
 
-## Default Sol + Fable + Grok profile
+## Default Sol + Fable + Pi-xAI Grok profile
 
-`New group chat` is now the opinionated default: action id `new` changes from
-the classic four-agent room to the bounded three-role `sol-fable-grok` room,
-launched via `./new-room --launch --profile sol-fable-grok`. The direct
-no-profile `./new-room --launch` command and the new `new-classic` action
-(`New classic four-agent chat`) preserve classic behavior. The room composes the existing `sol-fable` participants
-unchanged — `@sol` (Pi as `sol-peer`, `--provider openai-codex --model
-gpt-5.6-sol --thinking high`) and `@fable` (Claude Code as `fable-peer`,
-`--model fable --effort high`) — plus `@grok`, Grok as `grok46-peer` with
-the exact native arguments `--model grok-4.6 --reasoning-effort high
---no-memory --disable-web-search --no-subagents --permission-mode
-bypassPermissions` and no fallback. Only the Grok participant tab's PATH is
-prepended with `~/.grok/bin` through the Herdr `tab create` environment, so
-the launcher's own environment and global config are never touched.
+`New group chat` launches the bounded three-role `sol-fable-grok-pi` room via
+`./new-room --launch --profile sol-fable-grok-pi`. It retains `@sol` and
+`@fable` unchanged, then adds `@grok` as Pi `grok46pi-peer` with the exact
+native arguments `--provider xai --model grok-4.6 --thinking high`. There is
+no fallback provider, model, effort, or native Grok Build invocation.
 
-Before any participant becomes routable, `@grok` must show the bounded
-`Grok 4.6` and `high` token sequences in its native pane (a live canary
-confirmed the UI keeps `Grok 4.6 (high)` after a turn); on reopen the proof
-additionally requires the exact native foreground process argv0 `grok` with
-the contiguous start-argument sequence. Suffixed or prefixed lookalikes such
-as `Grok 4.6.1` or `groklette 4.6` never verify. The room is atomic: if any
-of the three roles fails verification, the launch or reopen fails closed, no
-room opens, and the non-secret `native-ui verified` receipt is emitted only
-after all three verify. A mismatching existing Grok session is left open,
-blocks the launch, and already-verified peers stay available for a retry.
-The stored room keeps its own profile: previously opened `sol-fable` or
-classic rooms reopen unchanged, Sol synthesizes, and `New Sol + Fable chat`
-remains available. `New classic four-agent chat` (or a direct
-`./new-room --launch` without a profile) still opens the unchanged classic
-Pi/Claude/Codex/Grok four-agent room.
+Before `@grok` becomes routable, Pi must return the exact `xai  grok-4.6` row
+from `pi --list-models grok-4.6`, with no competing provider for that exact
+model id. Its native pane must contain the bounded `grok-4.6 • high` token
+sequence. The same proof is required when reopening. Lookalikes, split model
+tokens, wrong separators, and wrong effort fail closed.
+The atomic receipt carries harness `pi`, provider `xai`, model `grok-4.6`, and
+effort `high` only after every role verifies.
+
+Pi-xAI is an external route. Payload eligibility remains task-specific, so the
+room disclosure boundary applies to every message addressed to `@grok`.
+
+## Retained native Sol + Fable + Grok profile
+
+`New Sol + Fable + Grok native chat` retains `sol-fable-grok` for stored rooms
+and explicit new launches. Its `@grok` remains Grok Build `grok46-peer` with
+the existing exact native arguments and pane-plus-process re-verification.
+Switching between native and Pi-xAI profiles replaces the single `@grok` role
+and closes the prior profile-owned Grok tab under the existing replacement semantics.
+Stored `sol-fable-grok`, `sol-fable`, and classic rooms keep their own profiles.
+`New classic four-agent chat` and direct no-profile `./new-room --launch` are
+unchanged.
 
 ## Sol + Fable + GLM profile
 
@@ -401,10 +401,11 @@ opens the bounded three-role `sol-fable-glm` room: the existing `@sol` and
 native arguments `--provider bigmodel-coding --model glm-5.3 --thinking high`
 and no fallback. Before `@glm` becomes routable, the launcher requires the
 exact `bigmodel-coding  glm-5.3` catalog row from `pi --list-models glm-5.3`
-plus the bounded `glm-5.3` bullet `high` token sequence in its native pane; a
-live canary confirmed Pi keeps `glm-5.3 • high` on its status and footer
-lines after the first turn, so the same pane proof applies on reopen and, like
-Sol, no foreground-process argv evidence is required. Suffixed or split
+with no competing provider for that exact model id, plus the bounded `glm-5.3`
+bullet `high` token sequence in its native pane; a live canary confirmed Pi
+keeps `glm-5.3 • high` on its status and footer lines after the first turn, so
+the same pane proof applies on reopen and, like Sol, no foreground-process argv
+evidence is required. Suffixed or split
 lookalikes such as `glm-5.3.1` or `glm 5.3` never verify. The room is atomic:
 if any of the three roles fails verification, the launch or reopen fails
 closed, no room opens, and the non-secret `native-ui verified` receipt —
@@ -419,10 +420,10 @@ disclosure boundary applies to anything addressed to `@glm`.
   blind passes are parallel; consensus votes are also parallel.
 - Every addressed agent must already be live in Herdr.
 - New-room setup starts the four classic participants, the two bounded
-  `sol-fable` profile participants, the three `sol-fable-grok` profile
-  participants, or the three `sol-fable-glm` profile participants; only these
-  four fixed compositions are selectable, and arbitrary participant selection
-  is not configurable.
+  `sol-fable` participants, or one of the three-role `sol-fable-grok`,
+  `sol-fable-grok-pi`, and `sol-fable-glm` profiles. Only these five fixed
+  compositions are selectable, and arbitrary participant selection is not
+  configurable.
 - Retry state is kept in the running room process and does not survive a room
   restart. The transcript itself remains durable.
 - Cancellation is local to the room orchestration. The relay never sends
