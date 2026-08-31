@@ -297,8 +297,14 @@ Sol/Fable/Pi-xAI Grok default, reuses any live named peers, creates tabs for
 missing participants, and then becomes a fresh `group-chat` room. **New classic
 four-agent chat** separately opens the Pi/Claude/Codex/Grok composition. New
 launches replace the previous plugin-owned room pane but retain that room's
-transcript. **Open group chat** focuses the exact recorded plugin pane or
-reopens the last room without starting models.
+transcript. Fresh launches never steal your focus, even when an earlier room
+already exists: the recorded room pane is revalidated through read-only tab
+listing, the replacement pane opens with `--no-focus`, and the `group-chat`
+and `agents · group-chat` workspaces are created without focus, so you stay
+where you were. **Open group chat** focuses
+the exact recorded plugin pane or
+reopens the last room without starting models; because that action is
+explicitly focus-oriented, recreating a missing room pane may take focus.
 The transcript and input remain visible while you switch among participant
 tabs. Failed cleanup remains recorded for a later retry instead of silently
 losing ownership of the old pane. Participant setup failures are recorded as

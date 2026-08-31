@@ -709,16 +709,19 @@ def load_validated_launcher_state(
     pane_id = state.get("room_pane_id")
     if not pane_id:
         return state
+    # Validate the recorded room with the read-only `pane get` inspection only:
+    # focusing the pane merely to validate it would steal the caller's focus on
+    # every subsequent launch once a room pane exists.
     try:
-        response = run_json(herdr_bin, ["plugin", "pane", "focus", pane_id])
+        response = run_json(herdr_bin, ["pane", "get", pane_id])
     except BootstrapError as error:
-        if error.code == "plugin_pane_not_found":
+        if error.code == "pane_not_found":
             state.pop("room_pane_id", None)
             state.pop("room_tab_id", None)
             return state
         raise
     try:
-        pane = response["result"]["plugin_pane"]["pane"]
+        pane = response["result"]["pane"]
         matches = (
             str(pane["pane_id"]) == pane_id
             and str(pane["workspace_id"]) == state.get("chat_workspace_id")
@@ -1327,7 +1330,10 @@ def launch_room(open_existing: bool, profile: str | None = None) -> int:
         agents_workspace_id = state.get("agents_workspace_id")
         if agents_workspace_id and agents_workspace_id in workspace_ids(herdr_bin):
             pane_arguments.extend(["--env", f"{AGENTS_WORKSPACE_ENV}={agents_workspace_id}"])
-        pane_arguments.append("--focus")
+        # A fresh launch must never steal the caller's focus: neither the room
+        # pane nor either workspace takes it. The explicit Open group chat action
+        # is focus-oriented, so recreating a missing room pane may use --focus.
+        pane_arguments.append("--focus" if open_existing else "--no-focus")
         state["pending_room_id"] = room
         state["pending_room_operation_id"] = operation_id
         if profile:

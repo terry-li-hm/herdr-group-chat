@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [0.10.4] - 2026-08-31
+
+- Fresh **New group chat** launches no longer steal focus: the plugin pane
+  `open` call uses `--no-focus`, and neither the `group-chat` nor the
+  `agents · group-chat` workspace creation takes focus. The recorded room pane
+  is revalidated through read-only tab listing instead of a focus call, so a
+  second fresh launch also preserves the caller's focus. The explicit
+  **Open group chat** action still focuses the recorded room pane, and a
+  reopen that must recreate a missing room pane may use `--focus` because the
+  action is explicitly focus-oriented.
+
 ## [0.10.3] - 2026-08-31
 
 - Make `sol-fable-grok-pi` the default three-role room. It preserves `@sol`

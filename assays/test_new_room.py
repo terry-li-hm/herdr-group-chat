@@ -535,6 +535,16 @@ def test_open_focuses_only_the_recorded_plugin_pane(
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: int = 30) -> dict:
         del timeout
         calls.append(arguments)
+        if arguments == ["pane", "get", "w-chat:p-owned"]:
+            return {
+                "result": {
+                    "pane": {
+                        "pane_id": "w-chat:p-owned",
+                        "workspace_id": "w-chat",
+                        "tab_id": "w-chat:t-owned",
+                    }
+                }
+            }
         return {
             "result": {
                 "type": "plugin_pane_focused",
@@ -552,10 +562,147 @@ def test_open_focuses_only_the_recorded_plugin_pane(
 
     assert launch_room(open_existing=True) == 0
     assert calls == [
-        ["plugin", "pane", "focus", "w-chat:p-owned"],
+        ["pane", "get", "w-chat:p-owned"],
         ["plugin", "pane", "focus", "w-chat:p-owned"],
     ]
     assert json.loads(capsys.readouterr().out)["result"]["type"] == "plugin_pane_focused"
+
+
+def test_fresh_replacement_launch_never_focuses_the_existing_room(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_launcher_state(
+        tmp_path,
+        {
+            "chat_workspace_id": "w-chat",
+            "room_pane_id": "w-chat:p-old",
+            "room_tab_id": "w-chat:t-old",
+            "last_room_id": "chat-old",
+        },
+    )
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["workspace", "list"]:
+            return {"result": {"workspaces": [{"workspace_id": "w-chat"}]}}
+        if arguments == ["pane", "get", "w-chat:p-old"]:
+            return {
+                "result": {
+                    "pane": {
+                        "pane_id": "w-chat:p-old",
+                        "workspace_id": "w-chat",
+                        "tab_id": "w-chat:t-old",
+                    }
+                }
+            }
+        if arguments[:3] == ["plugin", "pane", "open"]:
+            return {
+                "result": {
+                    "plugin_pane": {"pane": {"pane_id": "w-chat:p-new", "tab_id": "w-chat:t-new"}}
+                }
+            }
+        return {"result": {"type": "tab_info"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+
+    assert launch_room(open_existing=False) == 0
+    assert not any(call[:3] == ["plugin", "pane", "focus"] for call in calls)
+    open_arguments = next(
+        arguments for arguments in calls if arguments[:3] == ["plugin", "pane", "open"]
+    )
+    assert open_arguments[-1] == "--no-focus"
+    state = load_launcher_state(tmp_path)
+    assert state["room_pane_id"] == "w-chat:p-new"
+
+
+def test_fresh_launch_opens_room_pane_and_workspaces_without_focus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["workspace", "list"]:
+            return {"result": {"workspaces": []}}
+        if arguments[:2] == ["workspace", "create"]:
+            return {
+                "result": {
+                    "workspace": {"workspace_id": "w-created"},
+                    "tab": {"tab_id": "w-created:t-placeholder"},
+                }
+            }
+        if arguments[:2] == ["workspace", "rename"]:
+            return {"result": {"type": "workspace_info"}}
+        if arguments[:3] == ["plugin", "pane", "open"]:
+            return {
+                "result": {
+                    "plugin_pane": {
+                        "pane": {"pane_id": "w-created:p-new", "tab_id": "w-created:t-new"}
+                    }
+                }
+            }
+        return {"result": {"type": "tab_info"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+
+    assert launch_room(open_existing=False) == 0
+    open_arguments = next(
+        arguments for arguments in calls if arguments[:3] == ["plugin", "pane", "open"]
+    )
+    assert open_arguments[-1] == "--no-focus"
+    assert "--focus" not in open_arguments
+    workspace_creates = [
+        arguments for arguments in calls if arguments[:2] == ["workspace", "create"]
+    ]
+    assert workspace_creates and all("--no-focus" in call for call in workspace_creates)
+
+
+def test_open_recreates_missing_room_pane_with_focus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_launcher_state(
+        tmp_path,
+        {
+            "chat_workspace_id": "w-chat",
+            "room_pane_id": "w-chat:p-gone",
+            "room_tab_id": "w-chat:t-gone",
+            "last_room_id": "chat-kept",
+        },
+    )
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["workspace", "list"]:
+            return {"result": {"workspaces": [{"workspace_id": "w-chat"}]}}
+        if arguments == ["pane", "get", "w-chat:p-gone"]:
+            raise BootstrapError("pane gone", code="pane_not_found")
+        if arguments[:3] == ["plugin", "pane", "open"]:
+            return {
+                "result": {
+                    "plugin_pane": {"pane": {"pane_id": "w-chat:p-new", "tab_id": "w-chat:t-new"}}
+                }
+            }
+        return {"result": {"type": "tab_info"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+
+    assert launch_room(open_existing=True) == 0
+    open_arguments = next(
+        arguments for arguments in calls if arguments[:3] == ["plugin", "pane", "open"]
+    )
+    assert open_arguments[-1] == "--focus"
+    assert "--no-focus" not in open_arguments
+    state = load_launcher_state(tmp_path)
+    assert state["last_room_id"] == "chat-kept"
+    assert state["room_pane_id"] == "w-chat:p-new"
 
 
 def test_existing_room_retries_recorded_placeholder_cleanup_before_return(
@@ -578,6 +725,16 @@ def test_existing_room_retries_recorded_placeholder_cleanup_before_return(
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
         calls.append(arguments)
+        if arguments == ["pane", "get", "w-chat:p-owned"]:
+            return {
+                "result": {
+                    "pane": {
+                        "pane_id": "w-chat:p-owned",
+                        "workspace_id": "w-chat",
+                        "tab_id": "w-chat:t-owned",
+                    }
+                }
+            }
         if arguments[:3] == ["plugin", "pane", "focus"]:
             return {
                 "result": {
@@ -1016,10 +1173,17 @@ def test_definite_pane_open_failure_clears_pending_operation(
     assert "pending_room_started_unix_ms" not in state
 
 
-def test_transient_focus_failure_does_not_open_a_duplicate(
+def test_transient_validation_failure_does_not_open_a_duplicate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    save_launcher_state(tmp_path, {"room_pane_id": "w-chat:p-current"})
+    save_launcher_state(
+        tmp_path,
+        {
+            "chat_workspace_id": "w-chat",
+            "room_pane_id": "w-chat:p-current",
+            "room_tab_id": "w-chat:t-current",
+        },
+    )
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
     calls: list[list[str]] = []
 
@@ -1032,7 +1196,7 @@ def test_transient_focus_failure_does_not_open_a_duplicate(
 
     with pytest.raises(BootstrapError, match="temporary failure"):
         launch_room(open_existing=True)
-    assert calls == [["plugin", "pane", "focus", "w-chat:p-current"]]
+    assert calls == [["pane", "get", "w-chat:p-current"]]
 
 
 def test_failed_old_pane_close_remains_in_cleanup_state(
@@ -1052,15 +1216,13 @@ def test_failed_old_pane_close_remains_in_cleanup_state(
         del timeout
         if arguments == ["workspace", "list"]:
             return {"result": {"workspaces": [{"workspace_id": "w-chat"}]}}
-        if arguments == ["plugin", "pane", "focus", "w-chat:p-old"]:
+        if arguments == ["pane", "get", "w-chat:p-old"]:
             return {
                 "result": {
-                    "plugin_pane": {
-                        "pane": {
-                            "pane_id": "w-chat:p-old",
-                            "workspace_id": "w-chat",
-                            "tab_id": "w-chat:t-old",
-                        }
+                    "pane": {
+                        "pane_id": "w-chat:p-old",
+                        "workspace_id": "w-chat",
+                        "tab_id": "w-chat:t-old",
                     }
                 }
             }
@@ -1101,6 +1263,16 @@ def test_rename_failure_is_recovered_before_the_next_open_returns(
         del timeout
         if arguments == ["workspace", "list"]:
             return {"result": {"workspaces": [{"workspace_id": "w-chat"}]}}
+        if arguments == ["pane", "get", "w-chat:p-new"]:
+            return {
+                "result": {
+                    "pane": {
+                        "pane_id": "w-chat:p-new",
+                        "workspace_id": "w-chat",
+                        "tab_id": "w-chat:t-new",
+                    }
+                }
+            }
         if arguments[:3] == ["plugin", "pane", "open"]:
             return {
                 "result": {
@@ -4332,6 +4504,7 @@ def test_glm_tab_is_created_without_path_env_and_started_with_exact_argv(
     assert len(creates) == 3
     for create in creates:  # no GLM (or any) tab gets an environment override
         assert "--env" not in create
+        assert "--no-focus" in create  # participant tabs never steal focus
     starts = {call[2]: call for call in calls if call[:2] == ["agent", "start"]}
     assert starts["glm-peer"] == [
         "agent",
