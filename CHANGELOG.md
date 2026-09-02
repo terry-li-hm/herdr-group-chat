@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [0.11.3] - 2026-09-03
 
 - Relaunching a grid-layout room no longer aborts after the peers are
   arranged. Herdr auto-closes a workspace once its last pane leaves it, so
