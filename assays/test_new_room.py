@@ -5565,9 +5565,10 @@ def test_opus_participant_and_profile_are_exact():
         "opus-peer",
         ("--model", "opus", "--effort", "high"),
     )
-    proves = lambda text, proofs: all(  # noqa: E731
-        module.sequence_present(module.pane_tokens(text), proof) for proof in proofs
-    )
+
+    def proves(text: str, proofs: tuple) -> bool:
+        return all(module.sequence_present(module.pane_tokens(text), proof) for proof in proofs)
+
     assert proves("Claude Code v2.1.258\nOpus 5 with high effort · Claude Max\n", opus.pane_proofs)
     assert not proves(
         "Claude Code v2.1.258\nFable 5.1 with high effort · Claude Max\n", opus.pane_proofs
