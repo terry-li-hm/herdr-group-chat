@@ -63,7 +63,7 @@ SOL_PANE_PROOF = (("gpt-5.6-sol",), PANE_BULLETS, ("high",))
 # and no separate reopen proof is needed — mirroring Sol.
 GLM_PANE_PROOF = (("glm-5.3",), PANE_BULLETS, ("high",))
 GROK_PI_PANE_PROOF = (("grok-4.6",), PANE_BULLETS, ("high",))
-FABLE_PANE_PROOFS = (("fable",), ("5",)), (("high",), ("effort",))
+FABLE_PANE_PROOFS = (("fable",), ("5", "5.1")), (("high",), ("effort",))
 GROK_START_ARGS = (
     "--model",
     "grok-4.6",
@@ -130,7 +130,7 @@ FABLE_PARTICIPANT = Participant(
     name="fable-peer",
     start_args=("--model", "fable", "--effort", "high"),
     pane_proofs=FABLE_PANE_PROOFS,
-    reopen_pane_proofs=((("fable",), ("5",)),),
+    reopen_pane_proofs=((("fable",), ("5", "5.1")),),
     reopen_process_argv0="claude",
     reopen_process_args=("--model", "fable", "--effort", "high"),
     model="fable",

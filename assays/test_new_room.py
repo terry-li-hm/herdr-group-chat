@@ -2473,6 +2473,10 @@ def test_pane_proof_is_bounded_token_and_sequence_matching(
     assert not proves("model gpt-5.6-sol • highest\n", sol)  # suffixed effort token
     assert not proves("provider gpt-5.6-sol openai-codex • high\n", sol)
     assert proves("Claude Code\nFable 5\nreasoning: high effort\n", fable)
+    # Claude Code 2.1.258 renders the model as `Fable 5.1 with high effort`.
+    assert proves("Claude Code v2.1.258\nFable 5.1 with high effort · Claude Max\n", fable)
+    assert not proves("Claude Code\nFable 5.10 with high effort\n", fable)
+    assert not proves("Claude Code\nFable 5.1-deluxe with high effort\n", fable)
     assert not proves("Claude Code\nFable 5-deluxe\nhigh effort\n", fable)
     assert not proves("Claude Code\nFable 5\nreasoning: effortful\n", fable)
     assert not proves("Claude Code\nPrefable 5\nhigh effort\n", fable)

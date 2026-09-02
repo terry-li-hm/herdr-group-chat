@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## [0.10.7] - 2026-09-02
+
+- Accept `Fable 5.1` as native-pane evidence for the `@fable` participant.
+  Claude Code 2.1.258 renders the model line as `Fable 5.1 with high effort`,
+  and the bounded proof required the exact token `5`, so every
+  `sol-fable*` launch failed closed at `@fable` verification. The proof now
+  accepts `5` or `5.1` as the version token; `5.10`, `5.1-deluxe` and split
+  tokens still fail closed. The reopen proof carries the same alternatives.
+
 ## [0.10.6] - 2026-08-31
 
 - Refactor the `release-smoke` harness around injectable runtime
