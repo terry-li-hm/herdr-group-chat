@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+    from collections.abc import Collection, Iterator, Mapping, Sequence
 
 PARTICIPANTS = (
     ("pi", "pi-peer"),
@@ -1351,6 +1351,25 @@ def focused_workspace_and_tab(herdr_bin: str) -> tuple[str, str]:
     return "", ""
 
 
+def live_agent_pane_id(herdr_bin: str, participant: Participant) -> str:
+    """Read a participant's live pane id ahead of a grid move.
+
+    The recorded pane ids were written by the previous arrangement, whose
+    room tab a relaunch replaces, so the live pane is addressed by name
+    instead of by the possibly-stale recorded id.
+    """
+    live = (
+        run_json(herdr_bin, ["agent", "get", participant.name]).get("result", {}).get("agent", {})
+    )
+    pane_id = str(live.get("pane_id") or "")
+    if not pane_id:
+        raise BootstrapError(
+            f"@{participant.role}: {participant.name} has no live pane to arrange",
+            code="grid_failed",
+        )
+    return pane_id
+
+
 def arrange_grid(
     herdr_bin: str,
     state: dict[str, Any],
@@ -1360,22 +1379,23 @@ def arrange_grid(
 ) -> None:
     """Move every verified peer pane into the room tab as a right-hand stack.
 
-    Runs only after the whole profile verified. `pane move` takes focus, so the
-    caller's workspace and tab are recorded first and restored once at the end.
-    Each move is read back through `agent get`; a peer that lands outside the
-    room tab fails the launch closed. Recorded pane and tab ids are rewritten so
-    reopen, adopt and /show keep addressing the live panes.
+    Runs only after the whole profile verified. Each peer's live pane id is
+    read through `agent get` immediately before its move — the previous room
+    tab is being replaced, so the recorded pane ids cannot be trusted to
+    address the live panes. A peer already inside the target room tab is
+    still moved into position, so the stack order is rebuilt idempotently.
+    `pane move` takes focus, so the caller's workspace and tab are recorded
+    first and restored once at the end. Each move is read back through
+    `agent get`; a peer that lands outside the room tab fails the launch
+    closed. Recorded pane and tab ids are rewritten so reopen, adopt and
+    /show keep addressing the live panes.
     """
     caller_workspace, caller_tab = focused_workspace_and_tab(herdr_bin)
     panes = state.setdefault("participant_pane_ids", {})
     tabs = state.setdefault("participant_tab_ids", {})
     anchor = room_pane_id
     for index, participant in enumerate(participants):
-        pane_id = str(panes.get(participant.role) or "")
-        if not pane_id:
-            raise BootstrapError(
-                f"@{participant.role}: no recorded pane to arrange", code="grid_failed"
-            )
+        pane_id = live_agent_pane_id(herdr_bin, participant)
         arguments = ["pane", "move", pane_id, "--tab", room_tab_id, "--split"]
         if index == 0:
             arguments.extend(["right", "--target-pane", anchor, "--ratio", GRID_ROOM_RATIO])
@@ -1403,6 +1423,30 @@ def arrange_grid(
         run_json(herdr_bin, ["workspace", "focus", caller_workspace])
     if caller_tab:
         run_json(herdr_bin, ["tab", "focus", caller_tab])
+
+
+def close_empty_agents_workspace(herdr_bin: str, state: dict[str, Any]) -> None:
+    """Close the backstage workspace once grid arrangement emptied it.
+
+    A grid relaunch creates a fresh backstage workspace while the live peers
+    still sit in the previous room's workspace, so an emptied backstage must
+    not linger and accumulate across relaunches. A workspace that still holds
+    any pane is never closed; a close racing the workspace's own
+    disappearance only drops the recorded id.
+    """
+    workspace_id = str(state.get("agents_workspace_id") or "")
+    if not workspace_id:
+        return
+    listed = run_json(herdr_bin, ["pane", "list", "--workspace", workspace_id])
+    panes = listed.get("result", {}).get("panes")
+    if not isinstance(panes, list) or panes:
+        return
+    try:
+        run_json(herdr_bin, ["workspace", "close", workspace_id])
+    except BootstrapError as error:
+        if error.code != "workspace_not_found":
+            raise
+    state.pop("agents_workspace_id", None)
 
 
 def launch_room(open_existing: bool, profile: str | None = None) -> int:
@@ -1546,16 +1590,32 @@ def same_cwd(left: str, right: str) -> bool:
     return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
 
 
+def accepted_workspace_ids(agents_workspace_id: str, state: Mapping[str, Any]) -> list[str]:
+    """Every workspace a live participant may occupy and still count as owned.
+
+    Compact layout owns peers only in the backstage workspace. Grid layout
+    also owns peers still sitting in the recorded participant workspace from
+    the previous arrangement, so relaunching a grid room reuses its live
+    peers instead of failing closed against a freshly created backstage.
+    """
+    accepted = [agents_workspace_id]
+    if state.get("layout") == "grid":
+        participant_workspace_id = str(state.get("participant_workspace_id") or "")
+        if participant_workspace_id and participant_workspace_id not in accepted:
+            accepted.append(participant_workspace_id)
+    return accepted
+
+
 def ownership_mismatch_reasons(
     live_agent: Mapping[str, Any],
-    agents_workspace_id: str,
+    accepted_workspace_ids: Collection[str],
     live_cwd: str,
     agent_cwd: str,
     recorded_pane_id: str | None,
 ) -> list[str]:
     """Name every failed ownership check for an already-live participant."""
     reasons: list[str] = []
-    if str(live_agent.get("workspace_id")) != agents_workspace_id:
+    if str(live_agent.get("workspace_id")) not in accepted_workspace_ids:
         reasons.append("different workspace")
     if not live_cwd or not same_cwd(live_cwd, agent_cwd):
         reasons.append("different cwd")
@@ -1707,6 +1767,7 @@ def start_participants(
     participant_panes = state.setdefault("participant_pane_ids", {})
     participant_tabs = state.setdefault("participant_tab_ids", {})
     pending_tabs = state.setdefault("pending_participant_tabs", {})
+    accepted_ids = accepted_workspace_ids(agents_workspace_id, state)
     for participant in participants:
         role = participant.role
         name = participant.name
@@ -1730,7 +1791,7 @@ def start_participants(
                 print(f"failed @{role}", flush=True)
                 continue
             if (
-                str(live_agent.get("workspace_id")) != agents_workspace_id
+                str(live_agent.get("workspace_id")) not in accepted_ids
                 or not live_cwd
                 or not same_cwd(live_cwd, agent_cwd)
                 or (has_recorded_pane and recorded_pane_id != str(live_agent.get("pane_id")))
@@ -1738,13 +1799,13 @@ def start_participants(
             ):
                 reasons = ", ".join(
                     ownership_mismatch_reasons(
-                        live_agent, agents_workspace_id, live_cwd, agent_cwd, recorded_pane_id
+                        live_agent, accepted_ids, live_cwd, agent_cwd, recorded_pane_id
                     )
                 )
                 failures.append(
                     f"@{role}: {name} is live in workspace "
                     f"{live_agent.get('workspace_id')} but this launcher owns "
-                    f"{agents_workspace_id} ({reasons}); run the Adopt stale "
+                    f"{' or '.join(accepted_ids)} ({reasons}); run the Adopt stale "
                     "group-chat peers action or close that peer tab"
                 )
                 print(f"failed @{role}", flush=True)
@@ -2298,6 +2359,10 @@ def main() -> int:
             state_dir,
             state_path,
         )
+        if layout == "grid" and not failures:
+            # The peers now live in the room tab; the emptied backstage must
+            # not linger and accumulate across grid relaunches.
+            close_empty_agents_workspace(herdr_bin, state)
         if tab_id:
             with suppress(BootstrapError):
                 assert_server_identity(state_dir, state_path)

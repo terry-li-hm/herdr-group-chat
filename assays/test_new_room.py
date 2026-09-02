@@ -5587,6 +5587,34 @@ def test_arrange_grid_moves_in_roster_order_rewrites_ids_and_restores_focus(
 ):
     calls: list[list[str]] = []
     roster = module.resolve_profile("sol-fable-grok-pi")
+    moved: set[str] = set()
+
+    def role_of(name: str) -> str:
+        return name.removesuffix("-peer").replace("grok46pi", "grok")
+
+    def agent_payload(name: str) -> dict:
+        role = role_of(name)
+        if role in moved:
+            return {
+                "result": {
+                    "agent": {
+                        "pane_id": f"w-chat:p-{role}-moved",
+                        "tab_id": "w-chat:t-room",
+                        "workspace_id": "w-chat",
+                    }
+                }
+            }
+        # Sol never left the room tab of a partial relaunch; it is still moved.
+        tab = "w-chat:t-room" if role == "sol" else "w-old:t-room"
+        return {
+            "result": {
+                "agent": {
+                    "pane_id": f"w-old:p-{role}",
+                    "tab_id": tab,
+                    "workspace_id": "w-old",
+                }
+            }
+        }
 
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
@@ -5609,40 +5637,36 @@ def test_arrange_grid_moves_in_roster_order_rewrites_ids_and_restores_focus(
                 }
             }
         if arguments[:2] == ["agent", "get"]:
-            role = arguments[2].split("-")[0].replace("grok46pi", "grok")
-            return {
-                "result": {
-                    "agent": {
-                        "pane_id": f"w-chat:p-{role}-moved",
-                        "tab_id": "w-chat:t-room",
-                        "workspace_id": "w-chat",
-                    }
-                }
-            }
+            return agent_payload(arguments[2])
+        if arguments[:2] == ["pane", "move"]:
+            moved.add(arguments[2].split(":p-", 1)[1])
         return {"result": {"type": "ok"}}
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
     state: dict = {
+        # Stale ids from the replaced room tab; the live reads must bypass them.
         "participant_pane_ids": {
-            "sol": "w-agents:p-sol",
-            "fable": "w-agents:p-fable",
-            "grok": "w-agents:p-grok",
+            "sol": "w-gone:p-sol",
+            "fable": "w-gone:p-fable",
+            "grok": "w-gone:p-grok",
         },
         "participant_tab_ids": {
-            "sol": "w-agents:t-sol",
-            "fable": "w-agents:t-fable",
-            "grok": "w-agents:t-grok",
+            "sol": "w-gone:t-sol",
+            "fable": "w-gone:t-fable",
+            "grok": "w-gone:t-grok",
         },
     }
     module.arrange_grid(
         "herdr", state, roster, room_pane_id="w-chat:p-room", room_tab_id="w-chat:t-room"
     )
+    # Every move targets the live pane id read immediately before it, in
+    # roster order; Sol, already inside the room tab, is still moved.
     moves = [call for call in calls if call[:2] == ["pane", "move"]]
     assert moves == [
         [
             "pane",
             "move",
-            "w-agents:p-sol",
+            "w-old:p-sol",
             "--tab",
             "w-chat:t-room",
             "--split",
@@ -5655,7 +5679,7 @@ def test_arrange_grid_moves_in_roster_order_rewrites_ids_and_restores_focus(
         [
             "pane",
             "move",
-            "w-agents:p-fable",
+            "w-old:p-fable",
             "--tab",
             "w-chat:t-room",
             "--split",
@@ -5666,7 +5690,7 @@ def test_arrange_grid_moves_in_roster_order_rewrites_ids_and_restores_focus(
         [
             "pane",
             "move",
-            "w-agents:p-grok",
+            "w-old:p-grok",
             "--tab",
             "w-chat:t-room",
             "--split",
@@ -5675,6 +5699,10 @@ def test_arrange_grid_moves_in_roster_order_rewrites_ids_and_restores_focus(
             "w-chat:p-fable-moved",
         ],
     ]
+    for move in moves:
+        role = move[2].split(":p-", 1)[1]
+        name = "grok46pi-peer" if role == "grok" else f"{role}-peer"
+        assert calls.index(["agent", "get", name]) < calls.index(move)
     assert state["participant_pane_ids"] == {
         "sol": "w-chat:p-sol-moved",
         "fable": "w-chat:p-fable-moved",
@@ -5761,3 +5789,334 @@ def test_launch_passes_layout_env_and_opus_profile(tmp_path: Path, monkeypatch: 
     opened = next(call for call in calls if call[:3] == ["plugin", "pane", "open"])
     assert "HERDR_GROUP_CHAT_PROFILE=sol-fable-grok-opus-pi" in opened
     assert "HERDR_GROUP_CHAT_LAYOUT=grid" in opened
+
+
+def test_grid_relaunch_ownership_accepts_the_recorded_participant_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A grid relaunch reuses live peers still sitting in the recorded room workspace."""
+    calls: list[list[str]] = []
+    roles = (("sol", "pi", "sol-peer"), ("fable", "claude", "fable-peer"))
+
+    def relaunch(layout: str | None, live_workspace_id: str) -> list[str]:
+        calls.clear()
+        live = [
+            {
+                "name": name,
+                "kind": kind,
+                "workspace_id": live_workspace_id,
+                "cwd": str(tmp_path),
+                "pane_id": f"{live_workspace_id}:p-{role}",
+                "tab_id": f"{live_workspace_id}:t-{role}",
+            }
+            for role, kind, name in roles
+        ]
+        screens = {
+            f"{live_workspace_id}:p-sol": SOL_SCREEN,
+            f"{live_workspace_id}:p-fable": FABLE_SCREEN,
+        }
+        install_profile_host(
+            monkeypatch,
+            calls,
+            screens,
+            live_agents=live,
+            process_infos={f"{live_workspace_id}:p-fable": CLAUDE_FABLE_PROCESS},
+        )
+        state: dict = {
+            "schema_version": 1,
+            "agents_workspace_id": "w-backstage",
+            "participant_workspace_id": "w-room",
+            "participant_pane_ids": {"sol": live[0]["pane_id"], "fable": live[1]["pane_id"]},
+            "participant_tab_ids": {"sol": live[0]["tab_id"], "fable": live[1]["tab_id"]},
+        }
+        if layout is not None:
+            state["layout"] = layout
+        return module.start_participants(
+            "herdr",
+            str(tmp_path),
+            "w-backstage",
+            tmp_path,
+            launcher_state_path(tmp_path),
+            state,
+            participants=module.resolve_profile("sol-fable"),
+        )
+
+    # Grid layout owns the recorded participant workspace: the live peers are
+    # verified and reused, and nothing is started.
+    assert relaunch("grid", "w-room") == []
+    assert not any(call[:2] in (["tab", "create"], ["agent", "start"]) for call in calls)
+
+    # Compact layout keeps rejecting the same peers, with the exact single-id message.
+    assert relaunch("compact", "w-room") == [
+        "@sol: sol-peer is live in workspace w-room but this launcher owns w-backstage "
+        "(different workspace); run the Adopt stale group-chat peers action or "
+        "close that peer tab",
+        "@fable: fable-peer is live in workspace w-room but this launcher owns "
+        "w-backstage (different workspace); run the Adopt stale group-chat peers "
+        "action or close that peer tab",
+    ]
+
+    # A peer in an unrelated workspace is rejected by both layouts; the grid
+    # failure lists both accepted workspace ids.
+    assert relaunch("grid", "w-unrelated") == [
+        "@sol: sol-peer is live in workspace w-unrelated but this launcher owns "
+        "w-backstage or w-room (different workspace); run the Adopt stale "
+        "group-chat peers action or close that peer tab",
+        "@fable: fable-peer is live in workspace w-unrelated but this launcher owns "
+        "w-backstage or w-room (different workspace); run the Adopt stale "
+        "group-chat peers action or close that peer tab",
+    ]
+    assert relaunch("compact", "w-unrelated") == [
+        "@sol: sol-peer is live in workspace w-unrelated but this launcher owns "
+        "w-backstage (different workspace); run the Adopt stale group-chat peers "
+        "action or close that peer tab",
+        "@fable: fable-peer is live in workspace w-unrelated but this launcher owns "
+        "w-backstage (different workspace); run the Adopt stale group-chat peers "
+        "action or close that peer tab",
+    ]
+
+
+def test_arrange_grid_reads_the_live_pane_id_not_the_recorded_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The previous room tab is being replaced, so recorded ids may address nothing."""
+    calls: list[list[str]] = []
+    moved: set[str] = set()
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["workspace", "list"]:
+            return {"result": {"workspaces": []}}
+        if arguments[:2] == ["agent", "get"]:
+            name = arguments[2]
+            if name in moved:
+                return {
+                    "result": {
+                        "agent": {
+                            "pane_id": f"w-chat:p-{name}-moved",
+                            "tab_id": "w-chat:t-room",
+                            "workspace_id": "w-chat",
+                        }
+                    }
+                }
+            return {
+                "result": {
+                    "agent": {
+                        "pane_id": f"w-old:p-{name}",
+                        "tab_id": "w-old:t-room",
+                        "workspace_id": "w-old",
+                    }
+                }
+            }
+        if arguments[:2] == ["pane", "move"]:
+            moved.add(arguments[2].split(":p-", 1)[1])
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {
+        "participant_pane_ids": {"sol": "w-gone:p-sol", "fable": "w-gone:p-fable"},
+        "participant_tab_ids": {"sol": "w-gone:t-sol", "fable": "w-gone:t-fable"},
+    }
+    module.arrange_grid(
+        "herdr",
+        state,
+        module.resolve_profile("sol-fable"),
+        room_pane_id="w-chat:p-room",
+        room_tab_id="w-chat:t-room",
+    )
+
+    # The stale recorded ids reach no command; each move uses the live pane id
+    # read through `agent get` immediately before it.
+    assert all("w-gone" not in argument for call in calls for argument in call)
+    moves = [call for call in calls if call[:2] == ["pane", "move"]]
+    assert [move[2] for move in moves] == ["w-old:p-sol-peer", "w-old:p-fable-peer"]
+    for name in ("sol-peer", "fable-peer"):
+        assert calls.index(["agent", "get", name]) < calls.index(
+            next(move for move in moves if move[2] == f"w-old:p-{name}")
+        )
+    # The recorded ids are rewritten from the post-move reads, as today.
+    assert state["participant_pane_ids"] == {
+        "sol": "w-chat:p-sol-peer-moved",
+        "fable": "w-chat:p-fable-peer-moved",
+    }
+
+
+def test_close_empty_agents_workspace_closes_only_a_paneless_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    panes_by_workspace: dict[str, list[dict]] = {"w-backstage": []}
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments[:2] == ["pane", "list"]:
+            return {"result": {"panes": panes_by_workspace[arguments[3]]}}
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+
+    # No panes left: the backstage workspace is closed and unrecorded.
+    state: dict = {"agents_workspace_id": "w-backstage"}
+    module.close_empty_agents_workspace("herdr", state)
+    assert calls == [
+        ["pane", "list", "--workspace", "w-backstage"],
+        ["workspace", "close", "w-backstage"],
+    ]
+    assert "agents_workspace_id" not in state
+
+    # A workspace that still holds any pane is never closed.
+    calls.clear()
+    panes_by_workspace["w-backstage"] = [{"pane_id": "w-backstage:p-hold"}]
+    state = {"agents_workspace_id": "w-backstage"}
+    module.close_empty_agents_workspace("herdr", state)
+    assert calls == [["pane", "list", "--workspace", "w-backstage"]]
+    assert state["agents_workspace_id"] == "w-backstage"
+
+    # No recorded backstage workspace means nothing to close.
+    calls.clear()
+    module.close_empty_agents_workspace("herdr", {})
+    assert calls == []
+
+
+def test_grid_relaunch_reuses_live_peers_and_closes_the_emptied_backstage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end: peers in the recorded room workspace are reused, rearranged
+    into the new room tab, and the emptied backstage workspace is closed."""
+    captured: dict[str, object] = {}
+    profile_launch_env(tmp_path, monkeypatch, captured)
+    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable-grok")
+    monkeypatch.setenv(module.ROOM_ENV, "chat-sfg")
+    monkeypatch.setenv(module.LAYOUT_ENV, "grid")
+    live = [
+        {
+            "name": "sol-peer",
+            "kind": "pi",
+            "workspace_id": "w-room",
+            "cwd": str(tmp_path),
+            "pane_id": "w-room:p-sol",
+            "tab_id": "w-room:t-sol",
+        },
+        {
+            "name": "fable-peer",
+            "kind": "claude",
+            "workspace_id": "w-room",
+            "cwd": str(tmp_path),
+            "pane_id": "w-room:p-fable",
+            "tab_id": "w-room:t-fable",
+        },
+        {
+            "name": "grok46-peer",
+            "kind": "grok",
+            "workspace_id": "w-room",
+            "cwd": str(tmp_path),
+            "pane_id": "w-room:p-grok",
+            "tab_id": "w-room:t-grok",
+        },
+    ]
+    calls: list[list[str]] = []
+    install_profile_host(
+        monkeypatch,
+        calls,
+        {"w-room:p-sol": SOL_SCREEN, "w-room:p-fable": FABLE_SCREEN, "w-room:p-grok": GROK_SCREEN},
+        live_agents=live,
+        process_infos={"w-room:p-fable": CLAUDE_FABLE_PROCESS, "w-room:p-grok": GROK_PROCESS},
+    )
+    moved: set[str] = set()
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {"result": {"agents": live}}
+        if arguments == ["workspace", "list"]:
+            return {
+                "result": {
+                    "workspaces": [
+                        {"workspace_id": "w-chat", "label": "group-chat"},
+                        {"workspace_id": "w-room", "label": "group-chat"},
+                    ]
+                }
+            }
+        if arguments[:2] == ["workspace", "create"]:
+            # The previous backstage workspace vanished; the relaunch gets a fresh one.
+            return {
+                "result": {
+                    "workspace": {"workspace_id": "w-backstage"},
+                    "tab": {"tab_id": "w-backstage:t-ph"},
+                }
+            }
+        if arguments[:2] == ["agent", "get"]:
+            role = arguments[2].removesuffix("-peer").replace("grok46", "grok")
+            if role in moved:
+                return {
+                    "result": {
+                        "agent": {
+                            "pane_id": f"w-chat:p-{role}-m",
+                            "tab_id": "w-chat:t-room",
+                            "workspace_id": "w-chat",
+                        }
+                    }
+                }
+            return {
+                "result": {
+                    "agent": {
+                        "pane_id": f"w-room:p-{role}",
+                        "tab_id": f"w-room:t-{role}",
+                        "workspace_id": "w-room",
+                    }
+                }
+            }
+        if arguments[:2] == ["pane", "process-info"]:
+            processes = {
+                "w-room:p-fable": CLAUDE_FABLE_PROCESS,
+                "w-room:p-grok": GROK_PROCESS,
+            }.get(arguments[arguments.index("--pane") + 1], [{"name": "zsh"}])
+            return {"result": {"process_info": {"foreground_processes": processes}}}
+        if arguments[:2] == ["pane", "move"]:
+            moved.add(arguments[2].split(":p-", 1)[1])
+        if arguments[:2] == ["pane", "list"]:
+            return {"result": {"panes": []}}
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state = sfg_room_state(tmp_path)
+    state["agents_workspace_id"] = "w-backstage-gone"
+    state["layout"] = "grid"
+    state["participant_workspace_id"] = "w-room"
+    state["participant_pane_ids"] = {
+        "sol": "w-room:p-sol",
+        "fable": "w-room:p-fable",
+        "grok": "w-room:p-grok",
+    }
+    state["participant_tab_ids"] = {
+        "sol": "w-room:t-sol",
+        "fable": "w-room:t-fable",
+        "grok": "w-room:t-grok",
+    }
+    save_launcher_state(tmp_path, state)
+
+    module.main()
+
+    # The live peers were reused and rearranged, never restarted.
+    assert not any(call[:2] in (["tab", "create"], ["agent", "start"]) for call in calls)
+    moves = [call for call in calls if call[:2] == ["pane", "move"]]
+    assert [move[2] for move in moves] == ["w-room:p-sol", "w-room:p-fable", "w-room:p-grok"]
+    # The emptied fresh backstage workspace is closed after its placeholder tab.
+    assert ["tab", "close", "w-backstage:t-ph"] in calls
+    assert calls.index(["tab", "close", "w-backstage:t-ph"]) < calls.index(
+        ["workspace", "close", "w-backstage"]
+    )
+    argv = captured["argv"]
+    assert "--agents-workspace" not in argv
+    final_state = load_launcher_state(tmp_path)
+    assert "agents_workspace_id" not in final_state
+    assert final_state["layout"] == "grid"
+    assert final_state["participant_workspace_id"] == "w-chat"
+    assert final_state["participant_pane_ids"] == {
+        "sol": "w-chat:p-sol-m",
+        "fable": "w-chat:p-fable-m",
+        "grok": "w-chat:p-grok-m",
+    }

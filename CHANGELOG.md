@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+- Relaunching a grid-layout room now reuses its live peers. The previous
+  arrangement had moved every peer into the room workspace, but ownership
+  still accepted only the freshly created backstage workspace, so `New group
+  chat` failed closed for every live peer with "different workspace". In grid
+  layout a live participant is now owned in either the backstage workspace or
+  the recorded participant workspace, with its cwd and recorded pane id still
+  required to match; compact layout is unchanged, and the failure message
+  names both accepted workspaces when they differ.
+- `arrange_grid` reads each peer's live pane id through `agent get` immediately
+  before moving it, because a relaunch replaces the previous room tab and the
+  recorded pane ids can no longer be trusted to address the live panes. A peer
+  already inside the target room tab is still moved into position, so the
+  stack order is rebuilt idempotently; recorded ids are rewritten after each
+  move as before.
+- The emptied backstage workspace no longer accumulates. After a successful
+  grid arrangement and its placeholder-tab cleanup, a backstage workspace
+  that `pane list` reports as having no panes left is closed with
+  `workspace close` and dropped from launcher state; a workspace that still
+  holds any pane is never closed.
+
 ## [0.11.1] - 2026-09-03
 
 - The room TUI now enables SGR mouse reporting on entry (`\x1b[?1000h` with
