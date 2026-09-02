@@ -465,6 +465,31 @@ effort `high` only after every role verifies.
 Pi-xAI is an external route. Payload eligibility remains task-specific, so the
 room disclosure boundary applies to every message addressed to `@grok`.
 
+## Settings: grid layout and Opus
+
+Optional operator settings live in `settings.toml` inside the plugin config
+directory printed by `herdr plugin config-dir terry.herdr-group-chat`. A missing
+file means defaults; an invalid value or unknown key fails the launch closed.
+
+```toml
+layout = "grid"   # "compact" (default) keeps peers in the backstage workspace
+opus = true       # default false; adds @opus to the default `new` action
+```
+
+With `layout = "grid"`, the default room becomes one tab: the room pane on the
+left and each participant's native session stacked on the right in roster
+order, so the group chat and every model's own dialogue are visible together.
+Peers still start and verify in the backstage workspace exactly as in compact
+layout; only after the whole profile verifies are they moved, their recorded
+pane ids rewritten, and the caller's workspace and tab restored. `/agents`
+reports the backstage workspace as unavailable in grid layout; `/show <role>`
+focuses the peer pane inside the room tab.
+
+With `opus = true`, `New group chat` launches the `sol-fable-grok-opus-pi`
+profile: `@sol`, `@fable` and `@grok` as before plus `@opus` running Claude
+Code as `opus-peer` with `--model opus --effort high`, verified by the bounded
+`Opus 5` and `high effort` tokens in its native pane. Sol synthesises reviews.
+
 ## Retained native Sol + Fable + Grok profile
 
 `New Sol + Fable + Grok native chat` retains `sol-fable-grok` for stored rooms

@@ -5503,3 +5503,260 @@ def test_inspection_argument_parsing_is_exact() -> None:
     for arguments in (["--errors"], ["--errors", "0"], ["--errors", "x"], ["--errors", "1", "2"]):
         with pytest.raises(BootstrapError, match="requires a positive record count"):
             module.parse_launch_arguments(arguments)
+
+
+# --- settings, grid layout and the Opus participant ------------------------------------
+
+
+def test_settings_default_when_file_is_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("HERDR_GROUP_CHAT_SETTINGS", str(tmp_path / "none.toml"))
+    assert module.load_settings("terry.herdr-group-chat") == module.Settings()
+    assert module.load_settings("terry.herdr-group-chat").layout == "compact"
+
+
+def test_settings_parse_grid_and_opus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    path = tmp_path / "settings.toml"
+    path.write_text('layout = "grid"\nopus = true\n')
+    monkeypatch.setenv("HERDR_GROUP_CHAT_SETTINGS", str(path))
+    settings = module.load_settings("terry.herdr-group-chat")
+    assert settings == module.Settings(layout="grid", opus=True)
+    assert module.apply_settings_profile("sol-fable-grok-pi", settings) == "sol-fable-grok-opus-pi"
+    assert module.apply_settings_profile("sol-fable", settings) == "sol-fable"
+    assert module.apply_settings_profile(None, settings) is None
+    assert (
+        module.apply_settings_profile("sol-fable-grok-pi", module.Settings()) == "sol-fable-grok-pi"
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    ['layout = "wide"\n', "opus = 1\n", 'layout = "grid"\nextra = true\n', "layout = [\n"],
+)
+def test_settings_fail_closed_on_invalid_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str
+):
+    path = tmp_path / "settings.toml"
+    path.write_text(body)
+    monkeypatch.setenv("HERDR_GROUP_CHAT_SETTINGS", str(path))
+    with pytest.raises(module.BootstrapError) as raised:
+        module.load_settings("terry.herdr-group-chat")
+    assert raised.value.code == "settings_invalid"
+
+
+def test_settings_path_prefers_override_then_config_dir_then_xdg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv("HERDR_GROUP_CHAT_SETTINGS", raising=False)
+    monkeypatch.setenv("HERDR_PLUGIN_CONFIG_DIR", str(tmp_path / "cfg"))
+    assert module.settings_path("x") == tmp_path / "cfg" / "settings.toml"
+    monkeypatch.delenv("HERDR_PLUGIN_CONFIG_DIR")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert module.settings_path("x") == (
+        tmp_path / "xdg" / "herdr" / "plugins" / "config" / "x" / "settings.toml"
+    )
+    monkeypatch.setenv("HERDR_GROUP_CHAT_SETTINGS", str(tmp_path / "o.toml"))
+    assert module.settings_path("x") == tmp_path / "o.toml"
+
+
+def test_opus_participant_and_profile_are_exact():
+    opus = module.OPUS_PARTICIPANT
+    assert (opus.kind, opus.name, opus.start_args) == (
+        "claude",
+        "opus-peer",
+        ("--model", "opus", "--effort", "high"),
+    )
+    proves = lambda text, proofs: all(  # noqa: E731
+        module.sequence_present(module.pane_tokens(text), proof) for proof in proofs
+    )
+    assert proves("Claude Code v2.1.258\nOpus 5 with high effort · Claude Max\n", opus.pane_proofs)
+    assert not proves(
+        "Claude Code v2.1.258\nFable 5.1 with high effort · Claude Max\n", opus.pane_proofs
+    )
+    assert not proves("Claude Code\nOpus 5-deluxe with high effort\n", opus.pane_proofs)
+    roster = module.resolve_profile("sol-fable-grok-opus-pi")
+    assert [participant.role for participant in roster] == ["sol", "fable", "grok", "opus"]
+    assert roster[2] is module.GROK_PI_PARTICIPANT
+    arguments, _ = module.profile_room_exec("sol-fable-grok-opus-pi", roster)
+    assert arguments[-2:] == ["--synthesizer", "sol"]
+    assert "--agent" in arguments and "opus=opus-peer" in arguments
+
+
+def test_arrange_grid_moves_in_roster_order_rewrites_ids_and_restores_focus(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[list[str]] = []
+    roster = module.resolve_profile("sol-fable-grok-pi")
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["workspace", "list"]:
+            return {
+                "result": {
+                    "workspaces": [
+                        {
+                            "workspace_id": "w-chat",
+                            "focused": False,
+                            "active_tab_id": "w-chat:t-room",
+                        },
+                        {
+                            "workspace_id": "w-caller",
+                            "focused": True,
+                            "active_tab_id": "w-caller:t9",
+                        },
+                    ]
+                }
+            }
+        if arguments[:2] == ["agent", "get"]:
+            role = arguments[2].split("-")[0].replace("grok46pi", "grok")
+            return {
+                "result": {
+                    "agent": {
+                        "pane_id": f"w-chat:p-{role}-moved",
+                        "tab_id": "w-chat:t-room",
+                        "workspace_id": "w-chat",
+                    }
+                }
+            }
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {
+        "participant_pane_ids": {
+            "sol": "w-agents:p-sol",
+            "fable": "w-agents:p-fable",
+            "grok": "w-agents:p-grok",
+        },
+        "participant_tab_ids": {
+            "sol": "w-agents:t-sol",
+            "fable": "w-agents:t-fable",
+            "grok": "w-agents:t-grok",
+        },
+    }
+    module.arrange_grid(
+        "herdr", state, roster, room_pane_id="w-chat:p-room", room_tab_id="w-chat:t-room"
+    )
+    moves = [call for call in calls if call[:2] == ["pane", "move"]]
+    assert moves == [
+        [
+            "pane",
+            "move",
+            "w-agents:p-sol",
+            "--tab",
+            "w-chat:t-room",
+            "--split",
+            "right",
+            "--target-pane",
+            "w-chat:p-room",
+            "--ratio",
+            "0.55",
+        ],
+        [
+            "pane",
+            "move",
+            "w-agents:p-fable",
+            "--tab",
+            "w-chat:t-room",
+            "--split",
+            "down",
+            "--target-pane",
+            "w-chat:p-sol-moved",
+        ],
+        [
+            "pane",
+            "move",
+            "w-agents:p-grok",
+            "--tab",
+            "w-chat:t-room",
+            "--split",
+            "down",
+            "--target-pane",
+            "w-chat:p-fable-moved",
+        ],
+    ]
+    assert state["participant_pane_ids"] == {
+        "sol": "w-chat:p-sol-moved",
+        "fable": "w-chat:p-fable-moved",
+        "grok": "w-chat:p-grok-moved",
+    }
+    assert state["participant_tab_ids"] == dict.fromkeys(("sol", "fable", "grok"), "w-chat:t-room")
+    assert state["participant_workspace_id"] == "w-chat"
+    assert state["layout"] == "grid"
+    assert calls[-2:] == [["workspace", "focus", "w-caller"], ["tab", "focus", "w-caller:t9"]]
+    # Focus is restored only after the last move.
+    assert calls.index(moves[-1]) < calls.index(["workspace", "focus", "w-caller"])
+
+
+def test_arrange_grid_fails_closed_when_a_peer_lands_outside_the_room_tab(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        if arguments == ["workspace", "list"]:
+            return {"result": {"workspaces": []}}
+        if arguments[:2] == ["agent", "get"]:
+            return {
+                "result": {
+                    "agent": {"pane_id": "w-x:p1", "tab_id": "w-x:t1", "workspace_id": "w-x"}
+                }
+            }
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {"participant_pane_ids": {"sol": "w-agents:p-sol"}, "participant_tab_ids": {}}
+    with pytest.raises(module.BootstrapError) as raised:
+        module.arrange_grid(
+            "herdr",
+            state,
+            module.resolve_profile("sol-fable")[:1],
+            room_pane_id="w-chat:p-room",
+            room_tab_id="w-chat:t-room",
+        )
+    assert raised.value.code == "grid_failed"
+    assert "layout" not in state
+
+
+def test_adopted_workspace_acceptable_by_label_or_grid_room():
+    backstage = {"label": "agents · group-chat"}
+    room = {"label": "group-chat"}
+    assert module.adopted_workspace_acceptable({}, "w-agents", backstage)
+    assert not module.adopted_workspace_acceptable({}, "w-chat", room)
+    grid_state = {"layout": "grid", "participant_workspace_id": "w-chat"}
+    assert module.adopted_workspace_acceptable(grid_state, "w-chat", room)
+    assert not module.adopted_workspace_acceptable(grid_state, "w-other", room)
+    assert not module.adopted_workspace_acceptable(
+        {"layout": "compact", "participant_workspace_id": "w-chat"}, "w-chat", room
+    )
+
+
+def test_launch_passes_layout_env_and_opus_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    path = tmp_path / "settings.toml"
+    path.write_text('layout = "grid"\nopus = true\n')
+    monkeypatch.setenv("HERDR_GROUP_CHAT_SETTINGS", str(path))
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"workspace_cwd": str(tmp_path)}))
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["workspace", "list"]:
+            return {"result": {"workspaces": []}}
+        if arguments[:2] == ["workspace", "create"]:
+            return {
+                "result": {"workspace": {"workspace_id": "w-chat"}, "tab": {"tab_id": "w-chat:t-p"}}
+            }
+        if arguments[:3] == ["plugin", "pane", "open"]:
+            return {
+                "result": {
+                    "plugin_pane": {"pane": {"pane_id": "w-chat:p-new", "tab_id": "w-chat:t-new"}}
+                }
+            }
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    assert module.launch_room(open_existing=False, profile="sol-fable-grok-pi") == 0
+    opened = next(call for call in calls if call[:3] == ["plugin", "pane", "open"])
+    assert "HERDR_GROUP_CHAT_PROFILE=sol-fable-grok-opus-pi" in opened
+    assert "HERDR_GROUP_CHAT_LAYOUT=grid" in opened

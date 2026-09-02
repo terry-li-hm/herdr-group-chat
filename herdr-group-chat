@@ -53,12 +53,14 @@ PROFILE_ROLES = {
     "sol-fable": ("sol", "fable"),
     "sol-fable-grok": ("sol", "fable", "grok"),
     "sol-fable-grok-pi": ("sol", "fable", "grok"),
+    "sol-fable-grok-opus-pi": ("sol", "fable", "grok", "opus"),
     "sol-fable-glm": ("sol", "fable", "glm"),
 }
 PROFILE_SYNTHESIZER = {
     "sol-fable": "sol",
     "sol-fable-grok": "sol",
     "sol-fable-grok-pi": "sol",
+    "sol-fable-grok-opus-pi": "sol",
     "sol-fable-glm": "sol",
 }
 PROFILE_RECEIPT_KIND = "profile_receipt"

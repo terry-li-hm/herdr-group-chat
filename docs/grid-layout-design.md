@@ -1,6 +1,6 @@
 # Grid layout design (proposed, not built)
 
-Date: 2026-09-02. Status: design only; no code, no contract change yet.
+Date: 2026-09-02. Status: implemented in 0.11.0 on 2026-09-03 as the `layout` and `opus` settings; see README "Settings: grid layout and Opus".
 
 ## Ask
 

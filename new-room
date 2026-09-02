@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import traceback
 import uuid
 from contextlib import contextmanager, suppress
@@ -42,6 +43,13 @@ AGENTS_WORKSPACE_ENV = "HERDR_GROUP_CHAT_AGENTS_WORKSPACE_ID"
 AGENT_CWD_ENV = "HERDR_GROUP_CHAT_AGENT_CWD"
 ROOM_OPERATION_ENV = "HERDR_GROUP_CHAT_OPERATION_ID"
 SETUP_FAILURES_ENV = "HERDR_GROUP_CHAT_SETUP_FAILURES"
+LAYOUT_ENV = "HERDR_GROUP_CHAT_LAYOUT"
+SETTINGS_ENV = "HERDR_GROUP_CHAT_SETTINGS"
+SETTINGS_FILENAME = "settings.toml"
+LAYOUTS = ("compact", "grid")
+DEFAULT_PROFILE = "sol-fable-grok-pi"
+OPUS_DEFAULT_PROFILE = "sol-fable-grok-opus-pi"
+GRID_ROOM_RATIO = "0.55"
 PROFILE_RECEIPT_ENV = "HERDR_GROUP_CHAT_PROFILE_RECEIPT"
 NO_HOLD_ENV = "HERDR_GROUP_CHAT_NO_HOLD"
 LAUNCHER_ERRORS_NAME = "launcher-errors.jsonl"
@@ -64,6 +72,7 @@ SOL_PANE_PROOF = (("gpt-5.6-sol",), PANE_BULLETS, ("high",))
 GLM_PANE_PROOF = (("glm-5.3",), PANE_BULLETS, ("high",))
 GROK_PI_PANE_PROOF = (("grok-4.6",), PANE_BULLETS, ("high",))
 FABLE_PANE_PROOFS = (("fable",), ("5", "5.1")), (("high",), ("effort",))
+OPUS_PANE_PROOFS = (("opus",), ("5",)), (("high",), ("effort",))
 GROK_START_ARGS = (
     "--model",
     "grok-4.6",
@@ -137,6 +146,19 @@ FABLE_PARTICIPANT = Participant(
     effort="high",
 )
 
+OPUS_PARTICIPANT = Participant(
+    role="opus",
+    kind="claude",
+    name="opus-peer",
+    start_args=("--model", "opus", "--effort", "high"),
+    pane_proofs=OPUS_PANE_PROOFS,
+    reopen_pane_proofs=((("opus",), ("5",)),),
+    reopen_process_argv0="claude",
+    reopen_process_args=("--model", "opus", "--effort", "high"),
+    model="opus",
+    effort="high",
+)
+
 GROK_PARTICIPANT = Participant(
     role="grok",
     kind="grok",
@@ -194,6 +216,12 @@ PROFILE_PARTICIPANTS: dict[str, tuple[Participant, ...]] = {
     "sol-fable": (SOL_PARTICIPANT, FABLE_PARTICIPANT),
     "sol-fable-grok": (SOL_PARTICIPANT, FABLE_PARTICIPANT, GROK_PARTICIPANT),
     "sol-fable-grok-pi": (SOL_PARTICIPANT, FABLE_PARTICIPANT, GROK_PI_PARTICIPANT),
+    "sol-fable-grok-opus-pi": (
+        SOL_PARTICIPANT,
+        FABLE_PARTICIPANT,
+        GROK_PI_PARTICIPANT,
+        OPUS_PARTICIPANT,
+    ),
     "sol-fable-glm": (SOL_PARTICIPANT, FABLE_PARTICIPANT, GLM_PARTICIPANT),
 }
 
@@ -1249,12 +1277,144 @@ def register_room_pane(
     state.pop("pending_room_started_unix_ms", None)
 
 
+@dataclass(frozen=True)
+class Settings:
+    """Operator settings from the plugin config directory; every field has a default."""
+
+    layout: str = "compact"
+    opus: bool = False
+
+
+def settings_path(plugin_id: str) -> Path:
+    """Explicit override, then Herdr's config dir, then the XDG default location."""
+    override = os.environ.get(SETTINGS_ENV, "").strip()
+    if override:
+        return Path(override)
+    configured = os.environ.get("HERDR_PLUGIN_CONFIG_DIR", "").strip()
+    if configured:
+        return Path(configured) / SETTINGS_FILENAME
+    base = os.environ.get("XDG_CONFIG_HOME", "").strip() or str(Path.home() / ".config")
+    return Path(base) / "herdr" / "plugins" / "config" / plugin_id / SETTINGS_FILENAME
+
+
+def load_settings(plugin_id: str) -> Settings:
+    """Read settings.toml; a missing file means defaults, an invalid one fails closed."""
+    path = settings_path(plugin_id)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return Settings()
+    except OSError as error:
+        raise BootstrapError(
+            f"settings unreadable at {path}: {error}", code="settings_invalid"
+        ) from error
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
+        raise BootstrapError(
+            f"settings invalid at {path}: {error}", code="settings_invalid"
+        ) from error
+    unknown = sorted(set(data) - {"layout", "opus"})
+    if unknown:
+        raise BootstrapError(
+            f"settings invalid at {path}: unknown keys {unknown}", code="settings_invalid"
+        )
+    layout = data.get("layout", "compact")
+    if layout not in LAYOUTS:
+        raise BootstrapError(
+            f"settings invalid at {path}: layout must be one of {list(LAYOUTS)}",
+            code="settings_invalid",
+        )
+    opus = data.get("opus", False)
+    if not isinstance(opus, bool):
+        raise BootstrapError(
+            f"settings invalid at {path}: opus must be true or false", code="settings_invalid"
+        )
+    return Settings(layout=str(layout), opus=opus)
+
+
+def apply_settings_profile(profile: str | None, settings: Settings) -> str | None:
+    """Only the default profile gains Opus; every other profile is left exactly as asked."""
+    if profile == DEFAULT_PROFILE and settings.opus:
+        return OPUS_DEFAULT_PROFILE
+    return profile
+
+
+def focused_workspace_and_tab(herdr_bin: str) -> tuple[str, str]:
+    listed = run_json(herdr_bin, ["workspace", "list"])
+    for workspace in listed.get("result", {}).get("workspaces", []):
+        if isinstance(workspace, dict) and workspace.get("focused"):
+            return (
+                str(workspace.get("workspace_id") or ""),
+                str(workspace.get("active_tab_id") or ""),
+            )
+    return "", ""
+
+
+def arrange_grid(
+    herdr_bin: str,
+    state: dict[str, Any],
+    participants: Sequence[Participant],
+    room_pane_id: str,
+    room_tab_id: str,
+) -> None:
+    """Move every verified peer pane into the room tab as a right-hand stack.
+
+    Runs only after the whole profile verified. `pane move` takes focus, so the
+    caller's workspace and tab are recorded first and restored once at the end.
+    Each move is read back through `agent get`; a peer that lands outside the
+    room tab fails the launch closed. Recorded pane and tab ids are rewritten so
+    reopen, adopt and /show keep addressing the live panes.
+    """
+    caller_workspace, caller_tab = focused_workspace_and_tab(herdr_bin)
+    panes = state.setdefault("participant_pane_ids", {})
+    tabs = state.setdefault("participant_tab_ids", {})
+    anchor = room_pane_id
+    for index, participant in enumerate(participants):
+        pane_id = str(panes.get(participant.role) or "")
+        if not pane_id:
+            raise BootstrapError(
+                f"@{participant.role}: no recorded pane to arrange", code="grid_failed"
+            )
+        arguments = ["pane", "move", pane_id, "--tab", room_tab_id, "--split"]
+        if index == 0:
+            arguments.extend(["right", "--target-pane", anchor, "--ratio", GRID_ROOM_RATIO])
+        else:
+            arguments.extend(["down", "--target-pane", anchor])
+        run_json(herdr_bin, arguments)
+        live = (
+            run_json(herdr_bin, ["agent", "get", participant.name])
+            .get("result", {})
+            .get("agent", {})
+        )
+        new_pane = str(live.get("pane_id") or "")
+        new_tab = str(live.get("tab_id") or "")
+        if not new_pane or new_tab != room_tab_id:
+            raise BootstrapError(
+                f"@{participant.role}: {participant.name} did not land in the room tab",
+                code="grid_failed",
+            )
+        panes[participant.role] = new_pane
+        tabs[participant.role] = new_tab
+        state["participant_workspace_id"] = str(live.get("workspace_id") or "")
+        anchor = new_pane
+    state["layout"] = "grid"
+    if caller_workspace:
+        run_json(herdr_bin, ["workspace", "focus", caller_workspace])
+    if caller_tab:
+        run_json(herdr_bin, ["tab", "focus", caller_tab])
+
+
 def launch_room(open_existing: bool, profile: str | None = None) -> int:
     if profile and open_existing:
         # Opening the retained room never selects a profile; the stored binding wins.
         raise BootstrapError("--profile only applies to a new room launch")
     resolve_profile(profile)  # unknown profiles fail before opening tabs
     herdr_bin = os.environ.get("HERDR_BIN_PATH", "herdr")
+    settings = load_settings(os.environ.get("HERDR_PLUGIN_ID", "terry.herdr-group-chat"))
+    if profile and not open_existing:
+        profile = apply_settings_profile(profile, settings)
+        resolve_profile(profile)
     context = plugin_context()
     cwd = str(context.get("focused_pane_cwd") or context.get("workspace_cwd") or Path.cwd())
     state_dir = plugin_state_dir()
@@ -1327,6 +1487,8 @@ def launch_room(open_existing: bool, profile: str | None = None) -> int:
         ]
         if profile:
             pane_arguments.extend(["--env", f"{PROFILE_ENV}={profile}"])
+        if not open_existing:
+            pane_arguments.extend(["--env", f"{LAYOUT_ENV}={settings.layout}"])
         agents_workspace_id = state.get("agents_workspace_id")
         if agents_workspace_id and agents_workspace_id in workspace_ids(herdr_bin):
             pane_arguments.extend(["--env", f"{AGENTS_WORKSPACE_ENV}={agents_workspace_id}"])
@@ -1864,6 +2026,17 @@ def other_state_workspace_claims(state_dir: Path, state_path: Path) -> dict[str,
     return claims
 
 
+def adopted_workspace_acceptable(
+    state: Mapping[str, Any], workspace_id: str, workspace: Mapping[str, Any]
+) -> bool:
+    """Backstage by label, or the recorded participant workspace in grid layout."""
+    if str(workspace.get("label")) == AGENTS_WORKSPACE_LABEL:
+        return True
+    return state.get("layout") == "grid" and workspace_id == str(
+        state.get("participant_workspace_id") or ""
+    )
+
+
 def adopt_stale_peers() -> int:
     """Adopt live group-chat peers orphaned by a Herdr server restart.
 
@@ -1943,7 +2116,7 @@ def adopt_stale_peers() -> int:
             workspace = workspaces_by_id.get(adopted_workspace_id)
             if workspace is None:
                 problems.append(f"workspace {adopted_workspace_id} no longer exists")
-            elif str(workspace.get("label")) != AGENTS_WORKSPACE_LABEL:
+            elif not adopted_workspace_acceptable(state, adopted_workspace_id, workspace):
                 problems.append(
                     f"workspace {adopted_workspace_id} is labelled "
                     f"{workspace.get('label')!r}, not {AGENTS_WORKSPACE_LABEL!r}"
@@ -2096,6 +2269,20 @@ def main() -> int:
                 code="profile_incomplete",
                 failures=failures,
             )
+        layout = os.environ.get(LAYOUT_ENV, "").strip() or "compact"
+        if layout not in LAYOUTS:
+            raise BootstrapError(f"unknown layout {layout!r}", code="settings_invalid")
+        if layout == "grid" and not failures:
+            arrange_grid(
+                herdr_bin,
+                state,
+                participants,
+                room_pane_id=os.environ.get("HERDR_PANE_ID", "").strip(),
+                room_tab_id=os.environ.get("HERDR_TAB_ID", "").strip(),
+            )
+        else:
+            state["layout"] = "compact"
+            state.pop("participant_workspace_id", None)
         if profile:
             # Trust the profile only for this room, whose id lands in last_room_id.
             state["selected_profile"] = profile
@@ -2136,7 +2323,9 @@ def main() -> int:
         os.environ.pop(SETUP_FAILURES_ENV, None)
 
     executable = Path(__file__).resolve().parent / "herdr-group-chat"
-    arguments = [str(executable), "--room", room, "--agents-workspace", agents_workspace_id]
+    arguments = [str(executable), "--room", room]
+    if layout != "grid" or agents_workspace_id in workspace_ids(herdr_bin):
+        arguments.extend(["--agents-workspace", agents_workspace_id])
     if profile:
         profile_arguments, receipt = profile_room_exec(profile, participants)
         arguments.extend(profile_arguments)
@@ -2232,13 +2421,17 @@ def room_entrypoint() -> int:
         if profile:
             reverify_profile_participants(
                 herdr_bin,
-                str(state.get("agents_workspace_id") or ""),
+                str(
+                    state.get("participant_workspace_id") or state.get("agents_workspace_id") or ""
+                ),
                 str(state.get("agents_cwd") or ""),
                 state,
                 participants,
             )
         save_launcher_state(state_dir, state, state_path)
         agents_workspace_id = str(state.get("agents_workspace_id") or "")
+        if state.get("layout") == "grid" and agents_workspace_id not in workspace_ids(herdr_bin):
+            agents_workspace_id = ""
     # Reopening a retained room must not replay a previous launch's setup failures.
     os.environ.pop(SETUP_FAILURES_ENV, None)
     executable = Path(__file__).resolve().parent / "herdr-group-chat"

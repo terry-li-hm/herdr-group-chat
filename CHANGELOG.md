@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## [0.11.0] - 2026-09-03
+
+- Add operator settings in `settings.toml` under the plugin config directory
+  (`herdr plugin config-dir terry.herdr-group-chat`), read by the launcher
+  with a missing file meaning defaults and any invalid or unknown key failing
+  the launch closed. Two keys: `layout = "compact" | "grid"` (default
+  `compact`) and `opus = true | false` (default `false`). No action or pane
+  entrypoint changed, so the seven-action smoke contract is unchanged.
+- `layout = "grid"`: after every participant of a profile verifies in the
+  backstage workspace, the setup pane moves each peer pane into the room tab
+  as a right-hand stack beside the room pane (room at ratio 0.55, peers in
+  roster order), reads each move back through `agent get`, rewrites the
+  recorded pane and tab ids, records the participant workspace, and restores
+  the caller's workspace and tab, which `pane move` otherwise takes. A peer
+  landing outside the room tab fails the launch closed. Reopen re-verifies
+  against the recorded participant workspace, `adopt-peers` accepts the room
+  workspace in grid layout, and the relay receives `--agents-workspace` only
+  while that workspace still exists.
+- `opus = true`: the default `new` action launches `sol-fable-grok-opus-pi`,
+  which adds `@opus` as Claude Code `opus-peer` with `--model opus --effort
+  high`; its native pane must show the bounded `Opus 5` and `high effort`
+  token sequences, matching Claude Code 2.1.258's `Opus 5 with high effort`.
+  Sol still synthesises. Other profiles are unchanged.
+
 ## [0.10.7] - 2026-09-02
 
 - Accept `Fable 5.1` as native-pane evidence for the `@fable` participant.

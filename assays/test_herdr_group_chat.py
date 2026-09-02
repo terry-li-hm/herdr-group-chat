@@ -7642,6 +7642,11 @@ def test_sol_fable_grok_pi_has_exact_roles_and_preserves_stored_native_profile()
     assert namespace["PROFILE_ROLES"]["sol-fable"] == ("sol", "fable")
 
 
+def test_sol_fable_grok_opus_pi_adds_opus_as_fourth_role_with_sol_synthesizer() -> None:
+    assert namespace["PROFILE_ROLES"]["sol-fable-grok-opus-pi"] == ("sol", "fable", "grok", "opus")
+    assert namespace["PROFILE_SYNTHESIZER"]["sol-fable-grok-opus-pi"] == "sol"
+
+
 def test_sol_fable_grok_pi_requires_the_exact_roster_and_records_xai_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
