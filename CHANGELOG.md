@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [0.11.1] - 2026-09-03
 
 - The room TUI now enables SGR mouse reporting on entry (`\x1b[?1000h` with
   `\x1b[?1006h`) and disables it on every exit path — normal exit, an
