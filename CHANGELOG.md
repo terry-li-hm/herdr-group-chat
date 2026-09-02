@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [0.11.2] - 2026-09-03
 
 - Relaunching a grid-layout room now reuses its live peers. The previous
   arrangement had moved every peer into the room workspace, but ownership
