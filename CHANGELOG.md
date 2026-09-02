@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+- The room TUI now enables SGR mouse reporting on entry (`\x1b[?1000h` with
+  `\x1b[?1006h`) and disables it on every exit path — normal exit, an
+  exception propagating out of the event loop, and `--once`, which never
+  enables it — so a crashed or closed room never leaves the operator's
+  terminal with mouse reporting on. Wheel-up and wheel-down scroll the
+  transcript by three lines in `/room`, `/inbox`, and `/lanes`; only wheel
+  buttons 64 and 65 act, every other mouse report is ignored, and no mouse
+  bytes ever reach the input buffer or any participant. PgUp/PgDn are
+  unchanged, and Home/End jump to the oldest and newest lines.
+- The room TUI now uses the terminal's default foreground and background
+  everywhere and never emits a background, 256-colour, or truecolour
+  sequence, under any theme including Herdr's Ochre light theme. Header,
+  status row, participant labels, and system entries keep their distinctions
+  through ANSI bold, dim, and reverse only, chosen so they read on both a
+  light and a dark terminal.
+
 ## [0.11.0] - 2026-09-03
 
 - Add operator settings in `settings.toml` under the plugin config directory

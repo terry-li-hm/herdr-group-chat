@@ -25,10 +25,12 @@ import threading
 import time
 import unicodedata
 import uuid
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import Enum
 from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -4776,7 +4778,8 @@ def handle_local_command(
             "Commands: /review [@agents] QUESTION · /anneal @author,@critic QUESTION · "
             "/consensus [@agents] QUESTION · /retry <agent|synthesis> · /cancel · /agents · "
             "/council status · /council export PATH · /council resume · "
-            "/show <agent> · /inbox · /lanes · /room · PgUp/PgDn · @ opens a mention picker "
+            "/show <agent> · /inbox · /lanes · /room · PgUp/PgDn · mouse wheel scrolls "
+            "· Home/End jump · @ opens a mention picker "
             "(Tab completes, Esc closes)"
         )
     if stripped == "/review" or stripped.startswith("/review "):
@@ -4818,6 +4821,123 @@ def handle_local_command(
         chat.client.focus(chat.agents[name])
         return f"Focused @{name}."
     return "Unknown command. Use /help."
+
+
+# Terminal-default colour discipline: the room TUI never emits colour codes,
+# so nothing can fight the operator's terminal theme (light themes such as
+# Herdr's Ochre included). Every distinction uses the ANSI bold, dim, and
+# reverse attributes, which stay readable on both light and dark terminals,
+# and no background, 256-colour, or truecolour sequence is ever written.
+
+# SGR mouse mode: button-press reporting with SGR-encoded coordinates, so
+# wheel events survive every modern terminal without terminfo guesswork.
+MOUSE_ENABLE_SEQUENCE = "\x1b[?1000h\x1b[?1006h"
+MOUSE_DISABLE_SEQUENCE = "\x1b[?1000l\x1b[?1006l"
+MOUSE_REPORT_BODY_CHARS = frozenset("0123456789;[<Mm")
+MOUSE_REPORT_MAX_CHARS = 24
+MOUSE_WHEEL_UP_BUTTON = 64
+MOUSE_WHEEL_DOWN_BUTTON = 65
+MOUSE_WHEEL_LINES = 3
+SGR_MOUSE_REPORT_RE = re.compile(r"\[<(\d+);(\d+);(\d+)([Mm])\Z")
+
+
+class WheelEvent(Enum):
+    """Classification of one complete SGR mouse report."""
+
+    UP = "up"
+    DOWN = "down"
+    IGNORED = "ignored"
+
+
+def emit_terminal_sequence(sequence: str, *, file: Any | None = None) -> None:
+    """Write one raw terminal control sequence outside the curses screen seam."""
+    stream = file if file is not None else sys.stdout
+    stream.write(sequence)
+    stream.flush()
+
+
+def parse_sgr_mouse_report(report: str) -> WheelEvent | None:
+    """Classify one complete SGR mouse report.
+
+    Wheel-press reports (buttons 64 and 65) become UP or DOWN; every other
+    complete report, including other buttons, motion, and releases, is
+    IGNORED. None means the bytes are not an SGR mouse report at all and must
+    be handed back as ordinary keys.
+    """
+    match = SGR_MOUSE_REPORT_RE.fullmatch(report)
+    if match is None:
+        return None
+    if match.group(4) != "M":
+        return WheelEvent.IGNORED
+    button = int(match.group(1))
+    if button == MOUSE_WHEEL_UP_BUTTON:
+        return WheelEvent.UP
+    if button == MOUSE_WHEEL_DOWN_BUTTON:
+        return WheelEvent.DOWN
+    return WheelEvent.IGNORED
+
+
+class MouseAwareKeyReader:
+    """Read one key at a time, folding SGR wheel reports into wheel events.
+
+    Bytes that do not form an SGR mouse report are pushed back unchanged, so a
+    lone ESC, printable text, and translated function keys keep their exact
+    old meanings and no mouse bytes ever reach the input buffer.
+    """
+
+    def __init__(self, screen: Any) -> None:
+        self._screen = screen
+        self._pushback: deque[object] = deque()
+
+    def _next(self) -> object:
+        if self._pushback:
+            return self._pushback.popleft()
+        return self._screen.get_wch()
+
+    def read(self) -> object | None:
+        """Return the next key, a WheelEvent, or None on a read timeout."""
+        try:
+            key = self._next()
+        except curses.error:
+            return None
+        if not isinstance(key, str) or key != "\x1b":
+            return key
+        collected: list[str] = []
+        while len(collected) < MOUSE_REPORT_MAX_CHARS:
+            try:
+                following = self._next()
+            except curses.error:
+                break
+            if not isinstance(following, str) or following not in MOUSE_REPORT_BODY_CHARS:
+                self._pushback.appendleft(following)
+                break
+            collected.append(following)
+            if following in "Mm":
+                break
+        wheel = parse_sgr_mouse_report("".join(collected))
+        if wheel is not None:
+            return wheel
+        self._pushback.extendleft(reversed(collected))
+        return "\x1b"
+
+
+def transcript_line_emphasis(line: str, participants: Sequence[str]) -> tuple[str, int] | None:
+    """Return the label prefix and attribute that open a transcript line.
+
+    Participant labels get bold and system entries dim, so distinctions rely
+    only on attributes that read identically on light and dark themes.
+    """
+    if not line or line[0].isspace():
+        return None
+    label, separator, _rest = line.partition("> ")
+    if not separator:
+        return None
+    if label == "system":
+        return label + separator, curses.A_DIM
+    base = label.split(" [", 1)[0]
+    if base in participants:
+        return label + separator, curses.A_BOLD
+    return None
 
 
 @dataclass(frozen=True)
@@ -4904,7 +5024,16 @@ def draw_tui(
         line_column = 1
         line_width = max(0, width - 2)
     for row, line in enumerate(lines, start=regions.content_start):
-        _tui_addnstr(screen, row, line_column, line, line_width)
+        emphasis = transcript_line_emphasis(line, participants) if view != "lanes" else None
+        if emphasis is None:
+            _tui_addnstr(screen, row, line_column, line, line_width)
+            continue
+        prefix, attribute = emphasis
+        prefix_width = terminal_display_width(prefix)
+        _tui_addnstr(screen, row, line_column, prefix, line_width, attribute)
+        _tui_addnstr(
+            screen, row, line_column + prefix_width, line[len(prefix) :], line_width - prefix_width
+        )
     if regions.status_row is not None:
         _tui_addnstr(screen, regions.status_row, 0, status, width - 1, curses.A_DIM)
     prompt = f"> {buffer}"
@@ -4922,6 +5051,18 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
     curses.curs_set(1)
     screen.keypad(True)
     screen.timeout(100)
+    emit_terminal_sequence(MOUSE_ENABLE_SEQUENCE)
+    try:
+        _run_tui_loop(screen, MouseAwareKeyReader(screen), chat, room)
+    finally:
+        # Every exit path, including exceptions propagating out of the loop,
+        # leaves the operator's terminal with mouse reporting off again.
+        emit_terminal_sequence(MOUSE_DISABLE_SEQUENCE)
+
+
+def _run_tui_loop(
+    screen: curses.window, keys: MouseAwareKeyReader, chat: GroupChat, room: str
+) -> None:
     buffer = ""
     scroll_offset = 0
     participants = tuple(chat.agents)
@@ -4971,9 +5112,8 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
             title=f"{chat.host_label} group chat",
             view=view,
         )
-        try:
-            key = screen.get_wch()
-        except curses.error:
+        key = keys.read()
+        if key is None:
             continue
         if picker_active:
             picker_key = (
@@ -5010,6 +5150,20 @@ def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
             continue
         if key == curses.KEY_NPAGE:
             scroll_offset = max(0, scroll_offset - max(1, screen.getmaxyx()[0] - 5))
+            continue
+        if key is WheelEvent.UP:
+            scroll_offset = min(max_scroll, scroll_offset + MOUSE_WHEEL_LINES)
+            continue
+        if key is WheelEvent.DOWN:
+            scroll_offset = max(0, scroll_offset - MOUSE_WHEEL_LINES)
+            continue
+        if key is WheelEvent.IGNORED:
+            continue
+        if key == curses.KEY_HOME:
+            scroll_offset = max_scroll
+            continue
+        if key == curses.KEY_END:
+            scroll_offset = 0
             continue
         if key in ("\n", "\r"):
             if not buffer.strip():

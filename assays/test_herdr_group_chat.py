@@ -1314,6 +1314,301 @@ def test_tui_ctrl_q_waits_for_ordinary_cancellation_outcome_before_returning(
     )
 
 
+def test_parse_sgr_mouse_report_classifies_only_wheel_presses() -> None:
+    assert module.parse_sgr_mouse_report("[<64;9;9M") is module.WheelEvent.UP
+    assert module.parse_sgr_mouse_report("[<65;9;9M") is module.WheelEvent.DOWN
+    for ignored in ("[<0;1;1M", "[<1;1;1M", "[<2;1;1M", "[<35;1;1M", "[<64;1;1m", "[<66;1;1M"):
+        assert module.parse_sgr_mouse_report(ignored) is module.WheelEvent.IGNORED
+    for not_a_report in ("", "M", "[<64;1M", "[<64;1;1x", "64;1;1M", "[64;1;1M"):
+        assert module.parse_sgr_mouse_report(not_a_report) is None
+
+
+def test_wheel_input_scrolls_three_lines_in_every_view_and_never_reaches_participants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, client, _ = make_chat(tmp_path)
+    draws: list[tuple[str, int]] = []
+
+    class KeyScreen:
+        def __init__(self, keys: list[object]) -> None:
+            self.keys = keys
+
+        def keypad(self, _enabled: bool) -> None:
+            pass
+
+        def timeout(self, _milliseconds: int) -> None:
+            pass
+
+        def get_wch(self) -> object:
+            return self.keys.pop(0)
+
+    def track_draw(
+        _screen: object,
+        _transcript: object,
+        _room: object,
+        _buffer: object,
+        _status: object,
+        _participants: object,
+        scroll: object = 0,
+        **kwargs: object,
+    ) -> int:
+        draws.append((str(kwargs.get("view", "room")), int(scroll)))
+        return 100
+
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    monkeypatch.setattr(module, "draw_tui", track_draw)
+    screen = KeyScreen(
+        [
+            module.WheelEvent.UP,
+            *list("/inbox\n"),
+            module.WheelEvent.UP,
+            *list("/lanes\n"),
+            module.WheelEvent.UP,
+            *list("/room\n"),
+            module.WheelEvent.UP,
+            "\x11",
+        ]
+    )
+
+    run_tui(screen, chat, "wheel-views-room")
+
+    assert draws[0] == ("room", 0)
+    assert ("room", 3) in draws
+    assert ("inbox", 3) in draws
+    assert ("lanes", 3) in draws
+    assert max(scroll for _, scroll in draws) == 3
+    assert client.calls == []
+
+
+def test_raw_sgr_wheel_bytes_scroll_by_three_and_non_wheel_reports_are_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, client, transcript = make_chat(tmp_path)
+    scrolls: list[int] = []
+
+    class KeyScreen:
+        def __init__(self, keys: list[object]) -> None:
+            self.keys = keys
+
+        def keypad(self, _enabled: bool) -> None:
+            pass
+
+        def timeout(self, _milliseconds: int) -> None:
+            pass
+
+        def get_wch(self) -> object:
+            key = self.keys.pop(0)
+            if key == "WAIT_DELIVERY":
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and len(transcript.read()) < 2:
+                    time.sleep(0.005)
+                return self.keys.pop(0)
+            return key
+
+    def track_draw(*args: object, **_kwargs: object) -> int:
+        scrolls.append(int(args[6]) if len(args) > 6 else 0)
+        return 100
+
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    monkeypatch.setattr(module, "draw_tui", track_draw)
+    wheel_up = ["\x1b", "[", "<", "6", "4", ";", "2", "3", ";", "1", "M"]
+    wheel_down = ["\x1b", "[", "<", "6", "5", ";", "2", "3", ";", "1", "M"]
+    left_click = ["\x1b", "[", "<", "0", ";", "1", ";", "1", "M"]
+    motion = ["\x1b", "[", "<", "3", "5", ";", "1", ";", "1", "M"]
+    release = ["\x1b", "[", "<", "6", "4", ";", "1", ";", "1", "m"]
+    screen = KeyScreen(
+        [
+            *wheel_up,
+            *wheel_down,
+            *left_click,
+            *motion,
+            *release,
+            *list("@pi typed only\n"),
+            "WAIT_DELIVERY",
+            "\x11",
+        ]
+    )
+
+    run_tui(screen, chat, "wheel-bytes-room")
+
+    assert scrolls[:6] == [0, 3, 0, 0, 0, 0]
+    assert all(scroll == 0 for scroll in scrolls[6:])
+    assert [target for target, _ in client.calls] == ["pi-peer"]
+    prompt = client.calls[0][1]
+    assert "typed only" in prompt
+    assert "\x1b" not in prompt and "[<" not in prompt
+
+
+def test_home_and_end_jump_to_oldest_and_newest_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, _client, _ = make_chat(tmp_path)
+    scrolls: list[int] = []
+
+    class KeyScreen:
+        def __init__(self, keys: list[object]) -> None:
+            self.keys = keys
+
+        def keypad(self, _enabled: bool) -> None:
+            pass
+
+        def timeout(self, _milliseconds: int) -> None:
+            pass
+
+        def get_wch(self) -> object:
+            return self.keys.pop(0)
+
+    def track_draw(*args: object, **_kwargs: object) -> int:
+        scrolls.append(int(args[6]) if len(args) > 6 else 0)
+        return 100
+
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    monkeypatch.setattr(module, "draw_tui", track_draw)
+    screen = KeyScreen([module.curses.KEY_HOME, module.curses.KEY_END, "\x11"])
+
+    run_tui(screen, chat, "home-end-room")
+
+    assert scrolls[:3] == [0, 100, 0]
+
+
+def test_mouse_reporting_enabled_once_and_disabled_on_every_exit_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    emitted: list[str] = []
+    monkeypatch.setattr(
+        module, "emit_terminal_sequence", lambda sequence, **_kwargs: emitted.append(sequence)
+    )
+    chat, _client, _ = make_chat(tmp_path)
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    monkeypatch.setattr(module, "draw_tui", lambda *_args, **_kwargs: 0)
+
+    class ExitScreen:
+        def keypad(self, _enabled: bool) -> None:
+            pass
+
+        def timeout(self, _milliseconds: int) -> None:
+            pass
+
+        def get_wch(self) -> object:
+            return "\x11"
+
+    run_tui(ExitScreen(), chat, "mouse-exit-room")
+    assert emitted == [module.MOUSE_ENABLE_SEQUENCE, module.MOUSE_DISABLE_SEQUENCE]
+
+    class CrashScreen(ExitScreen):
+        def get_wch(self) -> object:
+            raise RuntimeError("terminal lost")
+
+    with pytest.raises(RuntimeError, match="terminal lost"):
+        run_tui(CrashScreen(), chat, "mouse-crash-room")
+    assert emitted == [
+        module.MOUSE_ENABLE_SEQUENCE,
+        module.MOUSE_DISABLE_SEQUENCE,
+        module.MOUSE_ENABLE_SEQUENCE,
+        module.MOUSE_DISABLE_SEQUENCE,
+    ]
+
+    class OnceChat:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def dispatch(self, _text: str) -> list[dict[str, str]]:
+            return []
+
+    monkeypatch.setattr(module, "GroupChat", OnceChat)
+    assert main(["--state-dir", str(tmp_path), "--room", "mouse-once", "--once", "hi"]) == 0
+    assert emitted == [
+        module.MOUSE_ENABLE_SEQUENCE,
+        module.MOUSE_DISABLE_SEQUENCE,
+        module.MOUSE_ENABLE_SEQUENCE,
+        module.MOUSE_DISABLE_SEQUENCE,
+    ]
+
+
+def test_tui_emits_no_background_or_indexed_colour_codes_with_attribute_distinctions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    emitted: list[str] = []
+    monkeypatch.setattr(
+        module, "emit_terminal_sequence", lambda sequence, **_kwargs: emitted.append(sequence)
+    )
+    transcript = Transcript(tmp_path, "colours-room")
+    transcript.append("pi", ("human",), "participant answer")
+    transcript.append("system", ("human",), "setup: relay attached")
+    transcript.append("pi", ("human",), "checked", kind="review_synthesis")
+    chat = GroupChat(Transcript(tmp_path, "colours-room"), {"pi": "pi-peer"}, FakeClient())
+
+    class CaptureScreen:
+        def __init__(self, keys: list[object], height: int = 12, width: int = 64) -> None:
+            self.keys = keys
+            self.height = height
+            self.width = width
+            self.writes: list[tuple[int, int, str, tuple[int, ...]]] = []
+            self.cursor: tuple[int, int] | None = None
+
+        def erase(self) -> None:
+            pass
+
+        def keypad(self, _enabled: bool) -> None:
+            pass
+
+        def timeout(self, _milliseconds: int) -> None:
+            pass
+
+        def getmaxyx(self) -> tuple[int, int]:
+            return self.height, self.width
+
+        def get_wch(self) -> object:
+            return self.keys.pop(0)
+
+        def addnstr(self, row: int, column: int, text: str, _count: int, *attrs: int) -> None:
+            assert 0 <= row < self.height
+            assert 0 <= column < self.width
+            self.writes.append((row, column, text, attrs))
+
+        def move(self, row: int, column: int) -> None:
+            self.cursor = (row, column)
+
+        def refresh(self) -> None:
+            pass
+
+    written: list[str] = ["".join(emitted)]
+    for view in ("room", "inbox", "lanes"):
+        screen = CaptureScreen([])
+        draw_tui(screen, transcript, "colours", "", "status", ("pi",), view=view)
+        written.extend(text for _, _, text, _ in screen.writes)
+
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    run_screen = CaptureScreen(["\x1b", "[", "<", "6", "4", ";", "2", ";", "1", "M", "\x11"])
+    run_tui(run_screen, chat, "colours-room")
+    written.extend(text for _, _, text, _ in run_screen.writes)
+
+    corpus = "\n".join(written)
+    for forbidden in (
+        "\x1b[48;",
+        "\x1b[38;5;",
+        "\x1b[48;5;",
+        "\x1b[38;2;",
+        "\x1b[48;2;",
+    ):
+        assert forbidden not in corpus
+
+    regions = tui_regions(12)
+    assert next(w for w in run_screen.writes if w[0] == regions.header_row)[3] == (
+        module.curses.A_REVERSE,
+    )
+    assert next(w for w in run_screen.writes if w[0] == regions.status_row)[3] == (
+        module.curses.A_DIM,
+    )
+    bold_labels = [w for w in run_screen.writes if w[3] == (module.curses.A_BOLD,)]
+    assert any(text.startswith("pi> ") for _, _, text, _ in bold_labels)
+    assert any(text.startswith("pi [synthesis]> ") for _, _, text, _ in bold_labels)
+    assert any(
+        attrs == (module.curses.A_DIM,) and text.startswith("system> ")
+        for _, _, text, attrs in run_screen.writes
+    )
+
+
 @pytest.mark.parametrize("buffer", ["漢字", "e\u0301e\u0301", "👩‍💻🚀"])
 def test_tui_cursor_uses_terminal_cells_for_unicode_input(tmp_path: Path, buffer: str) -> None:
     width = LANE_MIN_COLUMN_WIDTH
