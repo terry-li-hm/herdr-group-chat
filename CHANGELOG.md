@@ -2,6 +2,38 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+- Relaunching a grid-layout room no longer aborts after the peers are
+  arranged. Herdr auto-closes a workspace once its last pane leaves it, so
+  after `arrange_grid` empties the backstage workspace the following
+  `pane list --workspace <id>` failed with `workspace_not_found` and the
+  launch died before the room pane ever opened. `close_empty_agents_workspace`
+  now treats `workspace_not_found` from the pane listing as already closed:
+  the recorded id is dropped and setup continues; any other error still
+  raises, and a workspace that still holds panes is still never closed.
+- Repeated `down` splits no longer halve the peer stack. Probed live on
+  herdr 0.8.2 in an isolated session: `pane move <pane> --split down
+  --target-pane <target> --ratio r` keeps fraction r of the split pane for
+  the TARGET pane and lands the moved pane below it with the remaining 1-r
+  (ratio 0.25 on a 39-row column left the target 10 rows on top and the moved
+  pane 29 rows below; ratio 0.75 on those 29 rows left 22 above and 7 below).
+  Since each peer k splits the pane of peer k-1 exactly once, the k-th of N
+  peers now moves with `--ratio 1/(N-k+2)` — computed by
+  `grid_peer_split_ratios` — so every peer finishes within one row of the
+  others instead of the old 27/13/7/6 fixed-halving stack in a 53-row tab.
+  The room keeps GRID_ROOM_RATIO on the first `right` split, which the same
+  probe confirmed gives the target pane that fraction of the width.
+- Reuse verification now survives a short pane. Relaunching over a grid room
+  re-verifies each live peer with `reopen_pane_proof`, and a peer stacked a
+  few rows tall can show only its footer, so its status tokens never appeared
+  in the visible read and the launch failed. For reopen proofs only, after
+  the visible reads fail, the token read is retried exactly once with
+  `pane read <id> --source recent-unwrapped --lines 240` (scrollback) and
+  accepted only if the tokens appear there; participants with
+  `reopen_process_argv0` still must pass their foreground-process proof, and
+  fresh-launch proofs stay visible-only.
+
 ## [0.11.2] - 2026-09-03
 
 - Relaunching a grid-layout room now reuses its live peers. The previous

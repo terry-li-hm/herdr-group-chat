@@ -5686,6 +5686,8 @@ def test_arrange_grid_moves_in_roster_order_rewrites_ids_and_restores_focus(
             "down",
             "--target-pane",
             "w-chat:p-sol-moved",
+            "--ratio",
+            "0.3333",
         ],
         [
             "pane",
@@ -5697,6 +5699,8 @@ def test_arrange_grid_moves_in_roster_order_rewrites_ids_and_restores_focus(
             "down",
             "--target-pane",
             "w-chat:p-fable-moved",
+            "--ratio",
+            "0.5000",
         ],
     ]
     for move in moves:
@@ -5978,6 +5982,171 @@ def test_close_empty_agents_workspace_closes_only_a_paneless_workspace(
     calls.clear()
     module.close_empty_agents_workspace("herdr", {})
     assert calls == []
+
+
+def test_close_empty_agents_workspace_treats_a_vanished_workspace_as_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Herdr auto-closes a workspace whose last pane left it, so the pane
+    listing can already report it gone; that workspace is already closed."""
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments[:2] == ["pane", "list"]:
+            raise BootstrapError(
+                '{"error":{"code":"workspace_not_found","message":"workspace w26 not found"}}',
+                code="workspace_not_found",
+            )
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {"agents_workspace_id": "w26"}
+    module.close_empty_agents_workspace("herdr", state)
+    # Only the pane listing ran: no workspace close against a vanished id.
+    assert calls == [["pane", "list", "--workspace", "w26"]]
+    assert "agents_workspace_id" not in state
+
+    # A workspace that still holds any pane is never closed, even though the
+    # same helper would otherwise tolerate a vanished workspace.
+    calls.clear()
+
+    def listing_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments[:2] == ["pane", "list"]:
+            return {"result": {"panes": [{"pane_id": "w26:p-hold"}]}}
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", listing_run_json)
+    state = {"agents_workspace_id": "w26"}
+    module.close_empty_agents_workspace("herdr", state)
+    assert calls == [["pane", "list", "--workspace", "w26"]]
+    assert state["agents_workspace_id"] == "w26"
+
+
+@pytest.mark.parametrize("code", ["command_timeout", None])
+def test_close_empty_agents_workspace_raises_any_other_pane_list_error(
+    monkeypatch: pytest.MonkeyPatch, code: str | None
+) -> None:
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        if arguments[:2] == ["pane", "list"]:
+            raise BootstrapError("the socket vanished", code=code)
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {"agents_workspace_id": "w26"}
+    with pytest.raises(BootstrapError):
+        module.close_empty_agents_workspace("herdr", state)
+    # The failure propagates and the recorded id is neither closed nor dropped.
+    assert state == {"agents_workspace_id": "w26"}
+
+
+def test_grid_peer_split_ratios_equalize_the_stack() -> None:
+    """Hand-computed per-move ratios: for N peers the k-th move (k from 2)
+    keeps 1/(N-k+2) of the split pane for its target, so the stack levels."""
+    assert module.grid_peer_split_ratios(0) == ()
+    assert module.grid_peer_split_ratios(1) == ()
+    assert module.grid_peer_split_ratios(2) == ("0.5000",)
+    assert module.grid_peer_split_ratios(3) == ("0.3333", "0.5000")
+    assert module.grid_peer_split_ratios(4) == ("0.2500", "0.3333", "0.5000")
+    assert module.grid_peer_split_ratios(5) == ("0.2000", "0.2500", "0.3333", "0.5000")
+
+    # Probed semantics: `--ratio r` keeps fraction r of the split pane for
+    # the target and gives the moved pane the remainder below it. Under those
+    # rules the ratios leave N peers within one row of each other.
+    for rows in (24, 39, 53, 80):
+        for count in (2, 3, 4, 5):
+            heights = [rows]
+            for ratio in module.grid_peer_split_ratios(count):
+                split_height = heights[-1]
+                kept = round(split_height * float(ratio))
+                heights[-1] = kept
+                heights.append(split_height - kept)
+            assert max(heights) - min(heights) <= 1, (rows, count, heights)
+
+
+OPUS_SHORT_PANE_SCREEN = "Claude Code\n\u2570 \u2026 ctx 42% \u25af\n"
+OPUS_SCROLLBACK_SCREEN = "Claude Code\nOpus 5\nscrolled history\n\u2570 \u2026 ctx 42% \u25af\n"
+CLAUDE_OPUS_PROCESS = [
+    {
+        "argv0": "claude",
+        "name": "claude.exe",
+        "argv": ["claude", "--model", "opus", "--effort", "high"],
+    }
+]
+
+
+def test_reopen_pane_proof_falls_back_to_scrollback_after_visible_reads_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pane stacked into the grid can be a few rows tall and show only its
+    footer, so the reopen proof retries its token read exactly once against
+    scrollback; fresh-launch proofs stay visible-only."""
+    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+    reads: list[list[str]] = []
+
+    def fake_run_text(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
+        del timeout
+        reads.append(arguments)
+        return (
+            OPUS_SCROLLBACK_SCREEN
+            if arguments[4] == "recent-unwrapped"
+            else (OPUS_SHORT_PANE_SCREEN)
+        )
+
+    monkeypatch.setattr(module, "run_text", fake_run_text)
+    process_reads: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        assert arguments[:2] == ["pane", "process-info"], arguments
+        process_reads.append(arguments)
+        return {"result": {"process_info": {"foreground_processes": CLAUDE_OPUS_PROCESS}}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    opus = module.OPUS_PARTICIPANT
+
+    assert module.reopen_pane_proof("herdr", opus, "w-chat:p-opus")
+    # The scrollback read runs exactly once, only after every visible read
+    # failed, with this exact command; the process proof still passes, as today.
+    fallbacks = [read for read in reads if read[4] == "recent-unwrapped"]
+    assert fallbacks == [
+        ["pane", "read", "w-chat:p-opus", "--source", "recent-unwrapped", "--lines", "240"]
+    ]
+    assert reads.index(fallbacks[0]) > max(
+        index for index, read in enumerate(reads) if read[4] == "visible"
+    )
+    assert process_reads == [["pane", "process-info", "--pane", "w-chat:p-opus"]]
+
+    # Fresh-launch proofs never read scrollback, so the same short pane fails.
+    reads.clear()
+    assert not module.pane_proof("herdr", opus, "w-chat:p-opus")
+    assert reads
+    assert all(read[4] == "visible" for read in reads)
+
+    # Scrollback tokens alone do not rescue a failed process proof.
+    reads.clear()
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        lambda _herdr_bin, arguments, timeout=30: (
+            {"result": {"process_info": {"foreground_processes": []}}}
+            if arguments[:2] == ["pane", "process-info"]
+            else (_ for _ in ()).throw(AssertionError(arguments))
+        ),
+    )
+    assert not module.reopen_pane_proof("herdr", opus, "w-chat:p-opus")
+    assert reads and all(read[4] == "visible" or read[4] == "recent-unwrapped" for read in reads)
+    assert any(read[4] == "recent-unwrapped" for read in reads)
+
+    # A scrollback read without the tokens rejects the reopen outright.
+    monkeypatch.setattr(
+        module, "run_text", lambda _herdr_bin, arguments, timeout=30: OPUS_SHORT_PANE_SCREEN
+    )
+    assert not module.reopen_pane_proof("herdr", opus, "w-chat:p-opus")
 
 
 def test_grid_relaunch_reuses_live_peers_and_closes_the_emptied_backstage(

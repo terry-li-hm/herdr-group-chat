@@ -50,6 +50,14 @@ LAYOUTS = ("compact", "grid")
 DEFAULT_PROFILE = "sol-fable-grok-pi"
 OPUS_DEFAULT_PROFILE = "sol-fable-grok-opus-pi"
 GRID_ROOM_RATIO = "0.55"
+# Probed live on herdr 0.8.2 in an isolated `hgc-probe-*` session: a
+# `pane move <pane> --split down --target-pane <target> --ratio r` keeps
+# fraction r of the split pane for the TARGET and lands the moved pane below
+# it with the remaining 1-r. Ratio 0.25 on a 39-row column left the target 10
+# rows on top and the moved pane 29 rows below; ratio 0.75 on that 29-row
+# pane left the target 22 rows and the moved pane 7 rows. The first `right`
+# split behaves the same way: GRID_ROOM_RATIO 0.55 gave the room pane 46 of 84
+# columns and the moved peer the right-hand 38.
 PROFILE_RECEIPT_ENV = "HERDR_GROUP_CHAT_PROFILE_RECEIPT"
 NO_HOLD_ENV = "HERDR_GROUP_CHAT_NO_HOLD"
 LAUNCHER_ERRORS_NAME = "launcher-errors.jsonl"
@@ -891,9 +899,18 @@ def native_catalog_row_present(command: Sequence[str], provider: str, model: str
 
 
 def native_pane_proves(
-    herdr_bin: str, pane_id: str, proofs: Sequence[tuple[tuple[str, ...], ...]]
+    herdr_bin: str,
+    pane_id: str,
+    proofs: Sequence[tuple[tuple[str, ...], ...]],
+    scrollback_fallback: bool = False,
 ) -> bool:
-    """Bounded retries for native-pane token evidence; startup UIs render asynchronously."""
+    """Bounded retries for native-pane token evidence; startup UIs render asynchronously.
+
+    A visible read is the only fresh-launch evidence source. Reopen proofs
+    may pass ``scrollback_fallback``: a pane stacked into a grid can be too
+    short to show its status line at all, so after the visible retries fail
+    the read is retried exactly once against scrollback.
+    """
     for attempt in range(VERIFY_PANE_ATTEMPTS):
         text = run_text(
             herdr_bin, ["pane", "read", pane_id, "--source", "visible", "--lines", "80"]
@@ -903,7 +920,14 @@ def native_pane_proves(
             return True
         if attempt + 1 < VERIFY_PANE_ATTEMPTS:
             time.sleep(VERIFY_PANE_INTERVAL_S)
-    return False
+    if not scrollback_fallback:
+        return False
+    scrollback = run_text(
+        herdr_bin,
+        ["pane", "read", pane_id, "--source", "recent-unwrapped", "--lines", "240"],
+    )
+    tokens = pane_tokens(scrollback)
+    return all(sequence_present(tokens, proof) for proof in proofs)
 
 
 def catalog_proof(participant: Participant) -> bool:
@@ -962,11 +986,19 @@ def native_pane_process_proves(
 
 
 def reopen_pane_proof(herdr_bin: str, participant: Participant, pane_id: str) -> bool:
-    """Reopen proof: profile-driven; fresh proofs when no reopen fields exist."""
+    """Reopen proof: profile-driven; fresh proofs when no reopen fields exist.
+
+    Both reopen branches read with the scrollback fallback: a pane stacked
+    into a grid can be a few rows tall and show only its footer, so a token
+    that scrolled out of the viewport is still accepted from `recent-unwrapped`
+    scrollback. Fresh-launch proofs (`pane_proof`) stay visible-only.
+    """
     if not participant.reopen_pane_proofs and not participant.reopen_process_argv0:
-        return pane_proof(herdr_bin, participant, pane_id)
+        return native_pane_proves(
+            herdr_bin, pane_id, participant.pane_proofs, scrollback_fallback=True
+        )
     if participant.reopen_pane_proofs and not native_pane_proves(
-        herdr_bin, pane_id, participant.reopen_pane_proofs
+        herdr_bin, pane_id, participant.reopen_pane_proofs, scrollback_fallback=True
     ):
         return False
     if not participant.reopen_process_argv0:
@@ -1370,6 +1402,23 @@ def live_agent_pane_id(herdr_bin: str, participant: Participant) -> str:
     return pane_id
 
 
+def grid_peer_split_ratios(participant_count: int) -> tuple[str, ...]:
+    """Per-move `--ratio` values for the grid's `down` splits, equalizing the stack.
+
+    Peer k (k from 2) splits the pane of peer k-1, and every earlier peer is
+    split exactly once more, so for N peers to finish within one row of each
+    other the target pane of the k-th move must keep 1/(N-k+2) of the pane
+    being split — which is exactly the probed meaning of `--ratio`. The last
+    move is therefore always 0.5, and with the observed 0.5 default the old
+    fixed-halving stack (27/13/7/6 rows in a 53-row tab) becomes equal.
+    """
+    if participant_count < 2:
+        return ()
+    return tuple(
+        format(1 / (participant_count - split), ".4f") for split in range(participant_count - 1)
+    )
+
+
 def arrange_grid(
     herdr_bin: str,
     state: dict[str, Any],
@@ -1388,11 +1437,16 @@ def arrange_grid(
     first and restored once at the end. Each move is read back through
     `agent get`; a peer that lands outside the room tab fails the launch
     closed. Recorded pane and tab ids are rewritten so reopen, adopt and
-    /show keep addressing the live panes.
+    /show keep addressing the live panes. The first `right` split keeps the
+    room at GRID_ROOM_RATIO; every later `down` split carries its ratio from
+    `grid_peer_split_ratios`, so the stack finishes with equal heights
+    instead of halving with every move.
     """
     caller_workspace, caller_tab = focused_workspace_and_tab(herdr_bin)
     panes = state.setdefault("participant_pane_ids", {})
     tabs = state.setdefault("participant_tab_ids", {})
+
+    down_ratios = grid_peer_split_ratios(len(participants))
     anchor = room_pane_id
     for index, participant in enumerate(participants):
         pane_id = live_agent_pane_id(herdr_bin, participant)
@@ -1400,7 +1454,7 @@ def arrange_grid(
         if index == 0:
             arguments.extend(["right", "--target-pane", anchor, "--ratio", GRID_ROOM_RATIO])
         else:
-            arguments.extend(["down", "--target-pane", anchor])
+            arguments.extend(["down", "--target-pane", anchor, "--ratio", down_ratios[index - 1]])
         run_json(herdr_bin, arguments)
         live = (
             run_json(herdr_bin, ["agent", "get", participant.name])
@@ -1437,7 +1491,17 @@ def close_empty_agents_workspace(herdr_bin: str, state: dict[str, Any]) -> None:
     workspace_id = str(state.get("agents_workspace_id") or "")
     if not workspace_id:
         return
-    listed = run_json(herdr_bin, ["pane", "list", "--workspace", workspace_id])
+    try:
+        listed = run_json(herdr_bin, ["pane", "list", "--workspace", workspace_id])
+    except BootstrapError as error:
+        # Herdr auto-closes a workspace once its last pane leaves it, so the
+        # pane listing can already report the emptied workspace as gone. That
+        # workspace is already closed: drop the recorded id and return. Any
+        # other failure still raises.
+        if error.code != "workspace_not_found":
+            raise
+        state.pop("agents_workspace_id", None)
+        return
     panes = listed.get("result", {}).get("panes")
     if not isinstance(panes, list) or panes:
         return
