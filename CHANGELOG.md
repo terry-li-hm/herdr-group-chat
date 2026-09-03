@@ -78,7 +78,16 @@ Phase C of the 0.12 redesign, hardenings from the Grok challenge:
   `thinking_level_change` the exact effort, with the pane still running a
   foreground process named exactly `pi`; a missing file, a missing event, a
   malformed line, or any mismatch fails closed, under the same bounded
-  retries because the file appears a moment after the start. Every other
+  retries because the file appears a moment after the start. Pi creates
+  that file lazily on its first prompt, so a fresh launch whose `agent get`
+  names a session path that does not exist now sends exactly one inert
+  bootstrap prompt (`Do not inspect files or run tools. Reply READY only.`,
+  `--wait --timeout 90000`) per participant, then resumes the bounded
+  retries; a prompt refused with `agent_blocked` or `agent_prompt_stalled`
+  fails closed with the blocked-startup guidance instead of retrying, and
+  reopen and adopt never bootstrap, treating a missing file as not owned.
+  A peer that needed the bootstrap is recorded in the receipt as
+  `pi-session (bootstrapped)`. Every other
   kind keeps the argv proof, and the profile receipt records which proof
   kind verified each participant (`pi-session` or `process-argv`).
 

@@ -775,6 +775,10 @@ AGENT_START_BUSY_INTERVAL_S = 2.0
 VERIFY_PANE_ATTEMPTS = 15
 VERIFY_PANE_INTERVAL_S = 1.0
 PI_SESSION_READ_LIMIT = 64 * 1024
+PI_BOOTSTRAP_PROMPT = "Do not inspect files or run tools. Reply READY only."
+PI_BOOTSTRAP_BLOCKED_CODES = frozenset({"agent_blocked", "agent_prompt_stalled"})
+# The Pi participants this launch bootstrapped, so the receipt can name them.
+PI_BOOTSTRAPPED_NAMES: set[str] = set()
 
 
 def native_catalog_row_present(command: Sequence[str], provider: str, model: str) -> bool:
@@ -844,13 +848,21 @@ def native_pane_process_proves(
     return False
 
 
-def participant_process_proves(herdr_bin: str, participant: Participant, pane_id: str) -> bool:
+def participant_process_proves(
+    herdr_bin: str,
+    participant: Participant,
+    pane_id: str,
+    *,
+    bootstrap: bool = False,
+) -> bool:
     """The post-start native proof for one participant, by its own rule.
 
     A participant without start arguments is never process-proofed. Pi
     rewrites its own process title, so its argv can never carry the start
     arguments; its proof is the session file `agent get` names, plus a `pi`
-    foreground process on the live pane. Every other kind is proven by
+    foreground process on the live pane. Only a fresh launch passes
+    `bootstrap`, which sends one inert prompt when Pi has not written its
+    session file yet. Every other kind is proven by
     `pane process-info`: the foreground process's executable identity must
     be exactly the participant's kind and its argv must contain the start
     arguments as one contiguous sequence. Screen text is never evidence, so
@@ -859,13 +871,17 @@ def participant_process_proves(herdr_bin: str, participant: Participant, pane_id
     if not participant.start_args:
         return True
     if participant.kind == "pi":
-        return pi_participant_proves(herdr_bin, participant, pane_id)
+        return pi_participant_proves(herdr_bin, participant, pane_id, bootstrap=bootstrap)
     return native_pane_process_proves(herdr_bin, pane_id, participant.kind, participant.start_args)
 
 
 def participant_proof_kind(participant: Participant) -> str:
     """Which post-start proof kind the receipt records for this participant."""
-    return "pi-session" if participant.kind == "pi" else "process-argv"
+    if participant.kind != "pi":
+        return "process-argv"
+    if participant.name in PI_BOOTSTRAPPED_NAMES:
+        return "pi-session (bootstrapped)"
+    return "pi-session"
 
 
 def pi_session_proves(session_path: str, provider: str, model: str, effort: str) -> bool:
@@ -930,7 +946,13 @@ def pi_pane_identity_proves(processes: object) -> bool:
     return False
 
 
-def pi_participant_proves(herdr_bin: str, participant: Participant, pane_id: str) -> bool:
+def pi_participant_proves(
+    herdr_bin: str,
+    participant: Participant,
+    pane_id: str,
+    *,
+    bootstrap: bool = False,
+) -> bool:
     """The Pi post-start proof: a `pi` process on the pane plus its session file.
 
     Pi rewrites its own process title, so argv can never carry its start
@@ -938,6 +960,16 @@ def pi_participant_proves(herdr_bin: str, participant: Participant, pane_id: str
     must prove the exact provider, model and effort. The same bounded retries
     as the process proof apply, because the file appears a moment after the
     agent starts.
+
+    Pi writes that file lazily, on its first prompt. When `bootstrap` is set
+    (fresh launches only) and `agent get` names a session path that does not
+    exist, exactly one inert bootstrap prompt is sent per participant per
+    launch, then the bounded retries resume against the file. A prompt
+    refused with `agent_blocked` or `agent_prompt_stalled` propagates, so
+    the launcher reports the peer as waiting at its own startup prompt; a
+    file that never appears still fails closed. Reopen and adopt never
+    bootstrap: a used peer already has its file, and an unused one is not
+    owned by name alone, so there a missing file simply fails the proof.
     """
     for attempt in range(VERIFY_PANE_ATTEMPTS):
         payload = run_json(herdr_bin, ["pane", "process-info", "--pane", pane_id])
@@ -952,13 +984,34 @@ def pi_participant_proves(herdr_bin: str, participant: Participant, pane_id: str
                     raise
                 live = {}
             session_path = pi_agent_session_path(live.get("result", {}).get("agent"))
-            if session_path and pi_session_proves(
-                session_path,
-                str(participant.provider or ""),
-                participant.model,
-                participant.effort,
-            ):
-                return True
+            if session_path:
+                if pi_session_proves(
+                    session_path,
+                    str(participant.provider or ""),
+                    participant.model,
+                    participant.effort,
+                ):
+                    return True
+                if (
+                    bootstrap
+                    and participant.name not in PI_BOOTSTRAPPED_NAMES
+                    and not Path(session_path).exists()
+                ):
+                    PI_BOOTSTRAPPED_NAMES.add(participant.name)
+                    run_json(
+                        herdr_bin,
+                        [
+                            "agent",
+                            "prompt",
+                            participant.name,
+                            PI_BOOTSTRAP_PROMPT,
+                            "--wait",
+                            "--timeout",
+                            "90000",
+                        ],
+                        timeout=None,
+                    )
+                    continue
         if attempt + 1 < VERIFY_PANE_ATTEMPTS:
             time.sleep(VERIFY_PANE_INTERVAL_S)
     return False
@@ -2038,7 +2091,7 @@ def start_participants(
             assert_server_identity(state_dir, state_path)
             start_agent(herdr_bin, name, participant.kind, pane_id, participant.start_args)
             if needs_native_proof(participant) and not participant_process_proves(
-                herdr_bin, participant, pane_id
+                herdr_bin, participant, pane_id, bootstrap=True
             ):
                 try:
                     close_pending_participant_tab(
@@ -2076,6 +2129,15 @@ def start_participants(
                 # Herdr has started the native agent but it is blocked in its
                 # own trust UI. Preserve the recorded pane/tab so a later
                 # setup retry can prove and promote that exact surface.
+                pending_tabs[role]["blocked_startup"] = True
+                save_launcher_state(state_dir, state, state_path)
+                failures.append(blocked_startup_prompt_guidance(participant))
+                print(f"pending @{role} trust", flush=True)
+                continue
+            if isinstance(error, BootstrapError) and error.code in PI_BOOTSTRAP_BLOCKED_CODES:
+                # The bootstrap prompt found the fresh Pi peer waiting at its
+                # own startup prompt; preserve the tab and point Terry there
+                # rather than closing it, exactly like a blocked agent start.
                 pending_tabs[role]["blocked_startup"] = True
                 save_launcher_state(state_dir, state, state_path)
                 failures.append(blocked_startup_prompt_guidance(participant))

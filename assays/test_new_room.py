@@ -4959,6 +4959,237 @@ def test_profile_receipt_evidence_names_each_proof_kind() -> None:
     assert evidence == {"sol": "pi-session", "fable": "process-argv"}
 
 
+def test_fresh_pi_peer_without_a_session_file_is_bootstrapped_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(module, "PI_BOOTSTRAPPED_NAMES", set())
+    # The fresh peer has never been prompted, so `agent get` names a session
+    # path that does not exist yet.
+    session = tmp_path / "bootstrapped-sol-peer.jsonl"
+    install_profile_host(
+        monkeypatch,
+        calls,
+        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        tmp_path=tmp_path,
+        agent_sessions={"sol-peer": session},
+    )
+    host_run_json = module.run_json
+
+    def prompting_run_json(
+        herdr_bin: str, arguments: list[str], timeout: float | None = 30
+    ) -> dict:
+        if arguments[:2] == ["agent", "prompt"] and not session.exists():
+            # Pi writes its session file lazily, on its first prompt.
+            session.write_text(pi_session_lines("openai-codex", "gpt-5.6-sol"))
+        return host_run_json(herdr_bin, arguments, timeout)
+
+    monkeypatch.setattr(module, "run_json", prompting_run_json)
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        {"schema_version": 1},
+        participants=module.resolve_profile("sol-fable"),
+    )
+
+    assert failures == []
+    assert [call for call in calls if call[:2] == ["agent", "prompt"]] == [
+        [
+            "agent",
+            "prompt",
+            "sol-peer",
+            "Do not inspect files or run tools. Reply READY only.",
+            "--wait",
+            "--timeout",
+            "90000",
+        ]
+    ]
+    bootstrapped = module.PI_BOOTSTRAPPED_NAMES
+    assert bootstrapped == {"sol-peer"}
+
+
+def test_fresh_pi_peer_with_a_session_file_is_never_prompted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(module, "PI_BOOTSTRAPPED_NAMES", set())
+    install_profile_host(
+        monkeypatch,
+        calls,
+        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        tmp_path=tmp_path,
+    )
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        {"schema_version": 1},
+        participants=module.resolve_profile("sol-fable"),
+    )
+
+    assert failures == []
+    assert not any(call[:2] == ["agent", "prompt"] for call in calls)
+    bootstrapped = module.PI_BOOTSTRAPPED_NAMES
+    assert bootstrapped == set()
+
+
+@pytest.mark.parametrize("blocked_code", ["agent_blocked", "agent_prompt_stalled"])
+def test_blocked_bootstrap_prompt_fails_closed_without_a_second_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocked_code: str
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(module, "PI_BOOTSTRAPPED_NAMES", set())
+    session = tmp_path / "blocked-sol-peer.jsonl"
+    install_profile_host(
+        monkeypatch,
+        calls,
+        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        tmp_path=tmp_path,
+        agent_sessions={"sol-peer": session},
+    )
+    host_run_json = module.run_json
+
+    def blocked_run_json(herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        if arguments[:2] == ["agent", "prompt"]:
+            calls.append(arguments)
+            raise BootstrapError(
+                json.dumps({"error": {"code": blocked_code, "message": "blocked"}}),
+                code=blocked_code,
+            )
+        return host_run_json(herdr_bin, arguments, timeout)
+
+    monkeypatch.setattr(module, "run_json", blocked_run_json)
+    state: dict = {"schema_version": 1}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=module.resolve_profile("sol-fable"),
+    )
+
+    assert [failure for failure in failures if failure.startswith("@sol")] == [
+        "@sol: pi is waiting at a blocked startup prompt in the preserved tab; "
+        "answer the prompt there, then rerun group-chat setup"
+    ]
+    # Exactly one prompt, never retried, and the blocked peer's tab survives.
+    assert [call for call in calls if call[:2] == ["agent", "prompt"]] == [
+        [
+            "agent",
+            "prompt",
+            "sol-peer",
+            "Do not inspect files or run tools. Reply READY only.",
+            "--wait",
+            "--timeout",
+            "90000",
+        ]
+    ]
+    assert state["pending_participant_tabs"]["sol"]["blocked_startup"] is True
+    assert not any(
+        tuple(call[:2]) in {("tab", "close"), ("pane", "close")}
+        for call in calls
+        if call[2:3] == ["w-agents:t-sol"]
+    )
+
+
+def test_bootstrap_is_sent_once_and_fails_closed_when_the_file_never_appears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sol = module.resolve_profile("sol-fable")[0]
+    monkeypatch.setattr(module, "PI_BOOTSTRAPPED_NAMES", set())
+    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+    session = tmp_path / "never-written-sol.jsonl"
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments[:2] == ["pane", "process-info"]:
+            return {"result": {"process_info": {"foreground_processes": list(PI_PROCESS)}}}
+        if arguments[:2] == ["agent", "get"]:
+            return {
+                "result": {
+                    "agent": {
+                        "name": sol.name,
+                        "kind": "pi",
+                        "agent_session": {"kind": "path", "value": str(session)},
+                    }
+                }
+            }
+        if arguments[:2] == ["agent", "prompt"]:
+            return {"result": {"type": "ok"}}  # answered; the file still never appears
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+
+    assert not module.participant_process_proves("herdr", sol, "w-agents:p-sol", bootstrap=True)
+    assert len([call for call in calls if call[:2] == ["agent", "prompt"]]) == 1
+    # A second proof within the same launch never bootstraps again.
+    assert not module.participant_process_proves("herdr", sol, "w-agents:p-sol", bootstrap=True)
+    assert [call for call in calls if call[:2] == ["agent", "prompt"]] == [
+        [
+            "agent",
+            "prompt",
+            "sol-peer",
+            "Do not inspect files or run tools. Reply READY only.",
+            "--wait",
+            "--timeout",
+            "90000",
+        ]
+    ]
+
+
+def test_reopen_with_a_missing_session_file_is_not_owned_and_never_prompts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    room_reopen_env(tmp_path, monkeypatch, captured, "chat-profile")
+    calls = install_launch_host(
+        tmp_path,
+        monkeypatch,
+        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        # The peer never wrote its session file: reopen treats it as not
+        # owned rather than prompting a peer it did not launch.
+        agent_sessions={"sol-peer": tmp_path / "never-written-sol.jsonl"},
+    )
+    state = profile_room_state(tmp_path)
+    state.pop("pending_room_id")
+    state.pop("pending_room_operation_id")
+    state.pop("pending_room_profile")
+    state.pop("pending_room_started_unix_ms")
+    state["selected_profile"] = "sol-fable"
+    state["last_room_id"] = "chat-profile"
+    save_launcher_state(tmp_path, state)
+
+    with pytest.raises(BootstrapError, match=r"@sol.*re-verification"):
+        module.room_entrypoint()
+
+    assert not any(call[:2] == ["agent", "prompt"] for call in calls)
+    assert "argv" not in captured
+
+
+def test_receipt_names_a_bootstrapped_pi_peer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(module, "PI_BOOTSTRAPPED_NAMES", set())
+    assert module.participant_proof_kind(module.SOL_PARTICIPANT) == "pi-session"
+
+    module.PI_BOOTSTRAPPED_NAMES.add("sol-peer")
+    assert module.participant_proof_kind(module.SOL_PARTICIPANT) == "pi-session (bootstrapped)"
+    assert module.participant_proof_kind(module.FABLE_PARTICIPANT) == "process-argv"
+    _, receipt = module.profile_room_exec("sol-fable", module.resolve_profile("sol-fable"))
+    evidence = {entry["role"]: entry["evidence"] for entry in json.loads(receipt)["verified"]}
+    assert evidence == {"sol": "pi-session (bootstrapped)", "fable": "process-argv"}
+
+
 def pi_session_proof_harness(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
