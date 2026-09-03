@@ -1281,23 +1281,25 @@ def focused_workspace_and_tab(herdr_bin: str) -> tuple[str, str]:
     return "", ""
 
 
-def live_agent_pane_id(herdr_bin: str, participant: Participant) -> str:
-    """Read a participant's live pane id ahead of a grid move.
+def workspace_label_by_id(herdr_bin: str) -> dict[str, str]:
+    """Live workspace labels by id, from `workspace list` alone."""
+    return {
+        str(workspace["workspace_id"]): str(workspace.get("label") or "")
+        for workspace in workspaces(herdr_bin)
+    }
 
-    The recorded pane ids were written by the previous arrangement, whose
-    room tab a relaunch replaces, so the live pane is addressed by name
-    instead of by the possibly-stale recorded id.
-    """
-    live = (
-        run_json(herdr_bin, ["agent", "get", participant.name]).get("result", {}).get("agent", {})
+
+def ensure_place_workspace(herdr_bin: str, cwd: str, label: str) -> str:
+    """The live workspace carrying `label`, created unfocused when absent."""
+    for workspace in workspaces(herdr_bin):
+        if str(workspace.get("label")) == label:
+            return str(workspace["workspace_id"])
+    created = run_json(
+        herdr_bin,
+        ["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"],
+        timeout=None,
     )
-    pane_id = str(live.get("pane_id") or "")
-    if not pane_id:
-        raise BootstrapError(
-            f"@{participant.role}: {participant.name} has no live pane to arrange",
-            code="grid_failed",
-        )
-    return pane_id
+    return str(created["result"]["workspace"]["workspace_id"])
 
 
 def grid_peer_split_ratios(participant_count: int) -> tuple[str, ...]:
@@ -1317,64 +1319,130 @@ def grid_peer_split_ratios(participant_count: int) -> tuple[str, ...]:
     )
 
 
-def arrange_grid(
+def place(
     herdr_bin: str,
+    layout: str,
     state: dict[str, Any],
     participants: Sequence[Participant],
     room_pane_id: str,
     room_tab_id: str,
-) -> None:
-    """Move every verified peer pane into the room tab as a right-hand stack.
+    room_workspace_id: str,
+) -> list[str]:
+    """Place every owned peer for `layout`, from live state only.
 
-    Runs only after the whole profile verified. Each peer's live pane id is
-    read through `agent get` immediately before its move — the previous room
-    tab is being replaced, so the recorded pane ids cannot be trusted to
-    address the live panes. A peer already inside the target room tab is
-    still moved into position, so the stack order is rebuilt idempotently.
-    `pane move` takes focus, so the caller's workspace and tab are recorded
-    first and restored once at the end. Each move is read back through
-    `agent get`; a peer that lands outside the room tab fails the launch
-    closed. Recorded pane and tab ids are rewritten so reopen, adopt and
-    /show keep addressing the live panes. The first `right` split keeps the
-    room at GRID_ROOM_RATIO; every later `down` split carries its ratio from
-    `grid_peer_split_ratios`, so the stack finishes with equal heights
-    instead of halving with every move.
+    The step reads `agent get` for each participant, `pane layout` for the
+    room tab and `workspace list` for labels; no recorded pane, tab or
+    workspace id is authority. It is idempotent: a peer already sitting
+    where the layout puts it is never moved, so a re-run issues no command.
+    `compact` moves each owned peer that is not in a workspace labelled
+    `agents · group-chat` into that workspace (created on demand with
+    `--no-focus`) as its own tab labelled `<role> · group-chat`. `grid`
+    moves each owned peer that is not already in the room tab into it as
+    the right-hand stack: the room pane is the split anchor, the first
+    mover splits it `right` keeping GRID_ROOM_RATIO, and every later mover
+    splits the previous mover `down` with its ratio from
+    `grid_peer_split_ratios`, so the stack finishes with equal heights.
+    The caller's focused workspace and tab are recorded before the first
+    move and restored after the last. No workspace is ever closed.
     """
-    caller_workspace, caller_tab = focused_workspace_and_tab(herdr_bin)
+    if layout not in LAYOUTS:
+        raise BootstrapError(f"unknown layout {layout!r}", code="settings_invalid")
+    owned: list[tuple[Participant, dict[str, Any]]] = []
+    for participant in participants:
+        agent = owned_participant(herdr_bin, participant, str(state.get("agents_cwd") or ""))
+        if agent is not None:
+            owned.append((participant, agent))
+    moved: list[str] = []
+    caller_workspace, caller_tab = "", ""
+    if layout == "compact":
+        labels = workspace_label_by_id(herdr_bin)
+        movers = [
+            (participant, agent)
+            for participant, agent in owned
+            if labels.get(str(agent.get("workspace_id") or "")) != AGENTS_WORKSPACE_LABEL
+        ]
+        target_id = ""
+        if movers:
+            caller_workspace, caller_tab = focused_workspace_and_tab(herdr_bin)
+        for participant, agent in movers:
+            if not target_id:
+                target_id = ensure_place_workspace(
+                    herdr_bin, str(state.get("agents_cwd") or Path.cwd()), AGENTS_WORKSPACE_LABEL
+                )
+            run_json(
+                herdr_bin,
+                [
+                    "pane",
+                    "move",
+                    str(agent["pane_id"]),
+                    "--workspace",
+                    target_id,
+                    "--new-tab",
+                    "--label",
+                    f"{participant.role} · group-chat",
+                ],
+            )
+            moved.append(participant.role)
+    else:
+        movers = [
+            (participant, agent)
+            for participant, agent in owned
+            if str(agent.get("tab_id") or "") != room_tab_id
+        ]
+        if movers and not room_pane_id:
+            raise BootstrapError(
+                "grid placement needs a live room pane to anchor the stack",
+                code="place_failed",
+            )
+        down_ratios = grid_peer_split_ratios(len(movers))
+        anchor = room_pane_id
+        if movers:
+            caller_workspace, caller_tab = focused_workspace_and_tab(herdr_bin)
+        for index, (participant, agent) in enumerate(movers):
+            arguments = ["pane", "move", str(agent["pane_id"]), "--tab", room_tab_id, "--split"]
+            if index == 0:
+                arguments.extend(["right", "--target-pane", anchor, "--ratio", GRID_ROOM_RATIO])
+            else:
+                arguments.extend(
+                    ["down", "--target-pane", anchor, "--ratio", down_ratios[index - 1]]
+                )
+            run_json(herdr_bin, arguments)
+            anchor = str(agent["pane_id"])
+            moved.append(participant.role)
     panes = state.setdefault("participant_pane_ids", {})
     tabs = state.setdefault("participant_tab_ids", {})
-
-    down_ratios = grid_peer_split_ratios(len(participants))
-    anchor = room_pane_id
-    for index, participant in enumerate(participants):
-        pane_id = live_agent_pane_id(herdr_bin, participant)
-        arguments = ["pane", "move", pane_id, "--tab", room_tab_id, "--split"]
-        if index == 0:
-            arguments.extend(["right", "--target-pane", anchor, "--ratio", GRID_ROOM_RATIO])
-        else:
-            arguments.extend(["down", "--target-pane", anchor, "--ratio", down_ratios[index - 1]])
-        run_json(herdr_bin, arguments)
+    verify_workspace = ""
+    last_workspace = ""
+    for participant, _agent in owned:
         live = (
             run_json(herdr_bin, ["agent", "get", participant.name])
             .get("result", {})
             .get("agent", {})
         )
-        new_pane = str(live.get("pane_id") or "")
-        new_tab = str(live.get("tab_id") or "")
-        if not new_pane or new_tab != room_tab_id:
+        panes[participant.role] = str(live.get("pane_id") or "")
+        tabs[participant.role] = str(live.get("tab_id") or "")
+        last_workspace = str(live.get("workspace_id") or "")
+        if layout == "compact":
+            if not verify_workspace:
+                verify_workspace = workspace_label_by_id(herdr_bin)
+            if verify_workspace.get(str(live.get("workspace_id") or "")) != AGENTS_WORKSPACE_LABEL:
+                raise BootstrapError(
+                    f"@{participant.role}: {participant.name} did not land in "
+                    f"{AGENTS_WORKSPACE_LABEL}",
+                    code="place_failed",
+                )
+        elif str(live.get("tab_id") or "") != room_tab_id:
             raise BootstrapError(
                 f"@{participant.role}: {participant.name} did not land in the room tab",
-                code="grid_failed",
+                code="place_failed",
             )
-        panes[participant.role] = new_pane
-        tabs[participant.role] = new_tab
-        state["participant_workspace_id"] = str(live.get("workspace_id") or "")
-        anchor = new_pane
-    state["layout"] = "grid"
+    state["layout"] = layout
+    state["participant_workspace_id"] = last_workspace
     if caller_workspace:
         run_json(herdr_bin, ["workspace", "focus", caller_workspace])
     if caller_tab:
         run_json(herdr_bin, ["tab", "focus", caller_tab])
+    return moved
 
 
 def close_empty_agents_workspace(herdr_bin: str, state: dict[str, Any]) -> None:
@@ -2081,17 +2149,18 @@ def main() -> int:
         layout = os.environ.get(LAYOUT_ENV, "").strip() or "compact"
         if layout not in LAYOUTS:
             raise BootstrapError(f"unknown layout {layout!r}", code="settings_invalid")
-        if layout == "grid" and not failures:
-            arrange_grid(
+        if not failures:
+            place(
                 herdr_bin,
+                layout,
                 state,
                 participants,
-                room_pane_id=os.environ.get("HERDR_PANE_ID", "").strip(),
-                room_tab_id=os.environ.get("HERDR_TAB_ID", "").strip(),
+                os.environ.get("HERDR_PANE_ID", "").strip(),
+                os.environ.get("HERDR_TAB_ID", "").strip(),
+                workspace_id,
             )
         else:
-            state["layout"] = "compact"
-            state.pop("participant_workspace_id", None)
+            state["layout"] = layout
         if profile:
             # Trust the profile only for this room, whose id lands in last_room_id.
             state["selected_profile"] = profile
@@ -2218,6 +2287,17 @@ def room_entrypoint() -> int:
                 str(state.get("agents_cwd") or ""),
                 participants,
             )
+        layout = str(state.get("layout") or "compact")
+        if layout in LAYOUTS:
+            place(
+                herdr_bin,
+                layout,
+                state,
+                participants if profile else resolve_profile(None),
+                pane_id,
+                tab_id,
+                workspace_id,
+            )
         save_launcher_state(state_dir, state, state_path)
         agents_workspace_id = str(state.get("agents_workspace_id") or "")
         if state.get("layout") == "grid" and agents_workspace_id not in workspace_ids(herdr_bin):
@@ -2238,6 +2318,33 @@ def room_entrypoint() -> int:
     return 0
 
 
+def place_layout(layout: str) -> int:
+    """Run `place` for a recorded room and print exactly one JSON result line."""
+    herdr_bin = os.environ.get("HERDR_BIN_PATH", "herdr")
+    if layout not in LAYOUTS:
+        raise BootstrapError(f"--place requires one of {list(LAYOUTS)}", code="settings_invalid")
+    state_dir = plugin_state_dir()
+    with launcher_state_lock(state_dir) as state_path:
+        state = load_launcher_state(state_dir, state_path)
+        profile = str(state.get("selected_profile") or "") or None
+        participants = resolve_profile(profile) if profile else resolve_profile(None)
+        moved = place(
+            herdr_bin,
+            layout,
+            state,
+            participants,
+            str(state.get("room_pane_id") or ""),
+            str(state.get("room_tab_id") or ""),
+            str(state.get("chat_workspace_id") or ""),
+        )
+        save_launcher_state(state_dir, state, state_path)
+    print(
+        json.dumps({"layout": layout, "moved": moved}, sort_keys=True, separators=(",", ":")),
+        flush=True,
+    )
+    return 0
+
+
 def parse_launch_arguments(arguments: list[str]) -> tuple[str, str | None]:
     """Return (mode, profile) for the exact launcher argv; anything else fails."""
     if not arguments:
@@ -2252,6 +2359,10 @@ def parse_launch_arguments(arguments: list[str]) -> tuple[str, str | None]:
         if rest:
             raise BootstrapError(f"unknown arguments: {' '.join(arguments)}")
         return "--adopt-peers", None
+    if mode == "--place":
+        if len(rest) != 1 or rest[0] not in LAYOUTS:
+            raise BootstrapError("--place requires exactly one layout: compact or grid")
+        return "--place", None
     if mode == "--errors":
         try:
             count = int(rest[0])
@@ -2266,7 +2377,7 @@ def parse_launch_arguments(arguments: list[str]) -> tuple[str, str | None]:
             raise BootstrapError("--profile requires a profile name")
         profile = rest[1]
         rest = rest[2:]
-    if rest or mode not in {"--launch", "--open", "--adopt-peers", "--room-entrypoint"}:
+    if rest or mode not in {"--launch", "--open", "--adopt-peers", "--place", "--room-entrypoint"}:
         raise BootstrapError(f"unknown arguments: {' '.join(arguments)}")
     if profile is not None and mode != "--launch":
         raise BootstrapError("--profile only applies to --launch")
@@ -2284,6 +2395,8 @@ def run_launcher(arguments: list[str]) -> int:
             return launch_room(open_existing=True)
         if mode == "--adopt-peers":
             return adopt_stale_peers()
+        if mode == "--place":
+            return place_layout(arguments[1])
         if mode == "--room-entrypoint":
             return room_entrypoint()
         if mode == "--last-error":
