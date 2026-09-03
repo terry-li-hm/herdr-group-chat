@@ -945,25 +945,24 @@ def test_participant_start_does_not_move_a_globally_named_external_agent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(module, "PARTICIPANTS", (("pi", "pi-peer"),))
+    external_cwd = tmp_path / "elsewhere"
+    external_cwd.mkdir()
     calls: list[list[str]] = []
 
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
         calls.append(arguments)
-        assert arguments == ["agent", "list"]
-        return {
-            "result": {
-                "agents": [
-                    {
-                        "name": "pi-peer",
-                        "kind": "pi",
-                        "pane_id": "w-agents:p-unrecorded",
-                        "workspace_id": "w-agents",
-                        "cwd": str(tmp_path),
-                    }
-                ]
-            }
+        record = {
+            "name": "pi-peer",
+            "kind": "pi",
+            "pane_id": "w-other:p-unrecorded",
+            "workspace_id": "w-other",
+            "cwd": str(external_cwd),
         }
+        if arguments == ["agent", "list"]:
+            return {"result": {"agents": [record]}}
+        assert arguments == ["agent", "get", "pi-peer"]
+        return {"result": {"agent": record}}
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
     state: dict = {"schema_version": 1}
@@ -971,9 +970,9 @@ def test_participant_start_does_not_move_a_globally_named_external_agent(
         "herdr", str(tmp_path), "w-agents", tmp_path, launcher_state_path(tmp_path), state
     )
 
-    assert failures and "(pane not recorded)" in failures[0]
-    assert "Adopt stale group-chat peers" in failures[0]
-    assert calls == [["agent", "list"]]
+    assert failures and "not owned" in failures[0]
+    assert "the session was left open" in failures[0]
+    assert calls == [["agent", "list"], ["agent", "get", "pi-peer"]]
 
 
 @pytest.mark.parametrize(
@@ -992,22 +991,19 @@ def test_same_named_wrong_kind_agent_is_left_open_and_never_replaced(
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
         calls.append(arguments)
-        assert arguments == ["agent", "list"]
-        return {
-            "result": {
-                "agents": [
-                    {
-                        "name": "pi-peer",
-                        "kind": reported_kind,
-                        "agent": reported_agent,
-                        "workspace_id": "w-agents",
-                        "cwd": str(tmp_path),
-                        "pane_id": "w-agents:p-pi",
-                        "tab_id": "w-agents:t-pi",
-                    }
-                ]
-            }
+        record = {
+            "name": "pi-peer",
+            "kind": reported_kind,
+            "agent": reported_agent,
+            "workspace_id": "w-agents",
+            "cwd": str(tmp_path),
+            "pane_id": "w-agents:p-pi",
+            "tab_id": "w-agents:t-pi",
         }
+        if arguments == ["agent", "list"]:
+            return {"result": {"agents": [record]}}
+        assert arguments == ["agent", "get", "pi-peer"]
+        return {"result": {"agent": record}}
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
     state: dict = {
@@ -1027,9 +1023,9 @@ def test_same_named_wrong_kind_agent_is_left_open_and_never_replaced(
     )
 
     assert failures == [
-        "@pi: pi-peer is already running with a different agent kind; the session was left open"
+        "@pi: pi-peer is live but not owned (a different agent kind); the session was left open"
     ]
-    assert calls == [["agent", "list"]]
+    assert calls == [["agent", "list"], ["agent", "get", "pi-peer"]]
     assert state["participant_pane_ids"] == {"pi": "w-agents:p-pi"}
     assert state["participant_tab_ids"] == {"pi": "w-agents:t-pi"}
 
@@ -1651,8 +1647,11 @@ def test_launch_hands_participant_failures_to_the_room_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(module, "PARTICIPANTS", (("pi", "pi-peer"),))
+    external_cwd = tmp_path / "elsewhere"
+    external_cwd.mkdir()
     captured: dict[str, object] = {}
     launch_env(tmp_path, monkeypatch, captured)
+    save_launcher_state(tmp_path, {"agents_cwd": str(tmp_path)})
 
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
@@ -1673,11 +1672,24 @@ def test_launch_hands_participant_failures_to_the_room_process(
                             "name": "pi-peer",
                             "kind": "pi",
                             "workspace_id": "w-other",
-                            "cwd": str(tmp_path),
+                            "cwd": str(external_cwd),
                             "pane_id": "w-other:p1",
                             "tab_id": "w-other:t1",
                         }
                     ]
+                }
+            }
+        if arguments == ["agent", "get", "pi-peer"]:
+            return {
+                "result": {
+                    "agent": {
+                        "name": "pi-peer",
+                        "kind": "pi",
+                        "workspace_id": "w-other",
+                        "cwd": str(external_cwd),
+                        "pane_id": "w-other:p1",
+                        "tab_id": "w-other:t1",
+                    }
                 }
             }
         return {"result": {"type": "ok"}}
@@ -1687,11 +1699,8 @@ def test_launch_hands_participant_failures_to_the_room_process(
     module.main()
 
     env = captured["env"]
-    assert env[module.SETUP_FAILURES_ENV] == (
-        "@pi: pi-peer is live in workspace w-other but this launcher owns "
-        "w-agents (different workspace, different cwd, pane not recorded); "
-        "run the Adopt stale group-chat peers action or close that peer tab"
-    )
+    assert env[module.SETUP_FAILURES_ENV].startswith("@pi: pi-peer is live but not owned (cwd ")
+    assert "the session was left open" in env[module.SETUP_FAILURES_ENV]
     argv = captured["argv"]
     assert argv[0].endswith("herdr-group-chat") and "--room" in argv
 
@@ -1734,6 +1743,19 @@ def test_launch_without_failures_clears_stale_setup_failures(
                             "tab_id": "w-agents:t1",
                         }
                     ]
+                }
+            }
+        if arguments == ["agent", "get", "pi-peer"]:
+            return {
+                "result": {
+                    "agent": {
+                        "name": "pi-peer",
+                        "kind": "pi",
+                        "workspace_id": "w-agents",
+                        "cwd": str(tmp_path),
+                        "pane_id": "w-agents:p1",
+                        "tab_id": "w-agents:t1",
+                    }
                 }
             }
         return {"result": {"type": "ok"}}
@@ -2007,21 +2029,18 @@ def test_matching_live_agent_promotes_only_its_exact_pending_tab(
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
         calls.append(arguments)
+        record = {
+            "name": participant.name,
+            "kind": participant.kind,
+            "workspace_id": "w-agents",
+            "cwd": str(tmp_path),
+            "pane_id": pending["pane_id"],
+            "tab_id": pending["tab_id"],
+        }
         if arguments == ["agent", "list"]:
-            return {
-                "result": {
-                    "agents": [
-                        {
-                            "name": participant.name,
-                            "kind": participant.kind,
-                            "workspace_id": "w-agents",
-                            "cwd": str(tmp_path),
-                            "pane_id": pending["pane_id"],
-                            "tab_id": pending["tab_id"],
-                        }
-                    ]
-                }
-            }
+            return {"result": {"agents": [record]}}
+        if arguments == ["agent", "get", participant.name]:
+            return {"result": {"agent": record}}
         return {"result": {"type": "ok"}}
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
@@ -2061,21 +2080,18 @@ def test_recorded_live_agent_closes_a_different_stale_pending_tab(
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
         calls.append(arguments)
+        record = {
+            "name": participant.name,
+            "kind": participant.kind,
+            "workspace_id": "w-agents",
+            "cwd": str(tmp_path),
+            "pane_id": recorded_pane_id,
+            "tab_id": recorded_tab_id,
+        }
         if arguments == ["agent", "list"]:
-            return {
-                "result": {
-                    "agents": [
-                        {
-                            "name": participant.name,
-                            "kind": participant.kind,
-                            "workspace_id": "w-agents",
-                            "cwd": str(tmp_path),
-                            "pane_id": recorded_pane_id,
-                            "tab_id": recorded_tab_id,
-                        }
-                    ]
-                }
-            }
+            return {"result": {"agents": [record]}}
+        if arguments == ["agent", "get", participant.name]:
+            return {"result": {"agent": record}}
         return {"result": {"type": "ok"}}
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
@@ -2121,21 +2137,18 @@ def test_exact_live_pending_prompt_preserves_state_when_native_proof_fails(
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
         calls.append(arguments)
+        record = {
+            "name": participant.name,
+            "kind": participant.kind,
+            "workspace_id": "w-agents",
+            "cwd": str(tmp_path),
+            "pane_id": pending["pane_id"],
+            "tab_id": pending["tab_id"],
+        }
         if arguments == ["agent", "list"]:
-            return {
-                "result": {
-                    "agents": [
-                        {
-                            "name": participant.name,
-                            "kind": participant.kind,
-                            "workspace_id": "w-agents",
-                            "cwd": str(tmp_path),
-                            "pane_id": pending["pane_id"],
-                            "tab_id": pending["tab_id"],
-                        }
-                    ]
-                }
-            }
+            return {"result": {"agents": [record]}}
+        if arguments == ["agent", "get", participant.name]:
+            return {"result": {"agent": record}}
         return {"result": {"type": "ok"}}
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
@@ -2179,21 +2192,18 @@ def test_exact_live_blocked_startup_promotes_after_native_proof_succeeds(
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
         calls.append(arguments)
+        record = {
+            "name": participant.name,
+            "kind": participant.kind,
+            "workspace_id": "w-agents",
+            "cwd": str(tmp_path),
+            "pane_id": pending["pane_id"],
+            "tab_id": pending["tab_id"],
+        }
         if arguments == ["agent", "list"]:
-            return {
-                "result": {
-                    "agents": [
-                        {
-                            "name": participant.name,
-                            "kind": participant.kind,
-                            "workspace_id": "w-agents",
-                            "cwd": str(tmp_path),
-                            "pane_id": pending["pane_id"],
-                            "tab_id": pending["tab_id"],
-                        }
-                    ]
-                }
-            }
+            return {"result": {"agents": [record]}}
+        if arguments == ["agent", "get", participant.name]:
+            return {"result": {"agent": record}}
         if arguments[:2] == ["pane", "process-info"]:
             return {"result": {"process_info": {"foreground_processes": CLAUDE_FABLE_PROCESS}}}
         return {"result": {"type": "ok"}}
@@ -2221,15 +2231,24 @@ def test_exact_live_blocked_startup_promotes_after_native_proof_succeeds(
 
 
 @pytest.mark.parametrize(
-    ("live_pane_id", "live_tab_id"),
+    ("live_pane_id", "live_tab_id", "closes_pending_tab"),
     [
-        ("w-agents:p-other", "w-agents:t-codex"),
-        ("w-agents:p-codex", "w-agents:t-other"),
+        ("w-agents:p-other", "w-agents:t-codex", False),
+        ("w-agents:p-codex", "w-agents:t-other", True),
     ],
 )
-def test_mismatched_live_agent_is_not_adopted_or_closed_from_pending_tab(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_pane_id: str, live_tab_id: str
+def test_owned_live_agent_is_reused_wherever_it_sits_and_closes_only_a_stale_pending_tab(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    live_pane_id: str,
+    live_tab_id: str,
+    closes_pending_tab: bool,
 ) -> None:
+    """Ownership is by name: a live agent in any pane or tab is still owned.
+
+    The recorded pending pane and tab ids carry no authority; a pending tab is
+    closed only when it is not the live peer's own tab.
+    """
     participant = module.Participant(role="codex", kind="codex", name="codex-peer")
     calls: list[list[str]] = []
     pending = {
@@ -2242,21 +2261,18 @@ def test_mismatched_live_agent_is_not_adopted_or_closed_from_pending_tab(
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
         calls.append(arguments)
+        record = {
+            "name": participant.name,
+            "kind": participant.kind,
+            "workspace_id": "w-agents",
+            "cwd": str(tmp_path),
+            "pane_id": live_pane_id,
+            "tab_id": live_tab_id,
+        }
         if arguments == ["agent", "list"]:
-            return {
-                "result": {
-                    "agents": [
-                        {
-                            "name": participant.name,
-                            "kind": participant.kind,
-                            "workspace_id": "w-agents",
-                            "cwd": str(tmp_path),
-                            "pane_id": live_pane_id,
-                            "tab_id": live_tab_id,
-                        }
-                    ]
-                }
-            }
+            return {"result": {"agents": [record]}}
+        if arguments == ["agent", "get", participant.name]:
+            return {"result": {"agent": record}}
         return {"result": {"type": "ok"}}
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
@@ -2272,11 +2288,14 @@ def test_mismatched_live_agent_is_not_adopted_or_closed_from_pending_tab(
         participants=(participant,),
     )
 
-    assert len(failures) == 1 and "pane not recorded" in failures[0]
-    assert state["pending_participant_tabs"]["codex"] == pending
-    assert "participant_pane_ids" not in state
-    assert "participant_tab_ids" not in state
-    assert not any(call[:2] in (["tab", "close"], ["pane", "close"]) for call in calls)
+    assert failures == []
+    assert state["participant_pane_ids"] == {"codex": live_pane_id}
+    assert state["participant_tab_ids"] == {"codex": live_tab_id}
+    assert "pending_participant_tabs" not in state
+    if closes_pending_tab:
+        assert ["tab", "close", pending["tab_id"]] in calls
+    else:
+        assert not any(call[:2] in (["tab", "close"], ["pane", "close"]) for call in calls)
 
 
 # --- bounded sol-fable model profile -------------------------------------------------
@@ -2316,6 +2335,14 @@ def install_profile_host(
         calls.append(arguments)
         if arguments == ["agent", "list"]:
             return {"result": {"agents": live_agents}}
+        if arguments[:2] == ["agent", "get"]:
+            matches = [item for item in live_agents if item.get("name") == arguments[2]]
+            if not matches:
+                raise BootstrapError(
+                    json.dumps({"error": {"code": "agent_not_found", "message": "not found"}}),
+                    code="agent_not_found",
+                )
+            return {"result": {"agent": matches[0]}}
         if arguments == ["workspace", "list"]:
             return {"result": {"workspaces": workspaces}}
         if arguments[:2] == ["tab", "create"]:
@@ -2657,6 +2684,19 @@ def test_default_participants_stay_unverified_and_unchanged(
                     ]
                 }
             }
+        if arguments == ["agent", "get", "pi-peer"]:
+            return {
+                "result": {
+                    "agent": {
+                        "name": "pi-peer",
+                        "kind": "pi",
+                        "workspace_id": "w-agents",
+                        "cwd": str(tmp_path),
+                        "pane_id": "w-agents:p1",
+                        "tab_id": "w-agents:t1",
+                    }
+                }
+            }
         return {"result": {"type": "ok"}}
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
@@ -2892,21 +2932,18 @@ def test_profile_reverify_accepts_foreground_cwd_and_checks_native_pane_proof(
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
         calls.append(arguments)
+        record = {
+            "name": participant.name,
+            "kind": participant.kind,
+            "workspace_id": "w-agents",
+            "foreground_cwd": str(tmp_path),
+            "pane_id": pane_id,
+            "tab_id": tab_id,
+        }
         if arguments == ["agent", "list"]:
-            return {
-                "result": {
-                    "agents": [
-                        {
-                            "name": participant.name,
-                            "kind": participant.kind,
-                            "workspace_id": "w-agents",
-                            "foreground_cwd": str(tmp_path),
-                            "pane_id": pane_id,
-                            "tab_id": tab_id,
-                        }
-                    ]
-                }
-            }
+            return {"result": {"agents": [record]}}
+        if arguments == ["agent", "get", participant.name]:
+            return {"result": {"agent": record}}
         if arguments[:2] == ["pane", "process-info"]:
             return {"result": {"process_info": {"foreground_processes": CLAUDE_FABLE_PROCESS}}}
         return {"result": {"type": "ok"}}
@@ -2914,26 +2951,25 @@ def test_profile_reverify_accepts_foreground_cwd_and_checks_native_pane_proof(
     monkeypatch.setattr(module, "run_json", fake_run_json)
     monkeypatch.setattr(module, "run_text", lambda *_args, **_kwargs: FABLE_POST_TURN_SCREEN)
     monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
-    state = {
-        "schema_version": 1,
-        "participant_pane_ids": {"fable": pane_id},
-        "participant_tab_ids": {"fable": tab_id},
-    }
 
-    module.reverify_profile_participants("herdr", "w-agents", str(tmp_path), state, (participant,))
+    module.reverify_profile_participants("herdr", str(tmp_path), (participant,))
 
     assert ["pane", "process-info", "--pane", pane_id] in calls
 
 
-def test_room_reopen_fails_closed_on_a_renamed_or_replaced_pane(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_room_reopen_accepts_a_moved_pane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pane move is not an ownership change: reopen follows the live pane."""
     captured: dict[str, object] = {}
     room_reopen_env(tmp_path, monkeypatch, captured, "chat-profile")
     calls = install_launch_host(
-        tmp_path, monkeypatch, {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+        tmp_path,
+        monkeypatch,
+        {
+            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-replaced": SOL_SCREEN,
+            "w-agents:p-fable": FABLE_SCREEN,
+        },
     )
-    # The live Sol agent moved to a new pane: the recorded pane is stale.
     calls.clear()
     original = module.run_json
 
@@ -2943,6 +2979,8 @@ def test_room_reopen_fails_closed_on_a_renamed_or_replaced_pane(
             for agent in result["result"]["agents"]:
                 if agent["name"] == "sol-peer":
                     agent["pane_id"] = "w-agents:p-replaced"
+        if arguments == ["agent", "get", "sol-peer"]:
+            result["result"]["agent"]["pane_id"] = "w-agents:p-replaced"
         return result
 
     monkeypatch.setattr(module, "run_json", shifted_agents)
@@ -2955,10 +2993,10 @@ def test_room_reopen_fails_closed_on_a_renamed_or_replaced_pane(
     state["last_room_id"] = "chat-profile"
     save_launcher_state(tmp_path, state)
 
-    with pytest.raises(BootstrapError, match="re-verification"):
-        module.room_entrypoint()
+    module.room_entrypoint()
 
-    assert "argv" not in captured
+    argv = captured["argv"]
+    assert argv[0].endswith("herdr-group-chat")
     assert not any(call[:2] in (["agent", "start"], ["tab", "close"]) for call in calls)
 
 
@@ -3961,6 +3999,14 @@ def install_role_replacement_host(
         calls.append(arguments)
         if arguments == ["agent", "list"]:
             return {"result": {"agents": live_agents}}
+        if arguments[:2] == ["agent", "get"]:
+            matches = [agent for agent in live_agents if agent.get("name") == arguments[2]]
+            if not matches:
+                raise BootstrapError(
+                    json.dumps({"error": {"code": "agent_not_found", "message": "not found"}}),
+                    code="agent_not_found",
+                )
+            return {"result": {"agent": matches[0]}}
         if arguments[:2] == ["pane", "process-info"]:
             # A reused Fable peer has taken turns, so its startup banner is gone;
             # the setup path must accept its reopen evidence (pane text plus the
@@ -4937,114 +4983,44 @@ ADOPT_MUTATIONS = (
 )
 
 
-def test_adopt_peers_adopts_a_clean_single_workspace_set(
+def test_adopt_peers_reports_the_owned_roles_from_any_workspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """Ownership is by name: the workspace a peer sits in never matters."""
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
-    calls = install_adopt_host(monkeypatch, adopt_live_agents("w1E", str(tmp_path)))
-
-    assert module.adopt_stale_peers() == 0
-
-    state = load_launcher_state(tmp_path)
-    assert state["agents_workspace_id"] == "w1E"
-    assert state["agents_cwd"] == str(tmp_path)
-    assert state["participant_pane_ids"] == {
-        role: f"w1E:p-{pane}"
-        for role, pane in (
-            ("sol", "sol"),
-            ("fable", "fable"),
-            ("grok", "grok46"),
-            ("pi", "pi"),
-            ("claude", "claude"),
-            ("codex", "codex"),
-        )
-    }
-    assert state["participant_tab_ids"] == {
-        role: f"w1E:t-{pane}"
-        for role, pane in (
-            ("sol", "sol"),
-            ("fable", "fable"),
-            ("grok", "grok46"),
-            ("pi", "pi"),
-            ("claude", "claude"),
-            ("codex", "codex"),
-        )
-    }
-    out = capsys.readouterr().out.splitlines()
-    assert [line.split()[1] for line in out[:-1]] == [
-        "@pi",
-        "@claude",
-        "@codex",
-        "@sol",
-        "@fable",
-        "@grok",
+    monkeypatch.setenv("HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_cwd": str(tmp_path)}))
+    live = [
+        *adopt_live_agents("w1E", str(tmp_path), names=("sol-peer", "fable-peer")),
+        *adopt_live_agents("w-somewhere-else", str(tmp_path), names=("pi-peer",)),
     ]
-    assert "adopted 6 peers in workspace w1E (agents · group-chat)" in out[-1]
-    assert not any(tuple(call[:2]) in ADOPT_MUTATIONS for call in calls)
-
-
-def test_adopt_peers_recognizes_the_pi_xai_grok_profile_peer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
     calls = install_adopt_host(
         monkeypatch,
-        adopt_live_agents("w1E", str(tmp_path), names=("grok46pi-peer",)),
-        pane_screens={"w1E:p-grok46pi": GROK_PI_POST_TURN_SCREEN},
-    )
-
-    assert module.adopt_stale_peers() == 0
-
-    state = load_launcher_state(tmp_path)
-    assert state["participant_pane_ids"] == {"grok": "w1E:p-grok46pi"}
-    assert state["participant_tab_ids"] == {"grok": "w1E:t-grok46pi"}
-    assert ["pi", "--list-models", "grok-4.6"] in calls
-    assert "adopted @grok (grok46pi-peer, pane w1E:p-grok46pi)" in capsys.readouterr().out
-    assert not any(tuple(call[:2]) in ADOPT_MUTATIONS for call in calls)
-
-    before = load_launcher_state(tmp_path)
-    conflicting_calls = install_adopt_host(
-        monkeypatch,
-        adopt_live_agents("w1E", str(tmp_path), names=("grok46-peer", "grok46pi-peer")),
-        pane_screens={
-            "w1E:p-grok46": GROK_POST_TURN_SCREEN,
-            "w1E:p-grok46pi": GROK_PI_POST_TURN_SCREEN,
-        },
-    )
-    with pytest.raises(BootstrapError, match="grok46-peer, grok46pi-peer are both live"):
-        module.adopt_stale_peers()
-
-    assert load_launcher_state(tmp_path) == before
-    assert not any(tuple(call[:2]) in ADOPT_MUTATIONS for call in conflicting_calls)
-
-
-def test_adopt_peers_leaves_a_previous_placeholder_workspace_untouched(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
-    save_launcher_state(
-        tmp_path,
-        {
-            "agents_workspace_id": "w1Z",
-            "agents_placeholder_tab_id": "w1Z:t-placeholder",
-        },
-    )
-    calls = install_adopt_host(
-        monkeypatch,
-        adopt_live_agents("w1E", str(tmp_path)),
+        live,
         workspaces=[
             {"workspace_id": "w1E", "label": "agents · group-chat"},
-            {"workspace_id": "w1Z", "label": "agents · group-chat"},
+            {"workspace_id": "w-somewhere-else", "label": "scratch"},
         ],
     )
 
     assert module.adopt_stale_peers() == 0
 
     state = load_launcher_state(tmp_path)
-    assert state["agents_workspace_id"] == "w1E"
-    assert state["agents_placeholder_tab_id"] == "w1Z:t-placeholder"
-    summary = capsys.readouterr().out.splitlines()[-1]
-    assert "previous placeholder workspace w1Z was left untouched" in summary
+    assert state["agents_cwd"] == str(tmp_path)
+    assert state["participant_pane_ids"] == {
+        "pi": "w-somewhere-else:p-pi",
+        "sol": "w1E:p-sol",
+        "fable": "w1E:p-fable",
+    }
+    assert state["participant_tab_ids"] == {
+        "pi": "w-somewhere-else:t-pi",
+        "sol": "w1E:t-sol",
+        "fable": "w1E:t-fable",
+    }
+    out = capsys.readouterr().out.splitlines()
+    owned_lines = [line for line in out if line.startswith("owned @")]
+    assert [line.split()[1] for line in owned_lines] == ["@pi", "@sol", "@fable"]
+    assert "owned @pi (pi-peer, pane w-somewhere-else:p-pi)" in out
+    assert "3 peers owned at cwd " in out[-1]
     assert not any(tuple(call[:2]) in ADOPT_MUTATIONS for call in calls)
 
 
@@ -5055,112 +5031,98 @@ def _adopt_kind_mismatch_live() -> list[dict]:
 
 
 @pytest.mark.parametrize(
-    ("live", "screens", "workspaces", "needle", "other_state"),
+    ("live", "needle"),
     [
         pytest.param(
             _adopt_kind_mismatch_live(),
-            None,
-            None,
-            "@codex: codex-peer is live with a different agent kind",
-            None,
+            "not owned @codex (codex-peer): a different agent kind",
             id="kind-mismatch",
         ),
         pytest.param(
             adopt_live_agents("w1E", "/gone", names=("sol-peer",)),
-            # No fresh footer and no reopen evidence for Sol: adoption must refuse.
-            {"w1E:p-sol": "Pi\nmodel gpt-5.6-sol-01 • high\n"},
-            None,
-            "@sol: sol-peer failed native-ui verification",
-            None,
-            id="native-proof",
-        ),
-        pytest.param(
-            [
-                *adopt_live_agents("w1E", "/gone", names=("sol-peer",)),
-                *adopt_live_agents("w2E", "/gone", names=("fable-peer",)),
-            ],
-            {"w1E:p-sol": SOL_SCREEN, "w2E:p-fable": FABLE_POST_TURN_SCREEN},
-            [
-                {"workspace_id": "w1E", "label": "agents · group-chat"},
-                {"workspace_id": "w2E", "label": "agents · group-chat"},
-            ],
-            "the live peers span several workspaces: w1E, w2E",
-            None,
-            id="two-workspaces",
-        ),
-        pytest.param(
-            adopt_live_agents("w1E", "/gone"),
-            None,
-            None,
-            "workspace w1E is still recorded by launcher-state-deadbee000.json",
-            {"schema_version": 1, "agents_workspace_id": "w1E"},
-            id="claimed-by-other-state",
-        ),
-        pytest.param(
-            [
-                *adopt_live_agents("w1E", "/gone", names=("sol-peer", "fable-peer")),
-                *adopt_live_agents("w1E", "/elsewhere", names=("grok46-peer",)),
-            ],
-            {
-                "w1E:p-sol": SOL_SCREEN,
-                "w1E:p-fable": FABLE_POST_TURN_SCREEN,
-                "w1E:p-grok46": GROK_POST_TURN_SCREEN,
-            },
-            None,
-            "grok46-peer (/elsewhere)",
-            None,
-            id="differing-cwds",
+            "not owned @sol (sol-peer): cwd /gone, not ",
+            id="different-cwd",
         ),
         pytest.param(
             [],
-            None,
-            None,
-            "no configured group-chat participant is live",
-            None,
+            "not owned @pi (pi-peer): not live",
             id="nothing-live",
         ),
     ],
 )
-def test_adopt_peers_refuses_and_adopts_nothing(
+def test_adopt_peers_reports_each_not_owned_reason_and_records_nothing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
     live: list[dict],
-    screens: dict[str, str] | None,
-    workspaces: list[dict] | None,
     needle: str,
-    other_state: dict | None,
 ) -> None:
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
-    if other_state is not None:
-        (tmp_path / "launcher-state-deadbee000.json").write_text(
-            json.dumps(other_state), encoding="utf-8"
-        )
-    calls = install_adopt_host(monkeypatch, live, workspaces=workspaces, pane_screens=screens)
+    monkeypatch.setenv("HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_cwd": str(tmp_path)}))
+    calls = install_adopt_host(monkeypatch, live)
 
-    with pytest.raises(BootstrapError) as excinfo:
-        module.adopt_stale_peers()
+    assert module.adopt_stale_peers() == 0
 
-    error = excinfo.value
-    assert error.code == "adopt_refused"
-    assert needle in str(error)
-    assert error.failures and any(needle in failure for failure in error.failures)
+    out = capsys.readouterr().out.splitlines()
+    assert any(needle in line for line in out)
+    if not live:
+        assert "no configured group-chat participant is owned at cwd " in out[-1]
     assert load_launcher_state(tmp_path) == {"schema_version": module.LAUNCHER_STATE_VERSION}
     assert not any(tuple(call[:2]) in ADOPT_MUTATIONS for call in calls)
 
 
-def test_adopt_peers_ignores_claims_of_workspaces_that_no_longer_exist(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_adopt_peers_reports_two_live_peers_for_one_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The restart-dead launcher states point at workspaces Herdr deleted."""
+    """Both live peers for one role are reported; the display cache keeps the last."""
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
-    (tmp_path / "launcher-state-deadbee000.json").write_text(
-        json.dumps({"schema_version": 1, "agents_workspace_id": "w3"}), encoding="utf-8"
+    monkeypatch.setenv("HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_cwd": str(tmp_path)}))
+    calls = install_adopt_host(
+        monkeypatch,
+        adopt_live_agents("w1E", str(tmp_path), names=("grok46-peer", "grok46pi-peer")),
+        pane_screens={
+            "w1E:p-grok46": GROK_POST_TURN_SCREEN,
+            "w1E:p-grok46pi": GROK_PI_POST_TURN_SCREEN,
+        },
     )
-    calls = install_adopt_host(monkeypatch, adopt_live_agents("w1E", str(tmp_path)))
 
     assert module.adopt_stale_peers() == 0
-    assert load_launcher_state(tmp_path)["agents_workspace_id"] == "w1E"
+
+    state = load_launcher_state(tmp_path)
+    assert state["participant_pane_ids"] == {"grok": "w1E:p-grok46pi"}
+    out = capsys.readouterr().out.splitlines()
+    assert "owned @grok (grok46-peer, pane w1E:p-grok46)" in out
+    assert "owned @grok (grok46pi-peer, pane w1E:p-grok46pi)" in out
     assert not any(tuple(call[:2]) in ADOPT_MUTATIONS for call in calls)
+
+
+def test_adopt_peers_never_touches_workspaces_or_placeholders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_cwd": str(tmp_path)}))
+    save_launcher_state(
+        tmp_path,
+        {
+            "agents_workspace_id": "w1Z",
+            "agents_placeholder_tab_id": "w1Z:t-placeholder",
+        },
+    )
+    calls = install_adopt_host(
+        monkeypatch,
+        adopt_live_agents("w1E", str(tmp_path), names=("sol-peer",)),
+        workspaces=[
+            {"workspace_id": "w1E", "label": "agents · group-chat"},
+            {"workspace_id": "w1Z", "label": "agents · group-chat"},
+        ],
+    )
+
+    assert module.adopt_stale_peers() == 0
+
+    state = load_launcher_state(tmp_path)
+    assert state["agents_workspace_id"] == "w1Z"
+    assert state["agents_placeholder_tab_id"] == "w1Z:t-placeholder"
+    assert not any(tuple(call[:2]) in (("workspace", "close"), ("tab", "close")) for call in calls)
 
 
 def test_adopt_then_atomic_profile_launch_succeeds_against_the_same_fake(
@@ -5186,11 +5148,14 @@ def test_adopt_then_atomic_profile_launch_succeeds_against_the_same_fake(
         },
     )
     state = sfg_room_state(tmp_path)
-    state.pop("agents_workspace_id")  # the restart wiped this launcher's records
+    # The restart wiped the cwd and pane records; the workspace id survives as
+    # a display cache, and adopt recovers ownership purely by name.
+    state["agents_workspace_id"] = "w1E"
     state.pop("agents_cwd")
     state.pop("participant_pane_ids")
     state.pop("participant_tab_ids")
     save_launcher_state(tmp_path, state)
+    monkeypatch.setenv("HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_cwd": str(tmp_path)}))
 
     assert module.adopt_stale_peers() == 0
     module.main()
@@ -5213,30 +5178,21 @@ def test_profile_incomplete_message_and_record_carry_each_role_reason(
     profile_launch_env(tmp_path, monkeypatch, captured)
     monkeypatch.setenv(module.PROFILE_ENV, "sol-fable-grok")
     monkeypatch.setenv(module.ROOM_ENV, "chat-sfg")
-    live = [
-        {**agent, "workspace_id": "w-old"}
-        if agent["name"] == "sol-peer"
-        else {**agent, "cwd": str(tmp_path / "elsewhere")}
-        if agent["name"] == "fable-peer"
-        else agent
-        for agent in SFG_LIVE_AGENTS
-    ]
+    live = [dict(agent) for agent in SFG_LIVE_AGENTS]
     calls = install_sfg_host(
         monkeypatch,
         tmp_path,
         {
             "w-agents:p-sol": SOL_SCREEN,
             "w-agents:p-fable": FABLE_SCREEN,
-            "w-agents:p-grok": GROK_SCREEN,
+            # Grok is owned but its native evidence has lapsed.
+            "w-agents:p-grok": "Grok 4.5 (medium)\n",
         },
         live_agents=live,
     )
     # install_sfg_host normalises every cwd to tmp_path; move Fable afterwards.
     live[1]["cwd"] = str(tmp_path / "elsewhere")
     state = sfg_room_state(tmp_path)
-    # This session recorded Sol and Fable, but never Grok's pane.
-    state["participant_pane_ids"] = {"sol": "w-agents:p-sol", "fable": "w-agents:p-fable"}
-    state["participant_tab_ids"] = {"sol": "w-agents:t-sol", "fable": "w-agents:t-fable"}
     save_launcher_state(tmp_path, state)
 
     with pytest.raises(BootstrapError) as excinfo:
@@ -5246,29 +5202,17 @@ def test_profile_incomplete_message_and_record_carry_each_role_reason(
     assert error.code == "profile_incomplete"
     message = str(error)
     assert (
-        "- @sol: sol-peer is live in workspace w-old but this launcher owns "
-        "w-agents (different workspace)" in message
+        "- @fable: fable-peer is live but not owned (cwd " in message
+        and "the session was left open" in message
     )
     assert (
-        "- @fable: fable-peer is live in workspace w-agents but this launcher owns "
-        "w-agents (different cwd)" in message
+        "- @grok: grok46-peer failed native-ui verification; the session was left open" in message
     )
-    assert (
-        "- @grok: grok46-peer is live in workspace w-agents but this launcher owns "
-        "w-agents (pane not recorded)" in message
+    assert error.failures and len(error.failures) == 2
+    assert error.failures[0].startswith("@fable: fable-peer is live but not owned (cwd ")
+    assert error.failures[1] == (
+        "@grok: grok46-peer failed native-ui verification; the session was left open"
     )
-    assert "run the Adopt stale group-chat peers action or close that peer tab" in message
-    assert error.failures == [
-        "@sol: sol-peer is live in workspace w-old but this launcher owns w-agents "
-        "(different workspace); run the Adopt stale group-chat peers action or "
-        "close that peer tab",
-        "@fable: fable-peer is live in workspace w-agents but this launcher owns "
-        "w-agents (different cwd); run the Adopt stale group-chat peers action or "
-        "close that peer tab",
-        "@grok: grok46-peer is live in workspace w-agents but this launcher owns "
-        "w-agents (pane not recorded); run the Adopt stale group-chat peers action "
-        "or close that peer tab",
-    ]
     record = module._launcher_error_record(
         "--launch", ["--launch", "--profile", "sol-fable-grok"], error
     )
@@ -5749,19 +5693,6 @@ def test_arrange_grid_fails_closed_when_a_peer_lands_outside_the_room_tab(
     assert "layout" not in state
 
 
-def test_adopted_workspace_acceptable_by_label_or_grid_room():
-    backstage = {"label": "agents · group-chat"}
-    room = {"label": "group-chat"}
-    assert module.adopted_workspace_acceptable({}, "w-agents", backstage)
-    assert not module.adopted_workspace_acceptable({}, "w-chat", room)
-    grid_state = {"layout": "grid", "participant_workspace_id": "w-chat"}
-    assert module.adopted_workspace_acceptable(grid_state, "w-chat", room)
-    assert not module.adopted_workspace_acceptable(grid_state, "w-other", room)
-    assert not module.adopted_workspace_acceptable(
-        {"layout": "compact", "participant_workspace_id": "w-chat"}, "w-chat", room
-    )
-
-
 def test_launch_passes_layout_env_and_opus_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     path = tmp_path / "settings.toml"
     path.write_text('layout = "grid"\nopus = true\n')
@@ -5795,14 +5726,14 @@ def test_launch_passes_layout_env_and_opus_profile(tmp_path: Path, monkeypatch: 
     assert "HERDR_GROUP_CHAT_LAYOUT=grid" in opened
 
 
-def test_grid_relaunch_ownership_accepts_the_recorded_participant_workspace(
+def test_grid_relaunch_reuses_live_peers_in_any_workspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A grid relaunch reuses live peers still sitting in the recorded room workspace."""
+    """A relaunch reuses owned peers wherever they sit: workspace ids carry no authority."""
     calls: list[list[str]] = []
     roles = (("sol", "pi", "sol-peer"), ("fable", "claude", "fable-peer"))
 
-    def relaunch(layout: str | None, live_workspace_id: str) -> list[str]:
+    def relaunch(live_workspace_id: str) -> list[str]:
         calls.clear()
         live = [
             {
@@ -5832,9 +5763,8 @@ def test_grid_relaunch_ownership_accepts_the_recorded_participant_workspace(
             "participant_workspace_id": "w-room",
             "participant_pane_ids": {"sol": live[0]["pane_id"], "fable": live[1]["pane_id"]},
             "participant_tab_ids": {"sol": live[0]["tab_id"], "fable": live[1]["tab_id"]},
+            "layout": "grid",
         }
-        if layout is not None:
-            state["layout"] = layout
         return module.start_participants(
             "herdr",
             str(tmp_path),
@@ -5845,39 +5775,9 @@ def test_grid_relaunch_ownership_accepts_the_recorded_participant_workspace(
             participants=module.resolve_profile("sol-fable"),
         )
 
-    # Grid layout owns the recorded participant workspace: the live peers are
-    # verified and reused, and nothing is started.
-    assert relaunch("grid", "w-room") == []
-    assert not any(call[:2] in (["tab", "create"], ["agent", "start"]) for call in calls)
-
-    # Compact layout keeps rejecting the same peers, with the exact single-id message.
-    assert relaunch("compact", "w-room") == [
-        "@sol: sol-peer is live in workspace w-room but this launcher owns w-backstage "
-        "(different workspace); run the Adopt stale group-chat peers action or "
-        "close that peer tab",
-        "@fable: fable-peer is live in workspace w-room but this launcher owns "
-        "w-backstage (different workspace); run the Adopt stale group-chat peers "
-        "action or close that peer tab",
-    ]
-
-    # A peer in an unrelated workspace is rejected by both layouts; the grid
-    # failure lists both accepted workspace ids.
-    assert relaunch("grid", "w-unrelated") == [
-        "@sol: sol-peer is live in workspace w-unrelated but this launcher owns "
-        "w-backstage or w-room (different workspace); run the Adopt stale "
-        "group-chat peers action or close that peer tab",
-        "@fable: fable-peer is live in workspace w-unrelated but this launcher owns "
-        "w-backstage or w-room (different workspace); run the Adopt stale "
-        "group-chat peers action or close that peer tab",
-    ]
-    assert relaunch("compact", "w-unrelated") == [
-        "@sol: sol-peer is live in workspace w-unrelated but this launcher owns "
-        "w-backstage (different workspace); run the Adopt stale group-chat peers "
-        "action or close that peer tab",
-        "@fable: fable-peer is live in workspace w-unrelated but this launcher owns "
-        "w-backstage (different workspace); run the Adopt stale group-chat peers "
-        "action or close that peer tab",
-    ]
+    for workspace_id in ("w-room", "w-unrelated"):
+        assert relaunch(workspace_id) == []
+        assert not any(call[:2] in (["tab", "create"], ["agent", "start"]) for call in calls)
 
 
 def test_arrange_grid_reads_the_live_pane_id_not_the_recorded_one(
@@ -6193,7 +6093,8 @@ def test_grid_relaunch_reuses_live_peers_and_closes_the_emptied_backstage(
         live_agents=live,
         process_infos={"w-room:p-fable": CLAUDE_FABLE_PROCESS, "w-room:p-grok": GROK_PROCESS},
     )
-    moved: set[str] = set()
+    moved_names: set[str] = set()
+    pane_to_name = {agent["pane_id"]: agent["name"] for agent in live}
 
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
@@ -6218,12 +6119,19 @@ def test_grid_relaunch_reuses_live_peers_and_closes_the_emptied_backstage(
                 }
             }
         if arguments[:2] == ["agent", "get"]:
-            role = arguments[2].removesuffix("-peer").replace("grok46", "grok")
-            if role in moved:
+            kinds = {"sol-peer": "pi", "fable-peer": "claude", "grok46-peer": "grok"}
+
+            def name_for(name: str) -> str:
+                return name.removesuffix("-peer").replace("grok46", "grok")
+
+            if arguments[2] in moved_names:
                 return {
                     "result": {
                         "agent": {
-                            "pane_id": f"w-chat:p-{role}-m",
+                            "name": arguments[2],
+                            "kind": kinds[arguments[2]],
+                            "cwd": str(tmp_path),
+                            "pane_id": f"w-chat:p-{arguments[2]}",
                             "tab_id": "w-chat:t-room",
                             "workspace_id": "w-chat",
                         }
@@ -6232,8 +6140,11 @@ def test_grid_relaunch_reuses_live_peers_and_closes_the_emptied_backstage(
             return {
                 "result": {
                     "agent": {
-                        "pane_id": f"w-room:p-{role}",
-                        "tab_id": f"w-room:t-{role}",
+                        "name": arguments[2],
+                        "kind": kinds[arguments[2]],
+                        "cwd": str(tmp_path),
+                        "pane_id": f"w-room:p-{name_for(arguments[2])}",
+                        "tab_id": f"w-room:t-{name_for(arguments[2])}",
                         "workspace_id": "w-room",
                     }
                 }
@@ -6245,7 +6156,7 @@ def test_grid_relaunch_reuses_live_peers_and_closes_the_emptied_backstage(
             }.get(arguments[arguments.index("--pane") + 1], [{"name": "zsh"}])
             return {"result": {"process_info": {"foreground_processes": processes}}}
         if arguments[:2] == ["pane", "move"]:
-            moved.add(arguments[2].split(":p-", 1)[1])
+            moved_names.add(pane_to_name[arguments[2]])
         if arguments[:2] == ["pane", "list"]:
             return {"result": {"panes": []}}
         return {"result": {"type": "ok"}}
@@ -6285,7 +6196,7 @@ def test_grid_relaunch_reuses_live_peers_and_closes_the_emptied_backstage(
     assert final_state["layout"] == "grid"
     assert final_state["participant_workspace_id"] == "w-chat"
     assert final_state["participant_pane_ids"] == {
-        "sol": "w-chat:p-sol-m",
-        "fable": "w-chat:p-fable-m",
-        "grok": "w-chat:p-grok-m",
+        "sol": "w-chat:p-sol-peer",
+        "fable": "w-chat:p-fable-peer",
+        "grok": "w-chat:p-grok46-peer",
     }

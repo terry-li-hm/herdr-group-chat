@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Iterator, Mapping, Sequence
+    from collections.abc import Iterator, Mapping, Sequence
 
 PARTICIPANTS = (
     ("pi", "pi-peer"),
@@ -1654,56 +1654,40 @@ def same_cwd(left: str, right: str) -> bool:
     return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
 
 
-def accepted_workspace_ids(agents_workspace_id: str, state: Mapping[str, Any]) -> list[str]:
-    """Every workspace a live participant may occupy and still count as owned.
+def owned_participant(
+    herdr_bin: str, participant: Participant, agent_cwd: str
+) -> dict[str, Any] | None:
+    """The live `agent get` record when the participant is owned; None otherwise.
 
-    Compact layout owns peers only in the backstage workspace. Grid layout
-    also owns peers still sitting in the recorded participant workspace from
-    the previous arrangement, so relaunching a grid room reuses its live
-    peers instead of failing closed against a freshly created backstage.
+    Ownership is by name only: the agent exists, its kind matches the
+    participant, and its cwd matches the room's agent cwd. Fresh launch,
+    reopen and adopt all reduce to this single check; no recorded pane, tab
+    or workspace id ever takes part.
     """
-    accepted = [agents_workspace_id]
-    if state.get("layout") == "grid":
-        participant_workspace_id = str(state.get("participant_workspace_id") or "")
-        if participant_workspace_id and participant_workspace_id not in accepted:
-            accepted.append(participant_workspace_id)
-    return accepted
-
-
-def ownership_mismatch_reasons(
-    live_agent: Mapping[str, Any],
-    accepted_workspace_ids: Collection[str],
-    live_cwd: str,
-    agent_cwd: str,
-    recorded_pane_id: str | None,
-) -> list[str]:
-    """Name every failed ownership check for an already-live participant."""
-    reasons: list[str] = []
-    if str(live_agent.get("workspace_id")) not in accepted_workspace_ids:
-        reasons.append("different workspace")
+    try:
+        live = run_json(herdr_bin, ["agent", "get", participant.name])
+    except BootstrapError as error:
+        if error.code == "agent_not_found":
+            return None
+        raise
+    agent = live.get("result", {}).get("agent")
+    if not isinstance(agent, dict) or not agent:
+        return None
+    if not live_agent_kind_matches(agent, participant.kind):
+        return None
+    live_cwd = str(agent.get("cwd") or agent.get("foreground_cwd") or "")
     if not live_cwd or not same_cwd(live_cwd, agent_cwd):
-        reasons.append("different cwd")
-    if recorded_pane_id != str(live_agent.get("pane_id")):
-        reasons.append("pane not recorded")
-    return reasons
+        return None
+    return agent
 
 
-def pending_participant_tab_matches(live_agent: Mapping[str, Any], pending: object) -> bool:
-    """Accept a first-run agent only when it is still in its exact pending tab."""
-    if not isinstance(pending, dict):
-        return False
-    pending_pane_id = pending.get("pane_id")
-    pending_tab_id = pending.get("tab_id")
-    live_pane_id = live_agent.get("pane_id")
-    live_tab_id = live_agent.get("tab_id")
-    return (
-        isinstance(pending_pane_id, str)
-        and isinstance(pending_tab_id, str)
-        and bool(pending_pane_id)
-        and bool(pending_tab_id)
-        and pending_pane_id == live_pane_id
-        and pending_tab_id == live_tab_id
-    )
+def live_agent_unowned_reason(
+    live_agent: Mapping[str, Any], participant: Participant, agent_cwd: str
+) -> str:
+    """Why a live same-named agent is not owned; display text only, never authority."""
+    if not live_agent_kind_matches(live_agent, participant.kind):
+        return "a different agent kind"
+    return f"cwd {live_agent.get('cwd') or live_agent.get('foreground_cwd')}, not {agent_cwd}"
 
 
 def blocked_startup_prompt_guidance(participant: Participant) -> str:
@@ -1741,7 +1725,8 @@ def blocked_pending_participant_tab_exists(
     return False
 
 
-def infer_owned_agents_cwd(herdr_bin: str, agents_workspace_id: str, requested_cwd: str) -> str:
+def infer_owned_agents_cwd(herdr_bin: str, requested_cwd: str) -> str:
+    """Reuse the live peers' cwd when every configured live peer shares one."""
     listed = run_json(herdr_bin, ["agent", "list"])
     expected_names = {name for _, name in PARTICIPANTS} | {
         participant.name
@@ -1753,7 +1738,6 @@ def infer_owned_agents_cwd(herdr_bin: str, agents_workspace_id: str, requested_c
         for item in listed.get("result", {}).get("agents", [])
         if isinstance(item, dict)
         and item.get("name") in expected_names
-        and str(item.get("workspace_id")) == agents_workspace_id
         and (item.get("cwd") or item.get("foreground_cwd"))
     }
     return owned_cwds.pop() if len(owned_cwds) == 1 else requested_cwd
@@ -1831,54 +1815,25 @@ def start_participants(
     participant_panes = state.setdefault("participant_pane_ids", {})
     participant_tabs = state.setdefault("participant_tab_ids", {})
     pending_tabs = state.setdefault("pending_participant_tabs", {})
-    accepted_ids = accepted_workspace_ids(agents_workspace_id, state)
     for participant in participants:
         role = participant.role
         name = participant.name
         live_agent = live_agents.get(name)
         if live_agent is not None:
-            live_cwd = str(live_agent.get("cwd") or live_agent.get("foreground_cwd") or "")
-            recorded_pane_id = participant_panes.get(role)
-            pending = pending_tabs.get(role)
-            pending_matches_live_agent = pending_participant_tab_matches(live_agent, pending)
-            blocked_pending_live_agent = (
-                isinstance(pending, dict)
-                and pending.get("blocked_startup") is True
-                and pending_matches_live_agent
-            )
-            has_recorded_pane = bool(recorded_pane_id)
-            if not live_agent_kind_matches(live_agent, participant.kind):
+            owned = owned_participant(herdr_bin, participant, agent_cwd)
+            if owned is None:
+                reason = live_agent_unowned_reason(live_agent, participant, agent_cwd)
                 failures.append(
-                    f"@{role}: {name} is already running with a different agent kind; "
-                    "the session was left open"
-                )
-                print(f"failed @{role}", flush=True)
-                continue
-            if (
-                str(live_agent.get("workspace_id")) not in accepted_ids
-                or not live_cwd
-                or not same_cwd(live_cwd, agent_cwd)
-                or (has_recorded_pane and recorded_pane_id != str(live_agent.get("pane_id")))
-                or (not has_recorded_pane and not pending_matches_live_agent)
-            ):
-                reasons = ", ".join(
-                    ownership_mismatch_reasons(
-                        live_agent, accepted_ids, live_cwd, agent_cwd, recorded_pane_id
-                    )
-                )
-                failures.append(
-                    f"@{role}: {name} is live in workspace "
-                    f"{live_agent.get('workspace_id')} but this launcher owns "
-                    f"{' or '.join(accepted_ids)} ({reasons}); run the Adopt stale "
-                    "group-chat peers action or close that peer tab"
+                    f"@{role}: {name} is live but not owned ({reason}); the session was left open"
                 )
                 print(f"failed @{role}", flush=True)
                 continue
             if needs_native_proof(participant) and not (
                 catalog_proof(participant)
-                and reopen_pane_proof(herdr_bin, participant, str(live_agent["pane_id"]))
+                and reopen_pane_proof(herdr_bin, participant, str(owned["pane_id"]))
             ):
-                if blocked_pending_live_agent:
+                pending = pending_tabs.get(role)
+                if isinstance(pending, dict) and pending.get("blocked_startup") is True:
                     failures.append(blocked_startup_prompt_guidance(participant))
                     print(f"pending @{role} trust", flush=True)
                     continue
@@ -1887,12 +1842,12 @@ def start_participants(
                 )
                 print(f"unverified @{role}", flush=True)
                 continue
-            participant_panes[role] = str(live_agent["pane_id"])
-            participant_tabs[role] = str(live_agent["tab_id"])
-            if has_recorded_pane and pending and pending.get("tab_id") != live_agent.get("tab_id"):
-                # A verified recorded participant retains its prior stale-tab
-                # cleanup behavior. Exact pending promotion is only for roles
-                # that did not yet record a participant pane.
+            participant_panes[role] = str(owned["pane_id"])
+            participant_tabs[role] = str(owned["tab_id"])
+            pending = pending_tabs.get(role)
+            if pending is not None and pending.get("tab_id") != owned.get("tab_id"):
+                # A stale pending tab from an interrupted start is closed only
+                # when it is not the live peer's own tab.
                 try:
                     close_pending_participant_tab(
                         herdr_bin, agents_workspace_id, pending, state_dir, state_path
@@ -1903,9 +1858,6 @@ def start_participants(
                     save_launcher_state(state_dir, state, state_path)
                     continue
             if pending is not None:
-                # A pending tab is promoted only after the exact live pane and
-                # tab pair passed every ownership and native-proof check above,
-                # or a recorded participant's stale pending tab was closed.
                 pending_tabs.pop(role, None)
             save_launcher_state(state_dir, state, state_path)
             print(f"ready  @{role} (existing {name})", flush=True)
@@ -2098,227 +2050,64 @@ def all_configured_participants() -> tuple[Participant, ...]:
     return tuple(unique)
 
 
-def _read_json_file_at(directory_descriptor: int, name: str) -> dict[str, Any] | None:
-    """Read one launcher-owned JSON file read-only; None when not readable."""
-    try:
-        descriptor = os.open(
-            name,
-            os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=directory_descriptor,
-        )
-    except OSError:
-        return None
-    try:
-        file_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_uid != os.geteuid():
-            return None
-        with os.fdopen(descriptor, encoding="utf-8") as stream:
-            descriptor = -1
-            try:
-                payload = json.load(stream)
-            except (OSError, ValueError):
-                return None
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    return payload if isinstance(payload, dict) else None
-
-
-def other_state_workspace_claims(state_dir: Path, state_path: Path) -> dict[str, str]:
-    """Map each workspace id recorded by another launcher state file to its name.
-
-    The other files are read read-only and skipped when unreadable, because a
-    launcher whose state cannot be parsed can no longer act on any workspace.
-    """
-    claims: dict[str, str] = {}
-    with _launcher_directory(state_dir) as directory_descriptor:
-        try:
-            names = os.listdir(directory_descriptor)
-        except OSError:
-            return claims
-        for name in sorted(names):
-            if not name.startswith(LAUNCHER_STATE_PREFIX) or not name.endswith(".json"):
-                continue
-            if name == state_path.name:
-                continue
-            state = _read_json_file_at(directory_descriptor, name)
-            if state is None:
-                continue
-            for field in ("agents_workspace_id", "chat_workspace_id"):
-                workspace_id = state.get(field)
-                if isinstance(workspace_id, str) and workspace_id:
-                    claims.setdefault(workspace_id, name)
-    return claims
-
-
-def adopted_workspace_acceptable(
-    state: Mapping[str, Any], workspace_id: str, workspace: Mapping[str, Any]
-) -> bool:
-    """Backstage by label, or the recorded participant workspace in grid layout."""
-    if str(workspace.get("label")) == AGENTS_WORKSPACE_LABEL:
-        return True
-    return state.get("layout") == "grid" and workspace_id == str(
-        state.get("participant_workspace_id") or ""
-    )
-
-
 def adopt_stale_peers() -> int:
-    """Adopt live group-chat peers orphaned by a Herdr server restart.
+    """Run the owned check for every configured role and report which are owned.
 
-    A restart gives the launcher a fresh state key, so peers the previous
-    instance started fail the pane-ownership checks and an atomic profile
-    aborts. Adoption is an explicit, fail-closed action: every live configured
-    peer must match its kind and native evidence, all candidates must share
-    exactly one `agents · group-chat` workspace that no other launcher state
-    file still claims, and they must share one cwd. On any mismatch nothing is
-    adopted; no pane is ever closed, prompted, or moved.
+    Ownership is `owned_participant` alone, evaluated against the recorded
+    room cwd (or the caller's cwd when no room cwd is recorded). Nothing is
+    closed, prompted, or moved; owned roles are recorded as display caches
+    and reported, everything else is reported as not owned.
     """
     herdr_bin = os.environ.get("HERDR_BIN_PATH", "herdr")
     state_dir = plugin_state_dir()
     with launcher_state_lock(state_dir) as state_path:
         state = load_launcher_state(state_dir, state_path)
+        context = plugin_context()
+        agent_cwd = str(state.get("agents_cwd") or "").strip() or str(
+            context.get("focused_pane_cwd") or context.get("workspace_cwd") or Path.cwd()
+        )
         listed = run_json(herdr_bin, ["agent", "list"])
-        agents = listed.get("result", {}).get("agents", [])
         live_agents = {
-            item["name"]: item for item in agents if isinstance(item, dict) and item.get("name")
+            item["name"]: item
+            for item in listed.get("result", {}).get("agents", [])
+            if isinstance(item, dict) and item.get("name")
         }
-
-        problems: list[str] = []
-        by_role: dict[str, list[tuple[Participant, dict[str, Any]]]] = {}
+        owned_roles: list[tuple[Participant, dict[str, Any]]] = []
         for participant in all_configured_participants():
-            live_agent = live_agents.get(participant.name)
-            if live_agent is None:
-                continue
-            if not live_agent_kind_matches(live_agent, participant.kind):
-                problems.append(
-                    f"@{participant.role}: {participant.name} is live with a "
-                    "different agent kind; the session was left open"
+            owned = owned_participant(herdr_bin, participant, agent_cwd)
+            if owned is None:
+                live = live_agents.get(participant.name)
+                if live is None:
+                    reason = "not live"
+                else:
+                    reason = live_agent_unowned_reason(live, participant, agent_cwd)
+                print(
+                    f"not owned @{participant.role} ({participant.name}): {reason}",
+                    flush=True,
                 )
                 continue
-            by_role.setdefault(participant.role, []).append((participant, live_agent))
-        adopted: list[tuple[Participant, dict[str, Any]]] = []
-        blocked_roles: set[str] = set()
-        for participant in all_configured_participants():
-            entries = by_role.get(participant.role)
-            if not entries or participant.role in blocked_roles:
-                continue
-            if len(entries) > 1:
-                both = ", ".join(sorted(entry.name for entry, _ in entries))
-                problems.append(
-                    f"@{participant.role}: {both} are both live; one role cannot adopt two peers"
-                )
-                blocked_roles.add(participant.role)
-                continue
-            if entries[0][0].name == participant.name:
-                adopted.append(entries[0])
-        if not adopted:
-            problems.append("no configured group-chat participant is live")
-
-        for participant, live_agent in adopted:
-            pane_id = str(live_agent.get("pane_id") or "")
-            if needs_native_proof(participant) and not (
-                pane_id
-                and catalog_proof(participant)
-                and reopen_pane_proof(herdr_bin, participant, pane_id)
-            ):
-                problems.append(
-                    f"@{participant.role}: {participant.name} failed native-ui "
-                    "verification; the session was left open"
-                )
-
-        listed_workspaces = workspaces(herdr_bin)
-        workspaces_by_id = {
-            str(workspace["workspace_id"]): workspace for workspace in listed_workspaces
-        }
-        candidate_ids = {str(live_agent.get("workspace_id") or "") for _, live_agent in adopted}
-        candidate_ids.discard("")
-        adopted_workspace_id = candidate_ids.pop() if len(candidate_ids) == 1 else ""
-        if len(candidate_ids) > 1:
-            problems.append(
-                "the live peers span several workspaces: " + ", ".join(sorted(candidate_ids))
-            )
-        elif adopted_workspace_id:
-            workspace = workspaces_by_id.get(adopted_workspace_id)
-            if workspace is None:
-                problems.append(f"workspace {adopted_workspace_id} no longer exists")
-            elif not adopted_workspace_acceptable(state, adopted_workspace_id, workspace):
-                problems.append(
-                    f"workspace {adopted_workspace_id} is labelled "
-                    f"{workspace.get('label')!r}, not {AGENTS_WORKSPACE_LABEL!r}"
-                )
-            else:
-                claims = {
-                    workspace_id: name
-                    for workspace_id, name in other_state_workspace_claims(
-                        state_dir, state_path
-                    ).items()
-                    if workspace_id in workspaces_by_id
-                }
-                claimed_by = claims.get(adopted_workspace_id)
-                if claimed_by is not None:
-                    problems.append(
-                        f"workspace {adopted_workspace_id} is still recorded by "
-                        f"{claimed_by}; another launcher state owns it"
-                    )
-
-        cwd_groups: dict[str, list[str]] = {}
-        for participant, live_agent in adopted:
-            live_cwd = str(live_agent.get("cwd") or live_agent.get("foreground_cwd") or "")
-            if not live_cwd:
-                problems.append(f"@{participant.role}: {participant.name} reports no cwd")
-            else:
-                cwd_groups.setdefault(str(Path(live_cwd).expanduser().resolve()), []).append(
-                    f"{participant.name} ({live_cwd})"
-                )
-        common_cwd = ""
-        if len(cwd_groups) > 1:
-            problems.append(
-                "the live peers do not share one cwd: "
-                + "; ".join(", ".join(names) for names in cwd_groups.values())
-            )
-        elif cwd_groups:
-            common_cwd = str(
-                next(
-                    live_agent.get("cwd") or live_agent.get("foreground_cwd")
-                    for _, live_agent in adopted
-                )
-            )
-
-        if problems:
-            raise BootstrapError(
-                "the stale group-chat peers were not adopted:\n"
-                + "\n".join(f"- {problem}" for problem in problems),
-                code="adopt_refused",
-                failures=problems,
-            )
-
-        previous_agents_workspace_id = str(state.get("agents_workspace_id") or "")
-        participant_panes = state.setdefault("participant_pane_ids", {})
-        participant_tabs = state.setdefault("participant_tab_ids", {})
-        for participant, live_agent in adopted:
-            participant_panes[participant.role] = str(live_agent["pane_id"])
-            participant_tabs[participant.role] = str(live_agent["tab_id"])
+            owned_roles.append((participant, owned))
             print(
-                f"adopted @{participant.role} ({participant.name}, pane {live_agent['pane_id']})",
+                f"owned @{participant.role} ({participant.name}, pane {owned['pane_id']})",
                 flush=True,
             )
-        state["agents_workspace_id"] = adopted_workspace_id
-        state["agents_cwd"] = common_cwd
-        save_launcher_state(state_dir, state, state_path)
-        summary = (
-            f"adopted {len(adopted)} peers in workspace {adopted_workspace_id} "
-            f"({AGENTS_WORKSPACE_LABEL}), cwd {common_cwd}"
-        )
-        if (
-            previous_agents_workspace_id
-            and previous_agents_workspace_id != adopted_workspace_id
-            and previous_agents_workspace_id in workspaces_by_id
-        ):
-            summary += (
-                f"; the previous placeholder workspace {previous_agents_workspace_id} "
-                "was left untouched"
+        if not owned_roles:
+            print(
+                f"no configured group-chat participant is owned at cwd {agent_cwd}",
+                flush=True,
             )
-        print(summary, flush=True)
+            return 0
+        participant_panes = state.setdefault("participant_pane_ids", {})
+        participant_tabs = state.setdefault("participant_tab_ids", {})
+        for participant, owned in owned_roles:
+            participant_panes[participant.role] = str(owned["pane_id"])
+            participant_tabs[participant.role] = str(owned["tab_id"])
+        state["agents_cwd"] = agent_cwd
+        save_launcher_state(state_dir, state, state_path)
+        print(
+            f"{len(owned_roles)} peers owned at cwd {agent_cwd}",
+            flush=True,
+        )
     return 0
 
 
@@ -2359,14 +2148,9 @@ def main() -> int:
             room=room,
             operation_id=operation_id,
         )
-        existing_agents_workspace = str(state.get("agents_workspace_id") or "")
         agent_cwd = str(state.get("agents_cwd") or "")
         if not agent_cwd:
-            agent_cwd = (
-                infer_owned_agents_cwd(herdr_bin, existing_agents_workspace, requested_agent_cwd)
-                if existing_agents_workspace
-                else requested_agent_cwd
-            )
+            agent_cwd = infer_owned_agents_cwd(herdr_bin, requested_agent_cwd)
             state["agents_cwd"] = agent_cwd
         agents_workspace_id, placeholder_tab_id = ensure_agents_workspace(
             herdr_bin, agent_cwd, state_dir, state, state_path
@@ -2469,44 +2253,25 @@ def main() -> int:
 
 def reverify_profile_participants(
     herdr_bin: str,
-    agents_workspace_id: str,
     agents_cwd: str,
-    state: dict[str, Any],
     participants: Sequence[Participant],
 ) -> None:
     """Re-verify each role against its exact live agent and native evidence.
 
-    Uses the same catalog/pane primitives as a fresh launch; never starts or
-    closes anything, and any mismatch stops the reopen before exec.
+    Ownership is the single `owned_participant` check; no recorded pane, tab
+    or workspace id takes part. Never starts or closes anything, and any
+    mismatch stops the reopen before exec.
     """
-    if not agents_workspace_id or not agents_cwd:
+    if not agents_cwd:
         raise BootstrapError(
-            "room profile re-verification is missing the agents workspace or cwd",
+            "room profile re-verification is missing the agents cwd",
             code="profile_reverify_failed",
         )
-    listed = run_json(herdr_bin, ["agent", "list"])
-    agents = listed.get("result", {}).get("agents", [])
-    live_agents = {
-        item["name"]: item for item in agents if isinstance(item, dict) and item.get("name")
-    }
-    participant_panes = state.get("participant_pane_ids", {})
-    participant_tabs = state.get("participant_tab_ids", {})
     for participant in participants:
-        live_agent = live_agents.get(participant.name)
-        live_cwd = str(
-            (live_agent or {}).get("cwd") or (live_agent or {}).get("foreground_cwd") or ""
-        )
-        recorded_pane = participant_panes.get(participant.role)
-        if (
-            live_agent is None
-            or not live_agent_kind_matches(live_agent, participant.kind)
-            or str(live_agent.get("workspace_id")) != agents_workspace_id
-            or str(live_agent.get("pane_id")) != recorded_pane
-            or str(live_agent.get("tab_id")) != participant_tabs.get(participant.role)
-            or not live_cwd
-            or not same_cwd(live_cwd, agents_cwd)
-            or not catalog_proof(participant)
-            or not reopen_pane_proof(herdr_bin, participant, recorded_pane)
+        owned = owned_participant(herdr_bin, participant, agents_cwd)
+        if owned is None or not (
+            catalog_proof(participant)
+            and reopen_pane_proof(herdr_bin, participant, str(owned["pane_id"]))
         ):
             raise BootstrapError(
                 f"@{participant.role}: {participant.name} failed room profile re-verification; "
@@ -2550,11 +2315,7 @@ def room_entrypoint() -> int:
         if profile:
             reverify_profile_participants(
                 herdr_bin,
-                str(
-                    state.get("participant_workspace_id") or state.get("agents_workspace_id") or ""
-                ),
                 str(state.get("agents_cwd") or ""),
-                state,
                 participants,
             )
         save_launcher_state(state_dir, state, state_path)
