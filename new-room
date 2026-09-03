@@ -1438,45 +1438,20 @@ def place(
             )
     state["layout"] = layout
     state["participant_workspace_id"] = last_workspace
-    if caller_workspace:
-        run_json(herdr_bin, ["workspace", "focus", caller_workspace])
-    if caller_tab:
-        run_json(herdr_bin, ["tab", "focus", caller_tab])
+    for arguments in (
+        ["workspace", "focus", caller_workspace] if caller_workspace else None,
+        ["tab", "focus", caller_tab] if caller_tab else None,
+    ):
+        if arguments is None:
+            continue
+        try:
+            run_json(herdr_bin, arguments)
+        except BootstrapError as error:
+            # The caller's workspace or tab may itself have vanished while the
+            # moves ran; Herdr owns the lifecycle, so "already gone" is fine.
+            if error.code not in {"workspace_not_found", "tab_not_found"}:
+                raise
     return moved
-
-
-def close_empty_agents_workspace(herdr_bin: str, state: dict[str, Any]) -> None:
-    """Close the backstage workspace once grid arrangement emptied it.
-
-    A grid relaunch creates a fresh backstage workspace while the live peers
-    still sit in the previous room's workspace, so an emptied backstage must
-    not linger and accumulate across relaunches. A workspace that still holds
-    any pane is never closed; a close racing the workspace's own
-    disappearance only drops the recorded id.
-    """
-    workspace_id = str(state.get("agents_workspace_id") or "")
-    if not workspace_id:
-        return
-    try:
-        listed = run_json(herdr_bin, ["pane", "list", "--workspace", workspace_id])
-    except BootstrapError as error:
-        # Herdr auto-closes a workspace once its last pane leaves it, so the
-        # pane listing can already report the emptied workspace as gone. That
-        # workspace is already closed: drop the recorded id and return. Any
-        # other failure still raises.
-        if error.code != "workspace_not_found":
-            raise
-        state.pop("agents_workspace_id", None)
-        return
-    panes = listed.get("result", {}).get("panes")
-    if not isinstance(panes, list) or panes:
-        return
-    try:
-        run_json(herdr_bin, ["workspace", "close", workspace_id])
-    except BootstrapError as error:
-        if error.code != "workspace_not_found":
-            raise
-    state.pop("agents_workspace_id", None)
 
 
 def launch_room(open_existing: bool, profile: str | None = None) -> int:
@@ -1675,7 +1650,12 @@ def blocked_pending_participant_tab_exists(
     pane_id = pending.get("pane_id")
     if not isinstance(tab_id, str) or not tab_id or not isinstance(pane_id, str) or not pane_id:
         return False
-    listed = run_json(herdr_bin, ["tab", "list", "--workspace", agents_workspace_id])
+    try:
+        listed = run_json(herdr_bin, ["tab", "list", "--workspace", agents_workspace_id])
+    except BootstrapError as error:
+        if error.code != "workspace_not_found":
+            raise
+        return False
     for tab in listed.get("result", {}).get("tabs", []):
         if not isinstance(tab, dict) or tab.get("tab_id") != tab_id:
             continue
@@ -1718,7 +1698,14 @@ def close_pending_participant_tab(
 ) -> None:
     tab_id = pending.get("tab_id")
     if not tab_id and pending.get("label"):
-        listed = run_json(herdr_bin, ["tab", "list", "--workspace", agents_workspace_id])
+        try:
+            listed = run_json(herdr_bin, ["tab", "list", "--workspace", agents_workspace_id])
+        except BootstrapError as error:
+            # Herdr auto-closes an emptied workspace; with it gone there is no
+            # pending tab left to close.
+            if error.code != "workspace_not_found":
+                raise
+            return
         matches = [
             tab
             for tab in listed.get("result", {}).get("tabs", [])
@@ -2176,10 +2163,6 @@ def main() -> int:
             state_dir,
             state_path,
         )
-        if layout == "grid" and not failures:
-            # The peers now live in the room tab; the emptied backstage must
-            # not linger and accumulate across grid relaunches.
-            close_empty_agents_workspace(herdr_bin, state)
         if tab_id:
             with suppress(BootstrapError):
                 assert_server_identity(state_dir, state_path)

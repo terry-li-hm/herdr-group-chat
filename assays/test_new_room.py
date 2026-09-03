@@ -6069,102 +6069,90 @@ def test_grid_relaunch_reuses_live_peers_in_any_workspace(
         assert not any(call[:2] in (["tab", "create"], ["agent", "start"]) for call in calls)
 
 
-def test_close_empty_agents_workspace_closes_only_a_paneless_workspace(
+def test_place_tolerates_a_vanished_caller_workspace_and_tab_on_restore(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+):
+    """Herdr owns the workspace lifecycle: an already-gone focus target is fine."""
     calls: list[list[str]] = []
-    panes_by_workspace: dict[str, list[dict]] = {"w-backstage": []}
+    moved: set[str] = set()
 
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
         calls.append(arguments)
-        if arguments[:2] == ["pane", "list"]:
-            return {"result": {"panes": panes_by_workspace[arguments[3]]}}
-        return {"result": {"type": "ok"}}
-
-    monkeypatch.setattr(module, "run_json", fake_run_json)
-
-    # No panes left: the backstage workspace is closed and unrecorded.
-    state: dict = {"agents_workspace_id": "w-backstage"}
-    module.close_empty_agents_workspace("herdr", state)
-    assert calls == [
-        ["pane", "list", "--workspace", "w-backstage"],
-        ["workspace", "close", "w-backstage"],
-    ]
-    assert "agents_workspace_id" not in state
-
-    # A workspace that still holds any pane is never closed.
-    calls.clear()
-    panes_by_workspace["w-backstage"] = [{"pane_id": "w-backstage:p-hold"}]
-    state = {"agents_workspace_id": "w-backstage"}
-    module.close_empty_agents_workspace("herdr", state)
-    assert calls == [["pane", "list", "--workspace", "w-backstage"]]
-    assert state["agents_workspace_id"] == "w-backstage"
-
-    # No recorded backstage workspace means nothing to close.
-    calls.clear()
-    module.close_empty_agents_workspace("herdr", {})
-    assert calls == []
-
-
-def test_close_empty_agents_workspace_treats_a_vanished_workspace_as_closed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Herdr auto-closes a workspace whose last pane left it, so the pane
-    listing can already report it gone; that workspace is already closed."""
-    calls: list[list[str]] = []
-
-    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
-        del timeout
-        calls.append(arguments)
-        if arguments[:2] == ["pane", "list"]:
-            raise BootstrapError(
-                '{"error":{"code":"workspace_not_found","message":"workspace w26 not found"}}',
-                code="workspace_not_found",
+        if arguments == ["workspace", "list"]:
+            return {"result": {"workspaces": [{"workspace_id": "w-gone", "focused": True}]}}
+        if arguments[:2] == ["agent", "get"]:
+            name = arguments[2]
+            return place_agent_record(
+                name,
+                "claude" if name == "fable-peer" else "pi",
+                pane_id=f"w-room:p-{name}",
+                tab_id="w-chat:t-room" if name in moved else f"w-room:t-{name}",
+                workspace_id="w-chat" if name in moved else "w-room",
             )
-        return {"result": {"type": "ok"}}
+        if arguments[:2] == ["pane", "move"]:
+            moved.add(arguments[2].rsplit(":p-", 1)[1])
+            return {"result": {"type": "ok"}}
+        if arguments == ["workspace", "focus", "w-gone"]:
+            raise BootstrapError("workspace gone", code="workspace_not_found")
+        if arguments == ["tab", "focus", "w-gone:t-x"]:
+            raise BootstrapError("tab gone", code="tab_not_found")
+        raise AssertionError(arguments)
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
-    state: dict = {"agents_workspace_id": "w26"}
-    module.close_empty_agents_workspace("herdr", state)
-    # Only the pane listing ran: no workspace close against a vanished id.
-    assert calls == [["pane", "list", "--workspace", "w26"]]
-    assert "agents_workspace_id" not in state
-
-    # A workspace that still holds any pane is never closed, even though the
-    # same helper would otherwise tolerate a vanished workspace.
-    calls.clear()
-
-    def listing_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
-        del timeout
-        calls.append(arguments)
-        if arguments[:2] == ["pane", "list"]:
-            return {"result": {"panes": [{"pane_id": "w26:p-hold"}]}}
-        return {"result": {"type": "ok"}}
-
-    monkeypatch.setattr(module, "run_json", listing_run_json)
-    state = {"agents_workspace_id": "w26"}
-    module.close_empty_agents_workspace("herdr", state)
-    assert calls == [["pane", "list", "--workspace", "w26"]]
-    assert state["agents_workspace_id"] == "w26"
+    monkeypatch.setattr(
+        module, "focused_workspace_and_tab", lambda _herdr_bin: ("w-gone", "w-gone:t-x")
+    )
+    state: dict = {"agents_cwd": PLACE_AGENTS_CWD}
+    moved_roles = module.place(
+        "herdr",
+        "grid",
+        state,
+        module.resolve_profile("sol-fable"),
+        room_pane_id="w-chat:p-room",
+        room_tab_id="w-chat:t-room",
+        room_workspace_id="w-chat",
+    )
+    assert moved_roles == ["sol", "fable"]
+    assert ["workspace", "focus", "w-gone"] in calls
+    assert ["tab", "focus", "w-gone:t-x"] in calls
 
 
-@pytest.mark.parametrize("code", ["command_timeout", None])
-def test_close_empty_agents_workspace_raises_any_other_pane_list_error(
-    monkeypatch: pytest.MonkeyPatch, code: str | None
+def test_pending_tab_cleanup_tolerates_a_vanished_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
-        del timeout
-        if arguments[:2] == ["pane", "list"]:
-            raise BootstrapError("the socket vanished", code=code)
-        return {"result": {"type": "ok"}}
+    """A pending-tab close on an auto-closed workspace is already done."""
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        lambda _herdr_bin, arguments, timeout=30: (
+            (_ for _ in ()).throw(BootstrapError("gone", code="workspace_not_found"))
+            if arguments[:3] == ["tab", "list", "--workspace"]
+            else {"result": {"type": "ok"}}
+        ),
+    )
+    module.close_pending_participant_tab(
+        "herdr", "w-vanished", {"label": "hgchat-sol-x"}, tmp_path, launcher_state_path(tmp_path)
+    )
 
-    monkeypatch.setattr(module, "run_json", fake_run_json)
-    state: dict = {"agents_workspace_id": "w26"}
-    with pytest.raises(BootstrapError):
-        module.close_empty_agents_workspace("herdr", state)
-    # The failure propagates and the recorded id is neither closed nor dropped.
-    assert state == {"agents_workspace_id": "w26"}
+
+def test_blocked_tab_check_tolerates_a_vanished_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        module,
+        "run_json",
+        lambda _herdr_bin, arguments, timeout=30: (
+            (_ for _ in ()).throw(BootstrapError("gone", code="workspace_not_found"))
+            if arguments[:3] == ["tab", "list", "--workspace"]
+            else {"result": {"type": "ok"}}
+        ),
+    )
+    assert not module.blocked_pending_participant_tab_exists(
+        "herdr",
+        "w-vanished",
+        {"blocked_startup": True, "tab_id": "w-vanished:t1", "pane_id": "w-vanished:p1"},
+    )
 
 
 def test_grid_peer_split_ratios_equalize_the_stack() -> None:
@@ -6202,11 +6190,11 @@ CLAUDE_OPUS_PROCESS = [
 ]
 
 
-def test_grid_relaunch_reuses_live_peers_and_closes_the_emptied_backstage(
+def test_grid_relaunch_reuses_live_peers_and_leaves_lifecycle_to_herdr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """End to end: peers in the recorded room workspace are reused, rearranged
-    into the new room tab, and the emptied backstage workspace is closed."""
+    into the new room tab, and no workspace is ever closed by the launcher."""
     captured: dict[str, object] = {}
     profile_launch_env(tmp_path, monkeypatch, captured)
     monkeypatch.setenv(module.PROFILE_ENV, "sol-fable-grok")
@@ -6341,15 +6329,14 @@ def test_grid_relaunch_reuses_live_peers_and_closes_the_emptied_backstage(
     assert not any(call[:2] in (["tab", "create"], ["agent", "start"]) for call in calls)
     moves = [call for call in calls if call[:2] == ["pane", "move"]]
     assert [move[2] for move in moves] == ["w-room:p-sol", "w-room:p-fable", "w-room:p-grok"]
-    # The emptied fresh backstage workspace is closed after its placeholder tab.
+    # The placeholder tab is closed, but the emptied backstage workspace is
+    # Herdr's to close; the launcher never issues a workspace close.
     assert ["tab", "close", "w-backstage:t-ph"] in calls
-    assert calls.index(["tab", "close", "w-backstage:t-ph"]) < calls.index(
-        ["workspace", "close", "w-backstage"]
-    )
+    assert not any(call[:2] == ["workspace", "close"] for call in calls)
     argv = captured["argv"]
     assert "--agents-workspace" not in argv
     final_state = load_launcher_state(tmp_path)
-    assert "agents_workspace_id" not in final_state
+    assert final_state["agents_workspace_id"] == "w-backstage"
     assert final_state["layout"] == "grid"
     assert final_state["participant_workspace_id"] == "w-chat"
     assert final_state["participant_pane_ids"] == {
