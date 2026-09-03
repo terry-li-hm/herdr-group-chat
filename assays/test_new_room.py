@@ -535,16 +535,6 @@ def test_open_focuses_only_the_recorded_plugin_pane(
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: int = 30) -> dict:
         del timeout
         calls.append(arguments)
-        if arguments == ["pane", "get", "w-chat:p-owned"]:
-            return {
-                "result": {
-                    "pane": {
-                        "pane_id": "w-chat:p-owned",
-                        "workspace_id": "w-chat",
-                        "tab_id": "w-chat:t-owned",
-                    }
-                }
-            }
         return {
             "result": {
                 "type": "plugin_pane_focused",
@@ -561,10 +551,7 @@ def test_open_focuses_only_the_recorded_plugin_pane(
     monkeypatch.setattr(module, "run_json", fake_run_json)
 
     assert launch_room(open_existing=True) == 0
-    assert calls == [
-        ["pane", "get", "w-chat:p-owned"],
-        ["plugin", "pane", "focus", "w-chat:p-owned"],
-    ]
+    assert calls == [["plugin", "pane", "focus", "w-chat:p-owned"]]
     assert json.loads(capsys.readouterr().out)["result"]["type"] == "plugin_pane_focused"
 
 
@@ -682,8 +669,8 @@ def test_open_recreates_missing_room_pane_with_focus(
         calls.append(arguments)
         if arguments == ["workspace", "list"]:
             return {"result": {"workspaces": [{"workspace_id": "w-chat"}]}}
-        if arguments == ["pane", "get", "w-chat:p-gone"]:
-            raise BootstrapError("pane gone", code="pane_not_found")
+        if arguments[:3] == ["plugin", "pane", "focus"]:
+            raise BootstrapError("pane gone", code="plugin_pane_not_found")
         if arguments[:3] == ["plugin", "pane", "open"]:
             return {
                 "result": {
@@ -703,6 +690,60 @@ def test_open_recreates_missing_room_pane_with_focus(
     state = load_launcher_state(tmp_path)
     assert state["last_room_id"] == "chat-kept"
     assert state["room_pane_id"] == "w-chat:p-new"
+
+
+def test_open_recreates_the_room_in_a_fresh_workspace_when_both_are_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reopen never fails because the old pane or its workspace is gone."""
+    save_launcher_state(
+        tmp_path,
+        {
+            "chat_workspace_id": "w-gone",
+            "room_pane_id": "w-gone:p-gone",
+            "room_tab_id": "w-gone:t-gone",
+            "last_room_id": "chat-kept",
+        },
+    )
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments[:3] == ["plugin", "pane", "focus"]:
+            raise BootstrapError("pane gone", code="plugin_pane_not_found")
+        if arguments == ["workspace", "list"]:
+            # The recorded chat workspace was auto-closed with its last pane.
+            return {"result": {"workspaces": []}}
+        if arguments[:2] == ["workspace", "create"]:
+            assert "--no-focus" in arguments
+            return {
+                "result": {
+                    "workspace": {"workspace_id": "w-fresh"},
+                    "tab": {"tab_id": "w-fresh:t-placeholder"},
+                }
+            }
+        if arguments[:3] == ["plugin", "pane", "open"]:
+            return {
+                "result": {
+                    "plugin_pane": {"pane": {"pane_id": "w-fresh:p-new", "tab_id": "w-fresh:t-new"}}
+                }
+            }
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+
+    assert launch_room(open_existing=True) == 0
+    open_arguments = next(
+        arguments for arguments in calls if arguments[:3] == ["plugin", "pane", "open"]
+    )
+    assert open_arguments[open_arguments.index("--entrypoint") + 1] == "room"
+    assert open_arguments[-1] == "--focus"
+    state = load_launcher_state(tmp_path)
+    assert state["last_room_id"] == "chat-kept"
+    assert state["room_pane_id"] == "w-fresh:p-new"
+    assert state["chat_workspace_id"] == "w-fresh"
 
 
 def test_existing_room_retries_recorded_placeholder_cleanup_before_return(
@@ -1192,7 +1233,7 @@ def test_transient_validation_failure_does_not_open_a_duplicate(
 
     with pytest.raises(BootstrapError, match="temporary failure"):
         launch_room(open_existing=True)
-    assert calls == [["pane", "get", "w-chat:p-current"]]
+    assert calls == [["plugin", "pane", "focus", "w-chat:p-current"]]
 
 
 def test_failed_old_pane_close_remains_in_cleanup_state(

@@ -674,63 +674,6 @@ def launcher_state_lock(state_dir: Path) -> Iterator[Path]:
         os.close(directory_descriptor)
 
 
-TOPOLOGY_FIELDS = (
-    "chat_workspace_id",
-    "agents_workspace_id",
-    "room_pane_id",
-    "room_tab_id",
-    "chat_placeholder_tab_id",
-    "agents_placeholder_tab_id",
-    "stale_room_pane_ids",
-    "pending_chat_workspace_label",
-    "pending_agents_workspace_label",
-    "pending_room_id",
-    "pending_room_operation_id",
-    "pending_room_started_unix_ms",
-    "agents_cwd",
-    "participant_pane_ids",
-    "participant_tab_ids",
-    "pending_participant_tabs",
-)
-
-
-def clear_topology(state: dict[str, Any]) -> None:
-    for field in TOPOLOGY_FIELDS:
-        state.pop(field, None)
-
-
-def load_validated_launcher_state(
-    state_dir: Path, herdr_bin: str, state_path: Path | None = None
-) -> dict[str, Any]:
-    state = load_launcher_state(state_dir, state_path)
-    pane_id = state.get("room_pane_id")
-    if not pane_id:
-        return state
-    # Validate the recorded room with the read-only `pane get` inspection only:
-    # focusing the pane merely to validate it would steal the caller's focus on
-    # every subsequent launch once a room pane exists.
-    try:
-        response = run_json(herdr_bin, ["pane", "get", pane_id])
-    except BootstrapError as error:
-        if error.code == "pane_not_found":
-            state.pop("room_pane_id", None)
-            state.pop("room_tab_id", None)
-            return state
-        raise
-    try:
-        pane = response["result"]["pane"]
-        matches = (
-            str(pane["pane_id"]) == pane_id
-            and str(pane["workspace_id"]) == state.get("chat_workspace_id")
-            and str(pane["tab_id"]) == state.get("room_tab_id")
-        )
-    except (KeyError, TypeError):
-        matches = False
-    if not matches:
-        clear_topology(state)
-    return state
-
-
 def workspaces(herdr_bin: str) -> list[dict[str, Any]]:
     listed = run_json(herdr_bin, ["workspace", "list"])
     return [
@@ -1471,7 +1414,6 @@ def launch_room(open_existing: bool, profile: str | None = None) -> int:
         state = load_launcher_state(state_dir, state_path)
         reconcile_pending_room(state)
         save_launcher_state(state_dir, state, state_path)
-        state = load_validated_launcher_state(state_dir, herdr_bin, state_path)
         close_tracked_tab(
             herdr_bin,
             state,
@@ -1499,6 +1441,8 @@ def launch_room(open_existing: bool, profile: str | None = None) -> int:
             except BootstrapError as error:
                 if error.code != "plugin_pane_not_found":
                     raise
+                # The recorded room pane is gone: reopen never fails on it, a
+                # fresh room pane opens in the recorded or a new chat workspace.
                 state.pop("room_pane_id", None)
                 state.pop("room_tab_id", None)
                 save_launcher_state(state_dir, state, state_path)
