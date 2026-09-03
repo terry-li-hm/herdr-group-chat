@@ -495,10 +495,20 @@ layout; once every participant is owned, the placement step moves each peer
 that is not already in the room tab into it — the room pane anchors the stack,
 and the probed split ratios keep the right-hand column at equal heights —
 then restores your workspace and tab. `/agents`
-reports the backstage workspace as unavailable in grid layout; `/show <role>`
-focuses the peer pane inside the room tab. `./new-room --place grid` rebuilds
-the stack for the recorded room at any time; `--place compact` moves every
-owned peer back into an `agents · group-chat` workspace.
+focuses the first peer pane when the room is laid out in grid and the backstage
+workspace otherwise; `/show <role>` focuses that peer's pane. The room's
+`/layout compact|grid` command re-runs the placement step at any time.
+
+### Switching layout
+
+`/layout grid` and `/layout compact` in the room re-run the launcher's
+placement step for the recorded room: grid stacks every owned peer in the
+room tab beside the room pane, compact moves each one back into an
+`agents · group-chat` workspace as its own tab. The room command is refused
+while a council round is running; it never moves a pane itself, records the
+result as one system line in the transcript, and placement restores your
+workspace and tab when it finishes. `./new-room --place <compact|grid>` does
+the same from a terminal.
 
 With `opus = true`, `New group chat` launches the `sol-fable-grok-opus-pi`
 profile: `@sol`, `@fable` and `@grok` as before plus `@opus` running Claude

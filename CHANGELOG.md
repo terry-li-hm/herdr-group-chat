@@ -36,6 +36,22 @@ the launcher stops owning Herdr topology it cannot control.
   `selected_profile`, `layout` and the room ids only; unknown or stale id
   fields are ignored, never errors.
 
+Phase B of the 0.12 redesign:
+
+- **`/layout compact|grid` room command.** The room re-runs the launcher's
+  placement step by spawning `./new-room --place <mode>` from the plugin root
+  with the room's own environment, waits for it, and records its single JSON
+  result line in the transcript as
+  `Layout: grid — 4 peers placed, focus restored`, or the launcher's error
+  message. It never moves a pane itself — placement restores the caller's
+  workspace and tab — and it is refused while a council round is running,
+  like every other blocked command.
+- **`/agents` follows the live layout.** In grid layout it focuses the room
+  tab's first peer pane instead of reporting the backstage workspace as
+  unavailable; in compact it still focuses the backstage workspace. The
+  layout is determined live from one `agent get` of the first roster
+  participant against the room's own tab, never from the launcher state file.
+
 ## [0.11.3] - 2026-09-03
 
 - Relaunching a grid-layout room no longer aborts after the peers are

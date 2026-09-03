@@ -66,6 +66,7 @@ main = namespace["main"]
 resolve_state_dir = namespace["resolve_state_dir"]
 participant_status = namespace["participant_status"]
 handle_local_command = namespace["handle_local_command"]
+PLUGIN_ROOT = namespace["PLUGIN_ROOT"]
 handle_view_command = namespace["handle_view_command"]
 mention_fragment = namespace["mention_fragment"]
 mention_suggestions = namespace["mention_suggestions"]
@@ -1695,6 +1696,136 @@ def test_agents_command_does_not_guess_a_workspace_by_label(tmp_path: Path) -> N
         "The agents workspace is unavailable; use /show <agent>."
     )
     assert client.focused == []
+
+
+class LayoutClient(FakeClient):
+    """A fake client whose first roster participant lives in a known tab."""
+
+    def __init__(self, tab_id: str) -> None:
+        super().__init__()
+        self.tab_id = tab_id
+        self.tabs_queried: list[str] = []
+
+    def agent_tab(self, target: str) -> str:
+        self.tabs_queried.append(target)
+        return self.tab_id
+
+
+class Completed:
+    def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+class ActiveReviewStub:
+    def is_active(self) -> bool:
+        return True
+
+
+def test_layout_command_runs_the_launcher_from_the_plugin_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat, _, transcript = make_chat(tmp_path)
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(arguments: list[str], **kwargs: object) -> Completed:
+        calls.append((list(arguments), kwargs))
+        mode = arguments[2]
+        moved = ["sol", "fable"] if mode == "grid" else []
+        return Completed(json.dumps({"layout": mode, "moved": moved}) + "\n")
+
+    line = handle_local_command("/layout grid", chat, None, fake_run)
+
+    assert line == "Layout: grid — 2 peers placed, focus restored"
+    assert len(calls) == 1
+    arguments, kwargs = calls[0]
+    assert arguments == ["./new-room", "--place", "grid"]
+    assert kwargs["cwd"] == str(PLUGIN_ROOT)
+    assert kwargs["env"]["HERDR_PLUGIN_STATE_DIR"] == str(tmp_path / "state")
+    records = transcript.read()
+    assert records[-1]["sender"] == "system"
+    assert records[-1]["body"] == line
+
+    line = handle_local_command("/layout compact", chat, None, fake_run)
+    assert line == "Layout: compact — 0 peers placed, focus restored"
+    assert [args for args, _ in calls] == [
+        ["./new-room", "--place", "grid"],
+        ["./new-room", "--place", "compact"],
+    ]
+
+
+def test_layout_command_renders_the_launcher_error_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat, _, transcript = make_chat(tmp_path)
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    calls: list[list[str]] = []
+
+    def fake_run(arguments: list[str], **_kwargs: object) -> Completed:
+        calls.append(list(arguments))
+        return Completed(
+            stderr="new-room: grid placement needs a live room pane to anchor the stack\n",
+            returncode=2,
+        )
+
+    line = handle_local_command("/layout grid", chat, None, fake_run)
+
+    assert line == ("new-room: grid placement needs a live room pane to anchor the stack")
+    assert calls == [["./new-room", "--place", "grid"]]
+    records = transcript.read()
+    assert records[-1]["sender"] == "system"
+    assert records[-1]["body"] == line
+
+
+def test_layout_command_is_blocked_during_a_round_and_rejects_unknown_modes(
+    tmp_path: Path,
+) -> None:
+    chat, _, transcript = make_chat(tmp_path)
+
+    def fail_run(_arguments: list[str], **_kwargs: object) -> Completed:
+        raise AssertionError("the launcher must not spawn during a blocked or invalid /layout")
+
+    assert (
+        handle_local_command("/layout grid", chat, ActiveReviewStub(), fail_run)
+        == "A council round is running; use /cancel or wait before sending."
+    )
+    assert handle_local_command("/layout wide", chat, None, fail_run) == (
+        "Usage: /layout compact|grid"
+    )
+    assert handle_local_command("/layout", chat, None, fail_run) == ("Usage: /layout compact|grid")
+    assert transcript.read() == []
+
+
+def test_agents_command_focuses_first_peer_in_grid_and_backstage_in_compact(
+    tmp_path: Path,
+) -> None:
+    grid_client = LayoutClient("t-room")
+    grid_chat = GroupChat(
+        Transcript(tmp_path, "grid-room"),
+        {"pi": "pi-peer", "claude": "claude-peer"},
+        grid_client,
+        agents_workspace_id="w-agents",
+        room_tab_id="t-room",
+    )
+    assert handle_local_command("/agents", grid_chat) == "Focused @pi."
+    assert grid_client.tabs_queried == ["pi-peer"]
+    assert grid_client.focused == ["pi-peer"]
+
+    compact_client = LayoutClient("t-backstage")
+    compact_chat = GroupChat(
+        Transcript(tmp_path, "compact-room"),
+        {"pi": "pi-peer", "claude": "claude-peer"},
+        compact_client,
+        agents_workspace_id="w-agents",
+        room_tab_id="t-room",
+    )
+    assert handle_local_command("/agents", compact_chat) == "Focused the agents workspace."
+    assert compact_client.tabs_queried == ["pi-peer"]
+    assert compact_client.focused == ["workspace:w-agents"]
 
 
 def test_mentions_route_to_named_agents_and_reject_unknown() -> None:

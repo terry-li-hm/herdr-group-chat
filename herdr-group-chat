@@ -74,6 +74,10 @@ DEFAULT_STATE_DIR = Path("~/.local/state/herdr-group-chat")
 ROOM_ENV = "HERDR_GROUP_CHAT_ROOM"
 AGENTS_WORKSPACE_ENV = "HERDR_GROUP_CHAT_AGENTS_WORKSPACE_ID"
 SETUP_FAILURES_ENV = "HERDR_GROUP_CHAT_SETUP_FAILURES"
+ROOM_TAB_ENV = "HERDR_TAB_ID"
+ROOM_LAYOUTS = ("compact", "grid")
+PLUGIN_ROOT = Path(__file__).resolve().parent
+LAYOUT_PLACE_TIMEOUT_S = 180
 ROOM_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
 MENTION_RE = re.compile(r"^@([a-z0-9_,@-]+)\s+(.*)$", re.DOTALL | re.IGNORECASE)
 REPLY_TOKEN_RE = re.compile(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})")
@@ -142,6 +146,8 @@ class AgentClient(Protocol):
     def focus(self, target: str) -> None: ...
 
     def focus_workspace(self, workspace_id: str) -> None: ...
+
+    def agent_tab(self, target: str) -> str: ...
 
     def turn(
         self,
@@ -802,6 +808,13 @@ class HerdrClient:
 
     def focus_workspace(self, workspace_id: str) -> None:
         self._run(["workspace", "focus", workspace_id])
+
+    def agent_tab(self, target: str) -> str:
+        result = self._run(["agent", "get", target])
+        try:
+            return str(json.loads(result.stdout)["result"]["agent"].get("tab_id") or "")
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as error:
+            raise ChatError(f"Herdr returned invalid agent details for {target}") from error
 
     def turn(
         self,
@@ -2285,6 +2298,7 @@ class GroupChat:
         client: AgentClient,
         max_turns: int = 4,
         agents_workspace_id: str | None = None,
+        room_tab_id: str = "",
         synthesizer: str = "pi",
         agent_timeouts: dict[str, int] | None = None,
         host_label: str = "Herdr",
@@ -2296,6 +2310,7 @@ class GroupChat:
         self.client = client
         self.max_turns = max_turns
         self.agents_workspace_id = agents_workspace_id
+        self.room_tab_id = room_tab_id
         if synthesizer not in agents:
             raise ChatError(f"unknown synthesizer: @{synthesizer}")
         duplicates = sorted(
@@ -4744,13 +4759,72 @@ def participant_status(chat: GroupChat, prefix: str = "") -> str:
     return f"{prefix} {summary}".strip()
 
 
+def place_room_layout(
+    mode: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> str:
+    """Re-run the launcher's placement step for `mode` and render its result.
+
+    The launcher owns placement, so the room never issues a pane command
+    itself: it waits for `./new-room --place <mode>` — run from the plugin
+    root with the room's own environment — and renders the single JSON
+    result line, or the launcher's error message when it exits non-zero.
+    Placement records the caller's focus and restores it, so this never
+    focuses anything in the room process.
+    """
+    if mode not in ROOM_LAYOUTS:
+        raise ChatError("Usage: /layout compact|grid")
+    try:
+        result = runner(
+            ["./new-room", "--place", mode],
+            cwd=str(PLUGIN_ROOT),
+            env=dict(os.environ),
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=LAYOUT_PLACE_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ChatError(
+            f"layout change timed out after {LAYOUT_PLACE_TIMEOUT_S} s; "
+            "focus may need a manual restore"
+        ) from error
+    except OSError as error:
+        raise ChatError(f"layout change failed to start: {error}") from error
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if result.returncode == 0:
+        try:
+            payload = json.loads(lines[-1]) if lines else None
+            moved = payload["moved"]
+            layout = str(payload["layout"])
+            if not isinstance(moved, list):
+                raise TypeError("moved is not a list")
+        except (IndexError, json.JSONDecodeError, KeyError, TypeError) as error:
+            raise ChatError("layout change returned an unreadable result") from error
+        return f"Layout: {layout} — {len(moved)} peers placed, focus restored"
+    detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+    raise ChatError(detail.splitlines()[-1])
+
+
 def handle_local_command(
-    text: str, chat: GroupChat, reviews: ReviewController | None = None
+    text: str,
+    chat: GroupChat,
+    reviews: ReviewController | None = None,
+    layout_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> str | None:
     stripped = text.strip()
     if not stripped.startswith("/"):
         return None
     if stripped == "/agents":
+        # Layout is read live, never from the launcher state file: when the
+        # first roster participant sits in the room's own tab the room is in
+        # grid layout and the first peer pane is the thing to focus.
+        if chat.room_tab_id and chat.agents:
+            name, target = next(iter(chat.agents.items()))
+            if chat.client.agent_tab(target) == chat.room_tab_id:
+                chat.client.focus(target)
+                return f"Focused @{name}."
         if not chat.agents_workspace_id:
             return "The agents workspace is unavailable; use /show <agent>."
         chat.client.focus_workspace(chat.agents_workspace_id)
@@ -4778,10 +4852,23 @@ def handle_local_command(
             "Commands: /review [@agents] QUESTION · /anneal @author,@critic QUESTION · "
             "/consensus [@agents] QUESTION · /retry <agent|synthesis> · /cancel · /agents · "
             "/council status · /council export PATH · /council resume · "
-            "/show <agent> · /inbox · /lanes · /room · PgUp/PgDn · mouse wheel scrolls "
+            "/show <agent> · /layout compact|grid · /inbox · /lanes · /room · "
+            "PgUp/PgDn · mouse wheel scrolls "
             "· Home/End jump · @ opens a mention picker "
             "(Tab completes, Esc closes)"
         )
+    if stripped == "/layout" or stripped.startswith("/layout "):
+        if reviews is not None and reviews.is_active():
+            return "A council round is running; use /cancel or wait before sending."
+        mode = stripped.removeprefix("/layout").strip()
+        if mode not in ROOM_LAYOUTS:
+            return "Usage: /layout compact|grid"
+        try:
+            line = place_room_layout(mode, layout_runner)
+        except ChatError as error:
+            line = str(error)
+        chat.transcript.append("system", ("human",), line)
+        return line
     if stripped == "/review" or stripped.startswith("/review "):
         if reviews is None:
             return "Review control is unavailable."
@@ -5318,6 +5405,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             max_turns=args.max_turns,
             agents_workspace_id=args.agents_workspace,
+            room_tab_id=os.environ.get(ROOM_TAB_ENV, "").strip(),
             synthesizer=synthesizer,
             agent_timeouts=agent_timeouts,
         )
