@@ -2169,7 +2169,7 @@ def test_exact_live_pending_prompt_preserves_state_when_native_proof_fails(
     if blocked_startup:
         assert failures == [module.blocked_startup_prompt_guidance(participant)]
     else:
-        assert len(failures) == 1 and "failed native-ui verification" in failures[0]
+        assert len(failures) == 1 and "failed process verification" in failures[0]
     assert state["pending_participant_tabs"]["fable"] == pending
     assert "participant_pane_ids" not in state
     assert "participant_tab_ids" not in state
@@ -2312,6 +2312,30 @@ CLAUDE_FABLE_PROCESS = [
 ]
 
 
+def process_running(argv0: str, args: tuple[str, ...]) -> list[dict]:
+    """One foreground process whose identity and contiguous argv match a participant."""
+    return [{"name": argv0, "argv": [argv0, *args]}]
+
+
+PARTICIPANT_PROCESSES: dict[str, list[dict]] = {
+    "sol-peer": process_running("pi", module.SOL_PARTICIPANT.start_args),
+    "fable-peer": CLAUDE_FABLE_PROCESS,
+    "opus-peer": process_running("claude", module.OPUS_PARTICIPANT.start_args),
+    "grok46-peer": process_running("grok", module.GROK_START_ARGS),
+    "glm-peer": process_running("pi", module.GLM_PARTICIPANT.start_args),
+    "grok46pi-peer": process_running("pi", module.GROK_PI_PARTICIPANT.start_args),
+}
+# Freshly created tabs are addressed by role; the profile rosters fix which
+# participant each role starts in the tests that rely on the default.
+ROLE_PROCESSES: dict[str, list[dict]] = {
+    "sol": PARTICIPANT_PROCESSES["sol-peer"],
+    "fable": PARTICIPANT_PROCESSES["fable-peer"],
+    "opus": PARTICIPANT_PROCESSES["opus-peer"],
+    "grok": PARTICIPANT_PROCESSES["grok46-peer"],
+    "glm": PARTICIPANT_PROCESSES["glm-peer"],
+}
+
+
 def install_profile_host(
     monkeypatch: pytest.MonkeyPatch,
     calls: list[list[str]],
@@ -2329,6 +2353,17 @@ def install_profile_host(
         if workspaces is not None
         else [{"workspace_id": "w-agents", "label": "agents · group-chat"}]
     )
+    # Every live profile peer runs its participant's exact foreground process;
+    # created tabs get their role's process unless the test overrides either.
+    # Explicit overrides describe already-running panes (live or foreign), so
+    # they seed immediately; a created tab resets to its shell and receives
+    # its override only once `agent start` has run for that pane.
+    pane_processes = {
+        str(agent.get("pane_id")): PARTICIPANT_PROCESSES[agent["name"]]
+        for agent in live_agents
+        if agent.get("name") in PARTICIPANT_PROCESSES and agent.get("pane_id")
+    }
+    pane_processes.update(process_infos or {})
 
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
@@ -2348,15 +2383,26 @@ def install_profile_host(
         if arguments[:2] == ["tab", "create"]:
             label = arguments[arguments.index("--label") + 1]
             role = label.split("-")[1]
+            # A fresh tab reaches its shell first; the agent process appears
+            # only once `agent start` below has run for that pane.
+            pane_processes[f"w-agents:p-{role}"] = [{"name": "zsh"}]
             return {
                 "result": {
                     "tab": {"tab_id": f"w-agents:t-{role}"},
                     "root_pane": {"pane_id": f"w-agents:p-{role}"},
                 }
             }
+        if arguments[:2] == ["agent", "start"]:
+            pane = arguments[arguments.index("--pane") + 1]
+            kind = arguments[arguments.index("--kind") + 1]
+            pane_processes[pane] = (process_infos or {}).get(
+                pane,
+                PARTICIPANT_PROCESSES.get(arguments[2], [{"name": kind, "argv": [kind]}]),
+            )
+            return {"result": {"type": "ok"}}
         if arguments[:2] == ["pane", "process-info"]:
             pane = arguments[arguments.index("--pane") + 1]
-            processes = (process_infos or {}).get(pane)
+            processes = pane_processes.get(pane)
             if processes is not None:
                 return {"result": {"process_info": {"foreground_processes": processes}}}
             return {"result": {"process_info": {"foreground_processes": [{"name": "zsh"}]}}}
@@ -2471,62 +2517,85 @@ def test_catalog_proof_is_structural_not_substring(
     assert not catalog(("pi",), "openai-codex", "gpt-5.6-sol")
 
 
-def test_pane_proof_is_bounded_token_and_sequence_matching(
+def test_process_proof_requires_exact_argv0_and_contiguous_args(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[list[str]] = []
 
-    def install(screen: str) -> None:
+    def install(processes: list[dict] | None) -> None:
         calls.clear()
 
-        def fake_run_text(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
+        def fake_run_json(
+            _herdr_bin: str, arguments: list[str], timeout: float | None = 30
+        ) -> dict:
             del timeout
             calls.append(arguments)
-            return screen
+            return {"result": {"process_info": {"foreground_processes": processes or []}}}
 
-        monkeypatch.setattr(module, "run_text", fake_run_text)
+        monkeypatch.setattr(module, "run_json", fake_run_json)
 
-    def proves(screen: str, proofs: object) -> bool:
-        install(screen)
+    def proves(processes: list[dict] | None, argv0: str, args: tuple[str, ...]) -> bool:
+        install(processes)
         monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
-        assert isinstance(proofs, tuple)
-        return module.native_pane_proves("herdr", "w-agents:p-x", proofs)
+        return module.native_pane_process_proves("herdr", "w-agents:p-x", argv0, args)
 
-    sol = (module.SOL_PANE_PROOF,)
-    fable = module.FABLE_PANE_PROOFS
-    assert proves("model gpt-5.6-sol • high\n", sol)
-    assert proves("model: gpt-5.6-sol · high (local)\n", sol)
-    assert not proves("model gpt-5.6-sol-01 • high\n", sol)  # suffixed model identifier
-    assert not proves("model gpt-5.6-sol • highest\n", sol)  # suffixed effort token
-    assert not proves("provider gpt-5.6-sol openai-codex • high\n", sol)
-    assert proves("Claude Code\nFable 5\nreasoning: high effort\n", fable)
-    # Claude Code 2.1.258 renders the model as `Fable 5.1 with high effort`.
-    assert proves("Claude Code v2.1.258\nFable 5.1 with high effort · Claude Max\n", fable)
-    assert not proves("Claude Code\nFable 5.10 with high effort\n", fable)
-    assert not proves("Claude Code\nFable 5.1-deluxe with high effort\n", fable)
-    assert not proves("Claude Code\nFable 5-deluxe\nhigh effort\n", fable)
-    assert not proves("Claude Code\nFable 5\nreasoning: effortful\n", fable)
-    assert not proves("Claude Code\nPrefable 5\nhigh effort\n", fable)
-    # Retries stay bounded when evidence never renders.
-    assert not proves("", sol)
+    fable_args = module.FABLE_PARTICIPANT.start_args
+    exact = CLAUDE_FABLE_PROCESS[0]
+    assert proves([exact], "claude", fable_args)
+    # Extra leading arguments still contain the start args contiguously.
+    assert proves(
+        [{"name": "claude", "argv": ["claude", "--verbose", *fable_args]}], "claude", fable_args
+    )
+    # A lookalike model string is not the exact contiguous sequence.
+    assert not proves(
+        [{"name": "claude", "argv": ["claude", "--model", "fable-5", "--effort", "high"]}],
+        "claude",
+        fable_args,
+    )
+    # Reordered or non-contiguous arguments never satisfy the proof.
+    assert not proves(
+        [{"name": "claude", "argv": ["claude", "--effort", "high", "--model", "fable"]}],
+        "claude",
+        fable_args,
+    )
+    assert not proves(
+        [
+            {
+                "name": "claude",
+                "argv": ["claude", "--model", "fable", "--extra", "--effort", "high"],
+            }
+        ],
+        "claude",
+        fable_args,
+    )
+    # An MCP child process with the right flags but the wrong identity fails.
+    assert not proves(
+        [{"name": "mcp-server", "argv": ["claude", *fable_args]}], "claude", fable_args
+    )
+    # The wrong executable identity fails even with perfect arguments.
+    assert not proves([{"name": "codex", "argv": ["claude", *fable_args]}], "claude", fable_args)
+    assert not proves([], "claude", fable_args)
+    # Retries stay bounded when the process never appears.
+    assert not proves([{"name": "zsh", "argv": ["zsh"]}], "claude", fable_args)
     assert len(calls) == module.VERIFY_PANE_ATTEMPTS
 
 
-def test_pane_proof_retries_because_startup_uis_render_asynchronously(
+def test_process_proof_retries_because_startups_are_asynchronous(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[list[str]] = []
-    screens = ["", FABLE_SCREEN]  # evidence appears on the second read
+    processes: list[list[dict] | None] = [None, CLAUDE_FABLE_PROCESS]  # appears on second read
 
-    def fake_run_text(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
         calls.append(arguments)
-        return screens.pop(0) if screens else FABLE_SCREEN
+        listed = processes.pop(0) if processes else CLAUDE_FABLE_PROCESS
+        return {"result": {"process_info": {"foreground_processes": listed or []}}}
 
-    monkeypatch.setattr(module, "run_text", fake_run_text)
+    monkeypatch.setattr(module, "run_json", fake_run_json)
     monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
 
-    assert module.native_pane_proves("herdr", "w-agents:p-fable", module.FABLE_PANE_PROOFS)
+    assert module.participant_process_proves("herdr", module.FABLE_PARTICIPANT, "w-agents:p-fable")
     assert len(calls) == 2
 
 
@@ -2563,7 +2632,12 @@ def test_new_tab_failing_pane_verification_is_closed_and_not_routable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[list[str]] = []
-    install_profile_host(monkeypatch, calls, {"w-agents:p-fable": "Claude Code\n"})
+    install_profile_host(
+        monkeypatch,
+        calls,
+        {"w-agents:p-fable": "Claude Code\n"},
+        process_infos={"w-agents:p-fable": [{"name": "claude", "argv": ["claude", "--help"]}]},
+    )
     state: dict = {"schema_version": 1}
 
     failures = module.start_participants(
@@ -2727,34 +2801,37 @@ def install_launch_host(
     monkeypatch: pytest.MonkeyPatch,
     pane_screens: dict[str, str],
     catalog_rows: dict[tuple[str, str], bool] | None = None,
+    live_agents: list[dict] | None = None,
+    process_infos: dict[str, list[dict]] | None = None,
 ) -> list[list[str]]:
     """Wire a fake Herdr for main() with a pre-existing agents workspace/agents."""
     calls: list[list[str]] = []
-    live = [
-        {
-            "name": "sol-peer",
-            "kind": "pi",
-            "workspace_id": "w-agents",
-            "cwd": str(tmp_path),
-            "pane_id": "w-agents:p-sol",
-            "tab_id": "w-agents:t-sol",
-        },
-        {
-            "name": "fable-peer",
-            "kind": "claude",
-            "workspace_id": "w-agents",
-            "cwd": str(tmp_path),
-            "pane_id": "w-agents:p-fable",
-            "tab_id": "w-agents:t-fable",
-        },
-    ]
+    if live_agents is None:
+        live_agents = [
+            {
+                "name": "sol-peer",
+                "kind": "pi",
+                "workspace_id": "w-agents",
+                "cwd": str(tmp_path),
+                "pane_id": "w-agents:p-sol",
+                "tab_id": "w-agents:t-sol",
+            },
+            {
+                "name": "fable-peer",
+                "kind": "claude",
+                "workspace_id": "w-agents",
+                "cwd": str(tmp_path),
+                "pane_id": "w-agents:p-fable",
+                "tab_id": "w-agents:t-fable",
+            },
+        ]
     install_profile_host(
         monkeypatch,
         calls,
         pane_screens,
         catalog_rows=catalog_rows,
-        live_agents=live,
-        process_infos={"w-agents:p-fable": CLAUDE_FABLE_PROCESS},
+        live_agents=live_agents,
+        process_infos=process_infos,
     )
     return calls
 
@@ -2813,8 +2890,16 @@ def test_main_never_execs_a_profile_room_when_one_role_fails(
     calls = install_launch_host(
         tmp_path,
         monkeypatch,
-        # Sol's pane shows a suffixed model identifier: verification fails.
-        {"w-agents:p-sol": "Pi\nmodel gpt-5.6-sol-01 • high\n", "w-agents:p-fable": FABLE_SCREEN},
+        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        # Sol's process runs a suffixed model identifier: verification fails.
+        process_infos={
+            "w-agents:p-sol": [
+                {
+                    "name": "pi",
+                    "argv": ["pi", "--provider", "openai-codex", "--model", "gpt-5.6-sol-01"],
+                }
+            ]
+        },
     )
     save_launcher_state(tmp_path, profile_room_state(tmp_path))
 
@@ -2839,6 +2924,10 @@ def test_main_never_execs_a_profile_room_when_both_roles_fail(
         tmp_path,
         monkeypatch,
         {"w-agents:p-sol": "Pi\n", "w-agents:p-fable": "Claude Code\n"},
+        process_infos={
+            "w-agents:p-sol": [{"name": "pi", "argv": ["pi", "--model", "glm-5.3"]}],
+            "w-agents:p-fable": [{"name": "claude", "argv": ["claude", "--model", "opus"]}],
+        },
     )
     save_launcher_state(tmp_path, profile_room_state(tmp_path))
 
@@ -2921,7 +3010,7 @@ def test_room_reopen_reverifies_and_execs_with_receipt_and_mappings(
     )
 
 
-def test_profile_reverify_accepts_foreground_cwd_and_checks_native_pane_proof(
+def test_profile_reverify_accepts_foreground_cwd_and_checks_process_proof(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     participant = module.FABLE_PARTICIPANT
@@ -2969,6 +3058,7 @@ def test_room_reopen_accepts_a_moved_pane(tmp_path: Path, monkeypatch: pytest.Mo
             "w-agents:p-replaced": SOL_SCREEN,
             "w-agents:p-fable": FABLE_SCREEN,
         },
+        process_infos={"w-agents:p-replaced": PARTICIPANT_PROCESSES["sol-peer"]},
     )
     calls.clear()
     original = module.run_json
@@ -3008,7 +3098,16 @@ def test_room_reopen_fails_closed_when_native_evidence_lapsed(
     install_launch_host(
         tmp_path,
         monkeypatch,
-        {"w-agents:p-sol": "Pi\nmodel gpt-5.6-sol-01 • high\n", "w-agents:p-fable": FABLE_SCREEN},
+        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        process_infos={
+            # Sol's process has lapsed onto a different model: re-verification fails.
+            "w-agents:p-sol": [
+                {
+                    "name": "pi",
+                    "argv": ["pi", "--provider", "openai-codex", "--model", "gpt-5.6-sol-01"],
+                }
+            ]
+        },
     )
     state = profile_room_state(tmp_path)
     state.pop("pending_room_id")
@@ -3025,25 +3124,10 @@ def test_room_reopen_fails_closed_when_native_evidence_lapsed(
     assert "argv" not in captured
 
 
-def test_fresh_fable_proof_still_requires_the_high_effort_banner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A fresh launch keeps the strict two-sequence pane proof."""
-    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
-    monkeypatch.setattr(
-        module, "run_text", lambda _herdr_bin, arguments, timeout=30: FABLE_POST_TURN_SCREEN
-    )
-    fable = module.resolve_profile("sol-fable")[1]
-
-    assert not module.pane_proof("herdr", fable, "w-agents:p-fable")
-    # The bounded reopen pane sequence alone must not satisfy the fresh proof.
-    assert not module.native_pane_proves("herdr", "w-agents:p-fable", module.FABLE_PANE_PROOFS)
-
-
-def test_reopen_accepts_post_turn_fable_status_with_exact_process_argv(
+def test_reopen_process_verifies_every_profile_pane(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The real reopen contract: bounded `Fable 5` status plus native claude argv."""
+    """The reopen contract: each profile pane is proven by its foreground process."""
     captured: dict[str, object] = {}
     room_reopen_env(tmp_path, monkeypatch, captured, "chat-profile")
     calls = install_launch_host(
@@ -3064,11 +3148,10 @@ def test_reopen_accepts_post_turn_fable_status_with_exact_process_argv(
 
     receipt = json.loads(os.environ[module.PROFILE_RECEIPT_ENV])
     assert receipt["profile"] == "sol-fable"
-    # Only Fable is process-verified; Sol keeps catalog + pane proof alone.
     process_panes = {
         call[call.index("--pane") + 1] for call in calls if call[:2] == ["pane", "process-info"]
     }
-    assert process_panes == {"w-agents:p-fable"}
+    assert process_panes == {"w-agents:p-sol", "w-agents:p-fable"}
 
 
 @pytest.mark.parametrize(
@@ -3154,7 +3237,7 @@ def test_reopen_fable_process_proof_accepts_each_herdr_identity_field(
         ),
     ],
 )
-def test_reopen_fable_process_proof_fails_closed_on_inexact_evidence(
+def test_fable_process_proof_fails_closed_on_inexact_evidence(
     monkeypatch: pytest.MonkeyPatch, processes: list[dict]
 ) -> None:
     monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
@@ -3167,54 +3250,9 @@ def test_reopen_fable_process_proof_fails_closed_on_inexact_evidence(
             else (_ for _ in ()).throw(AssertionError(arguments))
         ),
     )
-    monkeypatch.setattr(
-        module, "run_text", lambda _herdr_bin, arguments, timeout=30: FABLE_POST_TURN_SCREEN
-    )
     fable = module.resolve_profile("sol-fable")[1]
 
-    assert not module.reopen_pane_proof("herdr", fable, "w-agents:p-fable")
-
-
-def test_reopen_rejects_a_fable_pane_without_bounded_model_status(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
-    monkeypatch.setattr(
-        module,
-        "run_json",
-        lambda _herdr_bin, arguments, timeout=30: (
-            {"result": {"process_info": {"foreground_processes": CLAUDE_FABLE_PROCESS}}}
-            if arguments[:2] == ["pane", "process-info"]
-            else (_ for _ in ()).throw(AssertionError(arguments))
-        ),
-    )
-    monkeypatch.setattr(
-        module, "run_text", lambda _herdr_bin, arguments, timeout=30: "Claude Code\nwaiting\n"
-    )
-    fable = module.resolve_profile("sol-fable")[1]
-
-    assert not module.reopen_pane_proof("herdr", fable, "w-agents:p-fable")
-
-
-def test_sol_reopen_proof_never_requires_process_argv(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        module,
-        "run_json",
-        lambda _herdr_bin, arguments, timeout=30: (
-            (_ for _ in ()).throw(AssertionError("Sol reopen must not read process info"))
-            if arguments[:2] == ["pane", "process-info"]
-            else {"result": {"type": "ok"}}
-        ),
-    )
-    monkeypatch.setattr(module, "run_text", lambda _herdr_bin, arguments, timeout=30: SOL_SCREEN)
-    monkeypatch.setattr(
-        module,
-        "native_catalog_row_present",
-        lambda command, provider, model: True,
-    )
-    sol = module.resolve_profile("sol-fable")[0]
-
-    assert module.reopen_pane_proof("herdr", sol, "w-agents:p-sol")
+    assert not module.participant_process_proves("herdr", fable, "w-agents:p-fable")
 
 
 def test_room_reopen_rejects_stale_cross_room_profile_binding(
@@ -3612,28 +3650,6 @@ def test_sol_fable_grok_composes_reused_participants_in_exact_order() -> None:
     assert len(sol_fable) == 2  # the stored sol-fable profile is unchanged
 
 
-def test_reopen_grok_fails_when_pane_text_mismatches_despite_exact_argv(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Exact process argv alone is insufficient: the pane must still show 4.6."""
-    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
-    monkeypatch.setattr(
-        module,
-        "run_json",
-        lambda _herdr_bin, arguments, timeout=30: (
-            {"result": {"process_info": {"foreground_processes": GROK_PROCESS}}}
-            if arguments[:2] == ["pane", "process-info"]
-            else (_ for _ in ()).throw(AssertionError(arguments))
-        ),
-    )
-    monkeypatch.setattr(
-        module, "run_text", lambda _herdr_bin, _arguments, timeout=30: "Grok CLI\nGrok 4.6.1\n"
-    )
-    grok = module.resolve_profile("sol-fable-grok")[2]
-
-    assert not module.reopen_pane_proof("herdr", grok, "w-agents:p-grok")
-
-
 def test_grok_participant_uses_exact_start_argv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3651,10 +3667,7 @@ def test_grok_participant_uses_exact_start_argv(
         "bypassPermissions",
     )
     assert grok.tab_path_prefix == "~/.grok/bin"
-    assert (grok.reopen_process_argv0, grok.reopen_process_args) == (
-        "grok",
-        grok.start_args,
-    )
+    assert grok.kind == "grok"
 
 
 def test_grok_tab_gets_prepended_grok_bin_path_and_exact_start_argv(
@@ -3739,25 +3752,33 @@ def test_grok_tab_env_has_no_trailing_separator_without_parent_path(
     assert module.participant_tab_env(module.SOL_PARTICIPANT) == []
 
 
-def test_grok_fresh_pane_proof_requires_exact_grok_46_and_high(
+def test_grok_process_proof_requires_the_exact_grok_46_argv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def proves(screen: str) -> bool:
-        monkeypatch.setattr(module, "run_text", lambda _herdr_bin, _arguments, timeout=30: screen)
-        monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
-        grok = module.resolve_profile("sol-fable-grok")[2]
-        return module.pane_proof("herdr", grok, "w-agents:p-grok")
+    grok = module.resolve_profile("sol-fable-grok")[2]
 
-    assert proves(GROK_SCREEN)
-    assert proves("Grok CLI\nmodel: Grok 4.6 (high)\nsession active\n")
-    assert not proves("Grok CLI\nmodel Grok 4.6.1\nreasoning effort: high\n")  # suffixed version
-    assert not proves("Grok CLI\nmodel groklette 4.6\nreasoning effort: high\n")  # prefix lookalike
-    assert not proves("Grok CLI\nmodel Grok 4.6\nreasoning effort: highest\n")  # suffixed effort
-    assert not proves("Grok CLI\nmodel Grok 4\nreasoning effort: high\n")  # version without 4.6
-    assert not proves("Grok CLI\nmodel Grok 4.6\nwaiting for input\n")  # high missing entirely
-    assert not proves("Grok CLI\nreasoning effort: high\nwaiting\n")  # model token missing
-    assert not proves("Grok CLI\nmodel Grok 4 (high)\nwaiting\n")  # version without 4.6
-    assert not proves("Grok CLI\nwaiting for input\n")  # no evidence at all
+    def proves(processes: list[dict]) -> bool:
+        monkeypatch.setattr(
+            module,
+            "run_json",
+            lambda _herdr_bin, arguments, timeout=30: (
+                {"result": {"process_info": {"foreground_processes": processes}}}
+                if arguments[:2] == ["pane", "process-info"]
+                else (_ for _ in ()).throw(AssertionError(arguments))
+            ),
+        )
+        monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+        return module.participant_process_proves("herdr", grok, "w-agents:p-grok")
+
+    argv = GROK_PROCESS[0]["argv"]
+    assert proves(GROK_PROCESS)
+    # A suffixed version, a prefixed lookalike, a missing flag and a missing
+    # effort are all different contiguous sequences and never prove.
+    assert not proves([{"name": "grok", "argv": [*argv[:2], "grok-4.6.1", *argv[3:]]}])
+    assert not proves([{"name": "groklette", "argv": argv}])
+    assert not proves([{"name": "grok", "argv": argv[:-2]}])
+    assert not proves([{"name": "grok", "argv": [*argv[:-1], "highest"]}])
+    assert not proves([{"name": "grok", "argv": argv[2:]}])
 
 
 @pytest.mark.parametrize(
@@ -3765,30 +3786,14 @@ def test_grok_fresh_pane_proof_requires_exact_grok_46_and_high(
     [
         pytest.param([], id="missing-process"),
         pytest.param(
-            [
-                {
-                    "argv0": "grok",
-                    "argv": ["grok", "--model", "grok-4.6", "--reasoning-effort", "high"],
-                }
-            ],
+            [{"argv0": "grok", "argv": ["grok", "--model", "grok-4.6"]}],
             id="missing-flags",
         ),
         pytest.param(
             [
                 {
                     "argv0": "grok",
-                    "argv": [
-                        "grok",
-                        "--reasoning-effort",
-                        "high",
-                        "--model",
-                        "grok-4.6",
-                        "--no-memory",
-                        "--disable-web-search",
-                        "--no-subagents",
-                        "--permission-mode",
-                        "bypassPermissions",
-                    ],
+                    "argv": ["grok", "--reasoning-effort", "high", "--model", "grok-4.6"],
                 }
             ],
             id="reordered-args",
@@ -3797,86 +3802,31 @@ def test_grok_fresh_pane_proof_requires_exact_grok_46_and_high(
             [
                 {
                     "argv0": "grok",
-                    "argv": [
-                        "grok",
-                        "--model",
-                        "grok-4.6-fast",
-                        "--reasoning-effort",
-                        "high",
-                        "--no-memory",
-                        "--disable-web-search",
-                        "--no-subagents",
-                        "--permission-mode",
-                        "bypassPermissions",
-                    ],
+                    "argv": ["grok", "--model", "grok-4.6.1", *module.GROK_START_ARGS[2:]],
                 }
             ],
             id="model-lookalike",
         ),
         pytest.param(
-            [
-                {
-                    "argv0": "grok-cli",
-                    "argv": [
-                        "grok",
-                        "--model",
-                        "grok-4.6",
-                        "--reasoning-effort",
-                        "high",
-                        "--no-memory",
-                        "--disable-web-search",
-                        "--no-subagents",
-                        "--permission-mode",
-                        "bypassPermissions",
-                    ],
-                }
-            ],
+            [{"argv0": "grok-cli", "argv": ["grok", *module.GROK_START_ARGS]}],
             id="wrong-argv0",
         ),
         pytest.param(
-            [
-                {
-                    "argv0": "node",
-                    "argv": [
-                        "node",
-                        "mcp",
-                        "--model",
-                        "grok-4.6",
-                        "--reasoning-effort",
-                        "high",
-                        "--no-memory",
-                        "--disable-web-search",
-                        "--no-subagents",
-                        "--permission-mode",
-                        "bypassPermissions",
-                    ],
-                }
-            ],
+            [{"argv0": "node", "argv": ["node", "mcp", *module.GROK_START_ARGS]}],
             id="mcp-child",
         ),
         pytest.param(
             [
                 {
                     "argv0": "grok",
-                    "argv": [
-                        "grok",
-                        "--model",
-                        "grok-4.6",
-                        "--reasoning-effort",
-                        "low",
-                        "--no-memory",
-                        "--disable-web-search",
-                        "--no-subagents",
-                        "--permission-mode",
-                        "bypassPermissions",
-                    ],
+                    "argv": ["grok", *module.GROK_START_ARGS[:-1], "medium"],
                 }
             ],
             id="wrong-effort",
         ),
     ],
 )
-def test_reopen_grok_process_proof_fails_closed_on_inexact_evidence(
+def test_grok_process_proof_fails_closed_on_inexact_evidence(
     monkeypatch: pytest.MonkeyPatch, processes: list[dict]
 ) -> None:
     monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
@@ -3889,15 +3839,12 @@ def test_reopen_grok_process_proof_fails_closed_on_inexact_evidence(
             else (_ for _ in ()).throw(AssertionError(arguments))
         ),
     )
-    monkeypatch.setattr(
-        module, "run_text", lambda _herdr_bin, _arguments, timeout=30: GROK_POST_TURN_SCREEN
-    )
     grok = module.resolve_profile("sol-fable-grok")[2]
 
-    assert not module.reopen_pane_proof("herdr", grok, "w-agents:p-grok")
+    assert not module.participant_process_proves("herdr", grok, "w-agents:p-grok")
 
 
-def test_reopen_grok_accepts_stable_ui_and_exact_process_argv(
+def test_grok_process_proof_accepts_exact_process_argv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
@@ -3910,12 +3857,9 @@ def test_reopen_grok_accepts_stable_ui_and_exact_process_argv(
             else (_ for _ in ()).throw(AssertionError(arguments))
         ),
     )
-    monkeypatch.setattr(
-        module, "run_text", lambda _herdr_bin, _arguments, timeout=30: GROK_POST_TURN_SCREEN
-    )
     grok = module.resolve_profile("sol-fable-grok")[2]
 
-    assert module.reopen_pane_proof("herdr", grok, "w-agents:p-grok")
+    assert module.participant_process_proves("herdr", grok, "w-agents:p-grok")
 
 
 def test_main_never_execs_sol_fable_grok_when_grok_fails(
@@ -3928,11 +3872,19 @@ def test_main_never_execs_sol_fable_grok_when_grok_fails(
     calls = install_sfg_host(
         monkeypatch,
         tmp_path,
-        # Grok's pane shows a suffixed version: the existing session mismatches.
         {
             "w-agents:p-sol": SOL_SCREEN,
             "w-agents:p-fable": FABLE_SCREEN,
-            "w-agents:p-grok": "Grok CLI\nmodel Grok 4.6.1\n",
+            "w-agents:p-grok": GROK_SCREEN,
+        },
+        # Grok's process runs a suffixed version: the existing session mismatches.
+        process_infos={
+            "w-agents:p-grok": [
+                {
+                    "name": "grok",
+                    "argv": ["grok", "--model", "grok-4.6.1", *module.GROK_START_ARGS[2:]],
+                }
+            ]
         },
     )
     save_launcher_state(tmp_path, sfg_room_state(tmp_path))
@@ -3960,6 +3912,8 @@ def test_failed_new_grok_tab_is_closed_while_verified_peers_remain(
         tmp_path,
         {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN, "w-agents:p-grok": ""},
         live_agents=[],
+        # The started Grok process never runs the exact start argv: proof fails.
+        process_infos={"w-agents:p-grok": [{"name": "grok", "argv": ["grok", "--help"]}]},
     )
     state: dict = {"schema_version": 1}
 
@@ -3990,6 +3944,7 @@ def install_role_replacement_host(
     """Fake Herdr whose created tabs always get fresh, never-reused pane ids."""
     calls: list[list[str]] = []
     created = 0
+    started_processes: dict[str, list[dict]] = {}
     for agent in live_agents:
         agent["cwd"] = str(tmp_path)
 
@@ -3999,6 +3954,12 @@ def install_role_replacement_host(
         calls.append(arguments)
         if arguments == ["agent", "list"]:
             return {"result": {"agents": live_agents}}
+        if arguments[:2] == ["agent", "start"]:
+            pane = arguments[arguments.index("--pane") + 1]
+            started_processes[pane] = PARTICIPANT_PROCESSES.get(
+                arguments[2], [{"name": arguments[2], "argv": [arguments[2]]}]
+            )
+            return {"result": {"type": "ok"}}
         if arguments[:2] == ["agent", "get"]:
             matches = [agent for agent in live_agents if agent.get("name") == arguments[2]]
             if not matches:
@@ -4008,22 +3969,24 @@ def install_role_replacement_host(
                 )
             return {"result": {"agent": matches[0]}}
         if arguments[:2] == ["pane", "process-info"]:
-            # A reused Fable peer has taken turns, so its startup banner is gone;
-            # the setup path must accept its reopen evidence (pane text plus the
-            # exact foreground argv under the protocol-21 ``name`` field).
-            if arguments[-1] == "w-agents:p-fable":
-                return {
-                    "result": {
-                        "process_info": {
-                            "foreground_processes": [
-                                {
-                                    "name": "claude",
-                                    "argv": ["claude", "--model", "fable", "--effort", "high"],
-                                }
-                            ]
+            # A reused peer runs its participant's exact foreground argv under
+            # the protocol-21 ``name`` identity field.
+            for agent in live_agents:
+                if agent.get("pane_id") == arguments[-1] and agent["name"] in (
+                    "sol-peer",
+                    "fable-peer",
+                    "grok46-peer",
+                ):
+                    return {
+                        "result": {
+                            "process_info": {
+                                "foreground_processes": PARTICIPANT_PROCESSES[agent["name"]]
+                            }
                         }
                     }
-                }
+            started = started_processes.get(arguments[-1])
+            if started is not None:
+                return {"result": {"process_info": {"foreground_processes": started}}}
             return {"result": {"process_info": {"foreground_processes": [{"name": "zsh"}]}}}
         if arguments[:2] == ["tab", "create"]:
             created += 1
@@ -4297,7 +4260,7 @@ def test_room_reopen_reverifies_sol_fable_grok_and_execs_with_receipt(
     process_panes = {
         call[call.index("--pane") + 1] for call in calls if call[:2] == ["pane", "process-info"]
     }
-    assert process_panes == {"w-agents:p-fable", "w-agents:p-grok"}
+    assert process_panes == {"w-agents:p-sol", "w-agents:p-fable", "w-agents:p-grok"}
 
     pi_captured: dict[str, object] = {}
     room_reopen_env(tmp_path, monkeypatch, pi_captured, "chat-sfgpi")
@@ -4339,7 +4302,7 @@ def test_room_reopen_reverifies_sol_fable_grok_and_execs_with_receipt(
     )
     assert {
         call[call.index("--pane") + 1] for call in pi_calls if call[:2] == ["pane", "process-info"]
-    } == {"w-agents:p-fable"}
+    } == {"w-agents:p-sol", "w-agents:p-fable", "w-agents:p-grokpi"}
 
 
 # --- sol-fable-glm profile ------------------------------------------------------------
@@ -4469,58 +4432,35 @@ def test_glm_participant_uses_exact_start_argv() -> None:
     )
     assert glm.catalog_command == ("pi", "--list-models", "glm-5.3")
     assert (glm.provider, glm.model, glm.effort) == ("bigmodel-coding", "glm-5.3", "high")
-    # Like Sol, GLM needs no tab PATH prefix and no reopen process argv: the
-    # pane keeps its `glm-5.3 • high` evidence after the first turn.
+    # Like Sol, GLM needs no tab PATH prefix; its proof is the pi process argv.
     assert glm.tab_path_prefix == ""
-    assert glm.reopen_pane_proofs == ()
-    assert glm.reopen_process_argv0 == ""
-    assert glm.reopen_process_args == ()
+    assert glm.kind == "pi"
 
 
-def test_glm_fresh_pane_proof_requires_exact_glm_53_and_high(
+def test_glm_process_proof_requires_the_exact_glm_53_argv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def proves(screen: str) -> bool:
-        monkeypatch.setattr(module, "run_text", lambda _herdr_bin, _arguments, timeout=30: screen)
-        monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
-        glm = module.resolve_profile("sol-fable-glm")[2]
-        return module.pane_proof("herdr", glm, "w-agents:p-glm")
-
-    assert proves(GLM_SCREEN)
-    assert proves("Pi\nmodel: glm-5.3 • high (auto)\nsession active\n")
-    assert not proves("Pi\nmodel glm-5.3.1 • high\n")  # suffixed version
-    assert not proves("Pi\nmodel glm 5.3 • high\n")  # split model token
-    assert not proves("Pi\nmodel glm-5.3 • highest\n")  # suffixed effort
-    assert not proves("Pi\nmodel glm-5.3 • medium\n")  # wrong effort
-    assert not proves("Pi\nmodel glm-5.3 ─ high\n")  # wrong separator token
-    assert not proves("Pi\nmodel glm-5.3\nwaiting for input\n")  # high missing
-    assert not proves("Pi\nthinking high\nwaiting\n")  # model token missing
-    assert not proves("Pi\nwaiting for input\n")  # no evidence at all
-
-
-def test_reopen_glm_uses_persistent_pane_proof_without_process_argv(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        module,
-        "run_json",
-        lambda _herdr_bin, arguments, timeout=30: (
-            (_ for _ in ()).throw(AssertionError("GLM reopen must not read process info"))
-            if arguments[:2] == ["pane", "process-info"]
-            else {"result": {"type": "ok"}}
-        ),
-    )
-    monkeypatch.setattr(
-        module, "run_text", lambda _herdr_bin, _arguments, timeout=30: GLM_POST_TURN_SCREEN
-    )
-    monkeypatch.setattr(
-        module,
-        "native_catalog_row_present",
-        lambda command, provider, model: True,
-    )
     glm = module.resolve_profile("sol-fable-glm")[2]
 
-    assert module.reopen_pane_proof("herdr", glm, "w-agents:p-glm")
+    def proves(processes: list[dict]) -> bool:
+        monkeypatch.setattr(
+            module,
+            "run_json",
+            lambda _herdr_bin, arguments, timeout=30: (
+                {"result": {"process_info": {"foreground_processes": processes}}}
+                if arguments[:2] == ["pane", "process-info"]
+                else (_ for _ in ()).throw(AssertionError(arguments))
+            ),
+        )
+        monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+        return module.participant_process_proves("herdr", glm, "w-agents:p-glm")
+
+    assert proves(PARTICIPANT_PROCESSES["glm-peer"])
+    argv = PARTICIPANT_PROCESSES["glm-peer"][0]["argv"]
+    assert not proves([{"name": "pi", "argv": [*argv[:4], "glm-5.3.1", *argv[5:]]}])
+    assert not proves([{"name": "pi", "argv": [*argv[:3], "glm", "5.3", *argv[4:]]}])
+    assert not proves([{"name": "pi", "argv": [*argv[:-1], "medium"]}])
+    assert not proves([{"name": "codex", "argv": argv}])
 
 
 def test_glm_tab_is_created_without_path_env_and_started_with_exact_argv(
@@ -4588,11 +4528,19 @@ def test_main_never_execs_sol_fable_glm_when_glm_fails(
     calls = install_sfglm_host(
         monkeypatch,
         tmp_path,
-        # GLM's pane shows a suffixed version: the existing session mismatches.
         {
             "w-agents:p-sol": SOL_SCREEN,
             "w-agents:p-fable": FABLE_SCREEN,
-            "w-agents:p-glm": "Pi\nmodel glm-5.3.1 • high\n",
+            "w-agents:p-glm": GLM_SCREEN,
+        },
+        # GLM's process runs a suffixed version: the existing session mismatches.
+        process_infos={
+            "w-agents:p-glm": [
+                {
+                    "name": "pi",
+                    "argv": ["pi", "--provider", "bigmodel-coding", "--model", "glm-5.3.1"],
+                }
+            ]
         },
     )
     save_launcher_state(tmp_path, sfglm_room_state(tmp_path))
@@ -4650,12 +4598,10 @@ def test_room_reopen_reverifies_sol_fable_glm_and_execs_with_receipt(
     assert not any(
         call[:2] in (["agent", "start"], ["tab", "close"], ["pane", "close"]) for call in calls
     )
-    # GLM, like Sol, verifies from its persistent pane text and needs no
-    # foreground-process argv evidence on reopen.
     process_panes = {
         call[call.index("--pane") + 1] for call in calls if call[:2] == ["pane", "process-info"]
     }
-    assert process_panes == {"w-agents:p-fable"}
+    assert process_panes == {"w-agents:p-sol", "w-agents:p-fable", "w-agents:p-glm"}
 
 
 # --- default sol-fable-grok-pi profile -----------------------------------------------
@@ -4775,9 +4721,7 @@ def test_grok_pi_uses_the_exact_xai_argv_and_no_fallback() -> None:
     assert grok.catalog_command == ("pi", "--list-models", "grok-4.6")
     assert (grok.provider, grok.model, grok.effort) == ("xai", "grok-4.6", "high")
     assert grok.tab_path_prefix == ""
-    assert grok.reopen_pane_proofs == ()
-    assert grok.reopen_process_argv0 == ""
-    assert grok.reopen_process_args == ()
+    assert grok.kind == "pi"
 
 
 def test_grok_pi_catalog_requires_the_exact_xai_grok_46_row(
@@ -4804,20 +4748,29 @@ def test_grok_pi_catalog_requires_the_exact_xai_grok_46_row(
     assert not proves("other  grok-4.6\nxai  grok-4.6\n")
 
 
-def test_grok_pi_pane_proof_requires_exact_bullet_high_sequence(
+def test_grok_pi_process_proof_requires_the_exact_xai_argv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def proves(screen: str) -> bool:
-        monkeypatch.setattr(module, "run_text", lambda *_args, **_kwargs: screen)
-        monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
-        return module.pane_proof("herdr", module.resolve_profile("sol-fable-grok-pi")[2], "p-grok")
+    grok = module.resolve_profile("sol-fable-grok-pi")[2]
 
-    assert proves(GROK_PI_SCREEN)
-    assert proves(GROK_PI_POST_TURN_SCREEN)
-    assert not proves("Pi\nmodel grok-4.6.1 • high\n")
-    assert not proves("Pi\nmodel grok 4.6 • high\n")
-    assert not proves("Pi\nmodel grok-4.6 • highest\n")
-    assert not proves("Pi\nmodel grok-4.6 ─ high\n")
+    def proves(processes: list[dict]) -> bool:
+        monkeypatch.setattr(
+            module,
+            "run_json",
+            lambda _herdr_bin, arguments, timeout=30: (
+                {"result": {"process_info": {"foreground_processes": processes}}}
+                if arguments[:2] == ["pane", "process-info"]
+                else (_ for _ in ()).throw(AssertionError(arguments))
+            ),
+        )
+        monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+        return module.participant_process_proves("herdr", grok, "w-agents:p-grokpi")
+
+    assert proves(PARTICIPANT_PROCESSES["grok46pi-peer"])
+    argv = PARTICIPANT_PROCESSES["grok46pi-peer"][0]["argv"]
+    assert not proves([{"name": "pi", "argv": [*argv[:3], "glm-5.3", *argv[4:]]}])
+    assert not proves([{"name": "pi", "argv": [*argv[:-1], "low"]}])
+    assert not proves([{"name": "grok", "argv": argv}])
 
 
 def test_grok_pi_catalog_failure_creates_no_tab_and_never_falls_back(
@@ -5185,10 +5138,18 @@ def test_profile_incomplete_message_and_record_carry_each_role_reason(
         {
             "w-agents:p-sol": SOL_SCREEN,
             "w-agents:p-fable": FABLE_SCREEN,
-            # Grok is owned but its native evidence has lapsed.
-            "w-agents:p-grok": "Grok 4.5 (medium)\n",
+            "w-agents:p-grok": GROK_SCREEN,
         },
         live_agents=live,
+        # Grok is owned but its process evidence has lapsed.
+        process_infos={
+            "w-agents:p-grok": [
+                {
+                    "name": "grok",
+                    "argv": ["grok", "--model", "grok-4.5", "--reasoning-effort", "medium"],
+                }
+            ]
+        },
     )
     # install_sfg_host normalises every cwd to tmp_path; move Fable afterwards.
     live[1]["cwd"] = str(tmp_path / "elsewhere")
@@ -5205,13 +5166,11 @@ def test_profile_incomplete_message_and_record_carry_each_role_reason(
         "- @fable: fable-peer is live but not owned (cwd " in message
         and "the session was left open" in message
     )
-    assert (
-        "- @grok: grok46-peer failed native-ui verification; the session was left open" in message
-    )
+    assert "- @grok: grok46-peer failed process verification; the session was left open" in message
     assert error.failures and len(error.failures) == 2
     assert error.failures[0].startswith("@fable: fable-peer is live but not owned (cwd ")
     assert error.failures[1] == (
-        "@grok: grok46-peer failed native-ui verification; the session was left open"
+        "@grok: grok46-peer failed process verification; the session was left open"
     )
     record = module._launcher_error_record(
         "--launch", ["--launch", "--profile", "sol-fable-grok"], error
@@ -5510,14 +5469,6 @@ def test_opus_participant_and_profile_are_exact():
         ("--model", "opus", "--effort", "high"),
     )
 
-    def proves(text: str, proofs: tuple) -> bool:
-        return all(module.sequence_present(module.pane_tokens(text), proof) for proof in proofs)
-
-    assert proves("Claude Code v2.1.258\nOpus 5 with high effort · Claude Max\n", opus.pane_proofs)
-    assert not proves(
-        "Claude Code v2.1.258\nFable 5.1 with high effort · Claude Max\n", opus.pane_proofs
-    )
-    assert not proves("Claude Code\nOpus 5-deluxe with high effort\n", opus.pane_proofs)
     roster = module.resolve_profile("sol-fable-grok-opus-pi")
     assert [participant.role for participant in roster] == ["sol", "fable", "grok", "opus"]
     assert roster[2] is module.GROK_PI_PARTICIPANT
@@ -5979,76 +5930,6 @@ CLAUDE_OPUS_PROCESS = [
 ]
 
 
-def test_reopen_pane_proof_falls_back_to_scrollback_after_visible_reads_fail(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A pane stacked into the grid can be a few rows tall and show only its
-    footer, so the reopen proof retries its token read exactly once against
-    scrollback; fresh-launch proofs stay visible-only."""
-    monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
-    reads: list[list[str]] = []
-
-    def fake_run_text(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
-        del timeout
-        reads.append(arguments)
-        return (
-            OPUS_SCROLLBACK_SCREEN
-            if arguments[4] == "recent-unwrapped"
-            else (OPUS_SHORT_PANE_SCREEN)
-        )
-
-    monkeypatch.setattr(module, "run_text", fake_run_text)
-    process_reads: list[list[str]] = []
-
-    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
-        del timeout
-        assert arguments[:2] == ["pane", "process-info"], arguments
-        process_reads.append(arguments)
-        return {"result": {"process_info": {"foreground_processes": CLAUDE_OPUS_PROCESS}}}
-
-    monkeypatch.setattr(module, "run_json", fake_run_json)
-    opus = module.OPUS_PARTICIPANT
-
-    assert module.reopen_pane_proof("herdr", opus, "w-chat:p-opus")
-    # The scrollback read runs exactly once, only after every visible read
-    # failed, with this exact command; the process proof still passes, as today.
-    fallbacks = [read for read in reads if read[4] == "recent-unwrapped"]
-    assert fallbacks == [
-        ["pane", "read", "w-chat:p-opus", "--source", "recent-unwrapped", "--lines", "240"]
-    ]
-    assert reads.index(fallbacks[0]) > max(
-        index for index, read in enumerate(reads) if read[4] == "visible"
-    )
-    assert process_reads == [["pane", "process-info", "--pane", "w-chat:p-opus"]]
-
-    # Fresh-launch proofs never read scrollback, so the same short pane fails.
-    reads.clear()
-    assert not module.pane_proof("herdr", opus, "w-chat:p-opus")
-    assert reads
-    assert all(read[4] == "visible" for read in reads)
-
-    # Scrollback tokens alone do not rescue a failed process proof.
-    reads.clear()
-    monkeypatch.setattr(
-        module,
-        "run_json",
-        lambda _herdr_bin, arguments, timeout=30: (
-            {"result": {"process_info": {"foreground_processes": []}}}
-            if arguments[:2] == ["pane", "process-info"]
-            else (_ for _ in ()).throw(AssertionError(arguments))
-        ),
-    )
-    assert not module.reopen_pane_proof("herdr", opus, "w-chat:p-opus")
-    assert reads and all(read[4] == "visible" or read[4] == "recent-unwrapped" for read in reads)
-    assert any(read[4] == "recent-unwrapped" for read in reads)
-
-    # A scrollback read without the tokens rejects the reopen outright.
-    monkeypatch.setattr(
-        module, "run_text", lambda _herdr_bin, arguments, timeout=30: OPUS_SHORT_PANE_SCREEN
-    )
-    assert not module.reopen_pane_proof("herdr", opus, "w-chat:p-opus")
-
-
 def test_grid_relaunch_reuses_live_peers_and_closes_the_emptied_backstage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -6150,10 +6031,14 @@ def test_grid_relaunch_reuses_live_peers_and_closes_the_emptied_backstage(
                 }
             }
         if arguments[:2] == ["pane", "process-info"]:
-            processes = {
+            pane_processes = {
+                "w-room:p-sol": PARTICIPANT_PROCESSES["sol-peer"],
                 "w-room:p-fable": CLAUDE_FABLE_PROCESS,
                 "w-room:p-grok": GROK_PROCESS,
-            }.get(arguments[arguments.index("--pane") + 1], [{"name": "zsh"}])
+            }
+            processes = pane_processes.get(
+                arguments[arguments.index("--pane") + 1], [{"name": "zsh"}]
+            )
             return {"result": {"process_info": {"foreground_processes": processes}}}
         if arguments[:2] == ["pane", "move"]:
             moved_names.add(pane_to_name[arguments[2]])

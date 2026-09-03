@@ -67,20 +67,6 @@ AGENTS_WORKSPACE_LABEL = "agents · group-chat"
 HOLD_PROMPT = "Press Enter to close (auto-closes in 60s)"
 HOLD_TIMEOUT_SECONDS = 60.0
 
-# A pane proof is a sequence of token alternatives: every element must match
-# consecutive whitespace-separated tokens exactly (case-insensitive, edge
-# punctuation stripped), so suffixed or prefixed lookalikes never match.
-PANE_BULLETS = ("•", "·")
-SOL_PANE_PROOF = (("gpt-5.6-sol",), PANE_BULLETS, ("high",))
-# Observed live (pi v0.84.4, --provider bigmodel-coding --model glm-5.3
-# --thinking high): the startup status line and the input-box footer both keep
-# `glm-5.3 • high`, and the footer still shows `╰ glm-5.3 • high … ctx 2% ╯`
-# after the first turn, so the fresh pane proof stays on screen across turns
-# and no separate reopen proof is needed — mirroring Sol.
-GLM_PANE_PROOF = (("glm-5.3",), PANE_BULLETS, ("high",))
-GROK_PI_PANE_PROOF = (("grok-4.6",), PANE_BULLETS, ("high",))
-FABLE_PANE_PROOFS = (("fable",), ("5", "5.1")), (("high",), ("effort",))
-OPUS_PANE_PROOFS = (("opus",), ("5",)), (("high",), ("effort",))
 GROK_START_ARGS = (
     "--model",
     "grok-4.6",
@@ -92,9 +78,6 @@ GROK_START_ARGS = (
     "--permission-mode",
     "bypassPermissions",
 )
-# The native Grok UI keeps `Grok 4.6 (high)` on screen after a turn, so the
-# fresh pane sequences also serve as the reopen pane sequences.
-GROK_PANE_PROOFS = ((("grok",), ("4.6",)), (("high",),))
 
 
 @dataclass(frozen=True)
@@ -105,13 +88,6 @@ class Participant:
     kind: str
     name: str
     start_args: tuple[str, ...] = ()
-    pane_proofs: tuple[tuple[tuple[str, ...], ...], ...] = ()
-    # Reopen (re-verification) proofs: weaker bounded pane evidence plus exact
-    # native foreground-process argv, for status lines that stop repeating
-    # startup-only banners after the first turn. Empty means fresh proofs apply.
-    reopen_pane_proofs: tuple[tuple[tuple[str, ...], ...], ...] = ()
-    reopen_process_argv0: str = ""
-    reopen_process_args: tuple[str, ...] = ()
     catalog_command: tuple[str, ...] = ()
     provider: str | None = None
     model: str = ""
@@ -133,7 +109,6 @@ SOL_PARTICIPANT = Participant(
         "--thinking",
         "high",
     ),
-    pane_proofs=(SOL_PANE_PROOF,),
     catalog_command=("pi", "--list-models", "gpt-5.6-sol"),
     provider="openai-codex",
     model="gpt-5.6-sol",
@@ -146,10 +121,6 @@ FABLE_PARTICIPANT = Participant(
     kind="claude",
     name="fable-peer",
     start_args=("--model", "fable", "--effort", "high"),
-    pane_proofs=FABLE_PANE_PROOFS,
-    reopen_pane_proofs=((("fable",), ("5", "5.1")),),
-    reopen_process_argv0="claude",
-    reopen_process_args=("--model", "fable", "--effort", "high"),
     model="fable",
     effort="high",
 )
@@ -159,10 +130,6 @@ OPUS_PARTICIPANT = Participant(
     kind="claude",
     name="opus-peer",
     start_args=("--model", "opus", "--effort", "high"),
-    pane_proofs=OPUS_PANE_PROOFS,
-    reopen_pane_proofs=((("opus",), ("5",)),),
-    reopen_process_argv0="claude",
-    reopen_process_args=("--model", "opus", "--effort", "high"),
     model="opus",
     effort="high",
 )
@@ -172,10 +139,6 @@ GROK_PARTICIPANT = Participant(
     kind="grok",
     name="grok46-peer",
     start_args=GROK_START_ARGS,
-    pane_proofs=GROK_PANE_PROOFS,
-    reopen_pane_proofs=GROK_PANE_PROOFS,
-    reopen_process_argv0="grok",
-    reopen_process_args=GROK_START_ARGS,
     tab_path_prefix="~/.grok/bin",
     model="grok-4.6",
     effort="high",
@@ -193,7 +156,6 @@ GLM_PARTICIPANT = Participant(
         "--thinking",
         "high",
     ),
-    pane_proofs=(GLM_PANE_PROOF,),
     catalog_command=("pi", "--list-models", "glm-5.3"),
     provider="bigmodel-coding",
     model="glm-5.3",
@@ -212,7 +174,6 @@ GROK_PI_PARTICIPANT = Participant(
         "--thinking",
         "high",
     ),
-    pane_proofs=(GROK_PI_PANE_PROOF,),
     catalog_command=("pi", "--list-models", "grok-4.6"),
     provider="xai",
     model="grok-4.6",
@@ -861,23 +822,6 @@ AGENT_START_BUSY_INTERVAL_S = 2.0
 
 VERIFY_PANE_ATTEMPTS = 15
 VERIFY_PANE_INTERVAL_S = 1.0
-_TOKEN_EDGE = "".join((":;,.!()", "[]<>", "\"'"))
-
-
-def pane_tokens(text: str) -> list[str]:
-    """Case-folded whitespace tokens with edge punctuation stripped; internal
-    punctuation stays, so `gpt-5.6-sol-01` remains a different token."""
-    return [token.strip(_TOKEN_EDGE).lower() for token in text.split()]
-
-
-def sequence_present(tokens: Sequence[str], sequence: tuple[tuple[str, ...], ...]) -> bool:
-    """Bounded sequence match: every element matches consecutive tokens exactly."""
-    for start in range(len(tokens) - len(sequence) + 1):
-        if all(
-            tokens[start + offset] in alternatives for offset, alternatives in enumerate(sequence)
-        ):
-            return True
-    return False
 
 
 def native_catalog_row_present(command: Sequence[str], provider: str, model: str) -> bool:
@@ -898,38 +842,6 @@ def native_catalog_row_present(command: Sequence[str], provider: str, model: str
     return providers == {provider}
 
 
-def native_pane_proves(
-    herdr_bin: str,
-    pane_id: str,
-    proofs: Sequence[tuple[tuple[str, ...], ...]],
-    scrollback_fallback: bool = False,
-) -> bool:
-    """Bounded retries for native-pane token evidence; startup UIs render asynchronously.
-
-    A visible read is the only fresh-launch evidence source. Reopen proofs
-    may pass ``scrollback_fallback``: a pane stacked into a grid can be too
-    short to show its status line at all, so after the visible retries fail
-    the read is retried exactly once against scrollback.
-    """
-    for attempt in range(VERIFY_PANE_ATTEMPTS):
-        text = run_text(
-            herdr_bin, ["pane", "read", pane_id, "--source", "visible", "--lines", "80"]
-        )
-        tokens = pane_tokens(text)
-        if all(sequence_present(tokens, proof) for proof in proofs):
-            return True
-        if attempt + 1 < VERIFY_PANE_ATTEMPTS:
-            time.sleep(VERIFY_PANE_INTERVAL_S)
-    if not scrollback_fallback:
-        return False
-    scrollback = run_text(
-        herdr_bin,
-        ["pane", "read", pane_id, "--source", "recent-unwrapped", "--lines", "240"],
-    )
-    tokens = pane_tokens(scrollback)
-    return all(sequence_present(tokens, proof) for proof in proofs)
-
-
 def catalog_proof(participant: Participant) -> bool:
     """Catalog preflight; must pass before any participant tab is created or started."""
     return not participant.catalog_command or (
@@ -937,12 +849,6 @@ def catalog_proof(participant: Participant) -> bool:
         and native_catalog_row_present(
             participant.catalog_command, participant.provider, participant.model
         )
-    )
-
-
-def pane_proof(herdr_bin: str, participant: Participant, pane_id: str) -> bool:
-    return not participant.pane_proofs or native_pane_proves(
-        herdr_bin, pane_id, participant.pane_proofs
     )
 
 
@@ -985,27 +891,19 @@ def native_pane_process_proves(
     return False
 
 
-def reopen_pane_proof(herdr_bin: str, participant: Participant, pane_id: str) -> bool:
-    """Reopen proof: profile-driven; fresh proofs when no reopen fields exist.
+def participant_process_proves(herdr_bin: str, participant: Participant, pane_id: str) -> bool:
+    """The only post-start native proof: the participant's own foreground process.
 
-    Both reopen branches read with the scrollback fallback: a pane stacked
-    into a grid can be a few rows tall and show only its footer, so a token
-    that scrolled out of the viewport is still accepted from `recent-unwrapped`
-    scrollback. Fresh-launch proofs (`pane_proof`) stay visible-only.
+    A participant without start arguments is never process-proofed. Otherwise
+    the proof is `pane process-info` on the agent's live pane: the foreground
+    process's executable identity must be exactly the participant's kind (the
+    canonical executable Herdr starts for that kind) and its argv must contain
+    the start arguments as one contiguous sequence. Screen text is never
+    evidence, so a model rename in a vendor UI cannot break a launch.
     """
-    if not participant.reopen_pane_proofs and not participant.reopen_process_argv0:
-        return native_pane_proves(
-            herdr_bin, pane_id, participant.pane_proofs, scrollback_fallback=True
-        )
-    if participant.reopen_pane_proofs and not native_pane_proves(
-        herdr_bin, pane_id, participant.reopen_pane_proofs, scrollback_fallback=True
-    ):
-        return False
-    if not participant.reopen_process_argv0:
+    if not participant.start_args:
         return True
-    return native_pane_process_proves(
-        herdr_bin, pane_id, participant.reopen_process_argv0, participant.reopen_process_args
-    )
+    return native_pane_process_proves(herdr_bin, pane_id, participant.kind, participant.start_args)
 
 
 def live_agent_kind_matches(live_agent: Mapping[str, Any], expected_kind: str) -> bool:
@@ -1017,7 +915,7 @@ def live_agent_kind_matches(live_agent: Mapping[str, Any], expected_kind: str) -
 
 
 def needs_native_proof(participant: Participant) -> bool:
-    return bool(participant.catalog_command or participant.pane_proofs)
+    return bool(participant.catalog_command or participant.start_args)
 
 
 def profile_receipt_payload(profile: str, participants: Sequence[Participant]) -> dict[str, Any]:
@@ -1830,7 +1728,7 @@ def start_participants(
                 continue
             if needs_native_proof(participant) and not (
                 catalog_proof(participant)
-                and reopen_pane_proof(herdr_bin, participant, str(owned["pane_id"]))
+                and participant_process_proves(herdr_bin, participant, str(owned["pane_id"]))
             ):
                 pending = pending_tabs.get(role)
                 if isinstance(pending, dict) and pending.get("blocked_startup") is True:
@@ -1838,7 +1736,7 @@ def start_participants(
                     print(f"pending @{role} trust", flush=True)
                     continue
                 failures.append(
-                    f"@{role}: {name} failed native-ui verification; the session was left open"
+                    f"@{role}: {name} failed process verification; the session was left open"
                 )
                 print(f"unverified @{role}", flush=True)
                 continue
@@ -1961,7 +1859,9 @@ def start_participants(
             wait_for_shell(herdr_bin, pane_id)
             assert_server_identity(state_dir, state_path)
             start_agent(herdr_bin, name, participant.kind, pane_id, participant.start_args)
-            if needs_native_proof(participant) and not pane_proof(herdr_bin, participant, pane_id):
+            if needs_native_proof(participant) and not participant_process_proves(
+                herdr_bin, participant, pane_id
+            ):
                 try:
                     close_pending_participant_tab(
                         herdr_bin, agents_workspace_id, pending_tabs[role], state_dir, state_path
@@ -1974,7 +1874,7 @@ def start_participants(
                 participant_tabs.pop(role, None)
                 save_launcher_state(state_dir, state, state_path)
                 failures.append(
-                    f"@{role}: {name} failed native-ui verification; the new tab was closed"
+                    f"@{role}: {name} failed process verification; the new tab was closed"
                 )
                 print(f"unverified @{role}", flush=True)
                 continue
@@ -2173,7 +2073,7 @@ def main() -> int:
             save_launcher_state(state_dir, state, state_path)
             raise BootstrapError(
                 f"the {profile} profile requires every participant to verify "
-                "native-ui evidence; the room was not opened:\n"
+                "native evidence; the room was not opened:\n"
                 + "\n".join(f"- {failure}" for failure in failures),
                 code="profile_incomplete",
                 failures=failures,
@@ -2271,7 +2171,7 @@ def reverify_profile_participants(
         owned = owned_participant(herdr_bin, participant, agents_cwd)
         if owned is None or not (
             catalog_proof(participant)
-            and reopen_pane_proof(herdr_bin, participant, str(owned["pane_id"]))
+            and participant_process_proves(herdr_bin, participant, str(owned["pane_id"]))
         ):
             raise BootstrapError(
                 f"@{participant.role}: {participant.name} failed room profile re-verification; "
