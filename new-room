@@ -1288,7 +1288,9 @@ def place(
     where the layout puts it is never moved, so a re-run issues no command.
     `compact` moves each owned peer that is not in a workspace labelled
     `agents · group-chat` into that workspace (created on demand with
-    `--no-focus`) as its own tab labelled `<role> · group-chat`. `grid`
+    `--no-focus`) as its own tab labelled `<role> · group-chat`; if Herdr
+    auto-closes that workspace between the list and a move, it is recreated
+    and the move retried exactly once against the new id. `grid`
     moves each owned peer that is not already in the room tab into it as
     the right-hand stack: the room pane is the split anchor, the first
     mover splits it `right` keeping GRID_ROOM_RATIO, and every later mover
@@ -1321,19 +1323,34 @@ def place(
                 target_id = ensure_place_workspace(
                     herdr_bin, str(state.get("agents_cwd") or Path.cwd()), AGENTS_WORKSPACE_LABEL
                 )
-            run_json(
-                herdr_bin,
-                [
-                    "pane",
-                    "move",
-                    str(agent["pane_id"]),
-                    "--workspace",
-                    target_id,
-                    "--new-tab",
-                    "--label",
-                    f"{participant.role} · group-chat",
-                ],
-            )
+            move_arguments = [
+                "pane",
+                "move",
+                str(agent["pane_id"]),
+                "--workspace",
+                target_id,
+                "--new-tab",
+                "--label",
+                f"{participant.role} · group-chat",
+            ]
+            try:
+                run_json(herdr_bin, move_arguments)
+            except BootstrapError as error:
+                if error.code != "workspace_not_found":
+                    raise
+                # Herdr auto-closes a workspace whose last pane leaves, so the
+                # listed target can vanish between the list and this move and
+                # leave peers half-placed. Recreate the labelled workspace
+                # through the same ensure path, retry this move exactly once
+                # against the new id, and keep that id for later movers.
+                target_id = ensure_place_workspace(
+                    herdr_bin,
+                    str(state.get("agents_cwd") or Path.cwd()),
+                    AGENTS_WORKSPACE_LABEL,
+                )
+                retry_arguments = list(move_arguments)
+                retry_arguments[retry_arguments.index("--workspace") + 1] = target_id
+                run_json(herdr_bin, retry_arguments)
             moved.append(participant.role)
     else:
         movers = [
@@ -1675,13 +1692,52 @@ def close_pending_participant_tab(
                 raise
 
 
+def recorded_pane_hosts_participant(herdr_bin: str, pane_id: str, name: str) -> bool:
+    """Whether the recorded pane is live and still hosts the agent `name`.
+
+    The pane's `agent` field is the identity source, with `agent list` as
+    the fallback when the pane record carries no agent. A pane that is
+    gone, hosts no agent, or hosts a different name is not ours to close.
+    """
+    try:
+        pane = run_json(herdr_bin, ["pane", "get", pane_id]).get("result", {}).get("pane")
+    except BootstrapError as error:
+        if error.code == "pane_not_found":
+            return False
+        raise
+    if not isinstance(pane, dict) or not pane:
+        return False
+    agent = pane.get("agent")
+    if isinstance(agent, dict):
+        agent = agent.get("name")
+    if agent is not None and str(agent):
+        return str(agent) == name
+    listed = run_json(herdr_bin, ["agent", "list"])
+    return any(
+        isinstance(item, dict)
+        and item.get("name") == name
+        and str(item.get("pane_id") or "") == pane_id
+        for item in listed.get("result", {}).get("agents", [])
+    )
+
+
 def close_recorded_participant(
     herdr_bin: str,
+    name: str,
     pane_id: str,
     tab_id: str | None,
     state_dir: Path,
     state_path: Path,
-) -> None:
+) -> bool:
+    """Close the recorded tab or pane only while it still hosts `name`.
+
+    Returns whether anything was closed. A recorded id is evidence about
+    the past, never authority over a live pane: when the pane is gone,
+    hosts no agent, or hosts a different name, nothing is closed and the
+    caller drops the stale record instead.
+    """
+    if not recorded_pane_hosts_participant(herdr_bin, pane_id, name):
+        return False
     assert_server_identity(state_dir, state_path)
     arguments = ["tab", "close", tab_id] if tab_id else ["pane", "close", pane_id]
     try:
@@ -1689,6 +1745,7 @@ def close_recorded_participant(
     except BootstrapError as error:
         if error.code not in {"tab_not_found", "pane_not_found"}:
             raise
+    return True
 
 
 def start_participants(
@@ -1703,11 +1760,12 @@ def start_participants(
     """Start (or re-verify) the requested participants, returning setup failures.
 
     Exactly one participant is recorded per role: the same exact named
-    participant is reused, while a different requested name for a recorded role
-    intentionally closes the plugin-recorded tab before starting its
-    replacement. Only participants whose native host evidence verified become
-    routable; a live session under the requested name that mismatches its kind,
-    ownership, or native evidence is excluded without being closed.
+    participant is reused, while a recorded role whose occupant is no longer
+    live has its tab closed only when the recorded pane still hosts that
+    occupant's name; any other recorded id is dropped untouched. Only
+    participants whose native host evidence verified become routable; a live
+    session under the requested name that mismatches its kind, ownership, or
+    native evidence is excluded without being closed.
     """
     if participants is None:
         participants = resolve_profile(None)
@@ -1771,13 +1829,15 @@ def start_participants(
         print(f"start  @{role}", flush=True)
         recorded_pane_id = participant_panes.get(role)
         if recorded_pane_id:
-            # One recorded participant per role: a different requested name
-            # replaces the recorded occupant. The replacement is announced only
-            # once its plugin-recorded tab has actually closed, so a failed
-            # close reports `cleanup @role previous` instead.
+            # One recorded participant per role: the recorded occupant's tab
+            # is closed before its replacement starts, and the replacement is
+            # announced only once that close succeeded, so a failed close
+            # reports `cleanup @role previous` instead; a recorded id whose
+            # pane no longer hosts that occupant is dropped untouched.
             try:
-                close_recorded_participant(
+                closed_previous = close_recorded_participant(
                     herdr_bin,
+                    participant.name,
                     recorded_pane_id,
                     participant_tabs.get(role),
                     state_dir,
@@ -1787,7 +1847,10 @@ def start_participants(
                 failures.append(f"@{role}: previous-tab cleanup failed: {error}")
                 print(f"cleanup @{role} previous", flush=True)
                 continue
-            print(f"replace @{role}", flush=True)
+            print(
+                f"replace @{role}" if closed_previous else f"stale   @{role} record",
+                flush=True,
+            )
             participant_panes.pop(role, None)
             participant_tabs.pop(role, None)
             save_launcher_state(state_dir, state, state_path)

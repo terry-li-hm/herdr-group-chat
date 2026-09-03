@@ -1252,6 +1252,9 @@ def test_exited_recorded_agent_tab_is_closed_before_replacement(
         calls.append(arguments)
         if arguments == ["agent", "list"]:
             return {"result": {"agents": []}}
+        if arguments == ["pane", "get", "w-agents:p-old"]:
+            # The exited occupant is still the pane's reported agent.
+            return {"result": {"pane": {"pane_id": "w-agents:p-old", "agent": "pi-peer"}}}
         if arguments == ["tab", "close", "w-agents:t-old"]:
             raise BootstrapError("temporary failure", code="server_unavailable")
         raise AssertionError(arguments)
@@ -1269,6 +1272,126 @@ def test_exited_recorded_agent_tab_is_closed_before_replacement(
     assert failures and "previous-tab cleanup failed" in failures[0]
     assert state["participant_pane_ids"]["pi"] == "w-agents:p-old"
     assert not any(call[:2] == ["tab", "create"] for call in calls)
+
+
+def install_recorded_close_host(
+    monkeypatch: pytest.MonkeyPatch,
+    pane_get: Callable[[str], dict | None],
+) -> list[list[str]]:
+    """Fake Herdr answering only the reads a recorded-close decision needs.
+
+    `pane_get` maps a pane id to its `pane get` payload, or None when the
+    pane is gone. The catalog preflight always fails, so a run stops right
+    after the recorded-id decision and never creates a replacement tab.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {"result": {"agents": []}}
+        if arguments[:2] == ["pane", "get"]:
+            payload = pane_get(arguments[2])
+            if payload is None:
+                raise BootstrapError("pane gone", code="pane_not_found")
+            return payload
+        if arguments[:2] in (["tab", "close"], ["pane", "close"]):
+            return {"result": {"type": "ok"}}
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    monkeypatch.setattr(module, "catalog_proof", lambda _participant: False)
+    return calls
+
+
+def recorded_close_scenario(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    pane_get: Callable[[str], dict | None],
+) -> tuple[list[list[str]], dict, list[str]]:
+    """Run `start_participants` over one recorded pi role; harvest the evidence."""
+    monkeypatch.setattr(module, "PARTICIPANTS", (("pi", "pi-peer"),))
+    state: dict = {
+        "schema_version": 1,
+        "participant_pane_ids": {"pi": "w-agents:p-old"},
+        "participant_tab_ids": {"pi": "w-agents:t-old"},
+    }
+    calls = install_recorded_close_host(monkeypatch, pane_get)
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+    )
+    return calls, state, capsys.readouterr().out.splitlines() + failures
+
+
+def test_recorded_participant_tab_is_closed_while_it_still_hosts_the_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A recorded pane still hosting the participant is closed as before."""
+    calls, state, output = recorded_close_scenario(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        lambda pane_id: {"result": {"pane": {"pane_id": pane_id, "agent": "pi-peer"}}},
+    )
+    assert ["pane", "get", "w-agents:p-old"] in calls
+    assert ["tab", "close", "w-agents:t-old"] in calls
+    assert calls.index(["pane", "get", "w-agents:p-old"]) < calls.index(
+        ["tab", "close", "w-agents:t-old"]
+    )
+    assert "replace @pi" in output
+    assert "pi" not in state.get("participant_pane_ids", {})
+
+
+def test_recorded_participant_ids_are_dropped_when_the_pane_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls, state, output = recorded_close_scenario(
+        tmp_path, monkeypatch, capsys, lambda _pane_id: None
+    )
+    assert ["pane", "get", "w-agents:p-old"] in calls
+    assert not any(call[:2] in (["tab", "close"], ["pane", "close"]) for call in calls)
+    assert "stale   @pi record" in output
+    assert "pi" not in state.get("participant_pane_ids", {})
+    assert "pi" not in state.get("participant_tab_ids", {})
+
+
+def test_recorded_participant_ids_are_dropped_when_the_pane_is_a_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A pane hosting no agent is not the recorded occupant, so it stays open."""
+    calls, state, output = recorded_close_scenario(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        lambda pane_id: {"result": {"pane": {"pane_id": pane_id}}},
+    )
+    assert ["pane", "get", "w-agents:p-old"] in calls
+    assert not any(call[:2] in (["tab", "close"], ["pane", "close"]) for call in calls)
+    assert "stale   @pi record" in output
+    assert "pi" not in state.get("participant_pane_ids", {})
+
+
+def test_recorded_participant_ids_are_dropped_when_the_pane_hosts_another_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A pane reused by a different agent is never closed on a stale id."""
+    calls, state, output = recorded_close_scenario(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        lambda pane_id: {"result": {"pane": {"pane_id": pane_id, "agent": "stranger-peer"}}},
+    )
+    assert ["pane", "get", "w-agents:p-old"] in calls
+    assert not any(call[:2] in (["tab", "close"], ["pane", "close"]) for call in calls)
+    assert "stale   @pi record" in output
+    assert "pi" not in state.get("participant_pane_ids", {})
 
 
 def test_definite_pane_open_failure_clears_pending_operation(
@@ -4093,6 +4216,16 @@ def install_role_replacement_host(
                     code="agent_not_found",
                 )
             return {"result": {"agent": matches[0]}}
+        if arguments[:2] == ["pane", "get"]:
+            # The pane reports the agent it hosts; a pane without one is a shell.
+            occupant = next(
+                (agent["name"] for agent in live_agents if agent.get("pane_id") == arguments[2]),
+                None,
+            )
+            pane: dict[str, object] = {"pane_id": arguments[2]}
+            if occupant:
+                pane["agent"] = occupant
+            return {"result": {"pane": pane}}
         if arguments[:2] == ["pane", "process-info"]:
             # A reused peer runs its participant's exact foreground argv under
             # the protocol-21 ``name`` identity field.
@@ -4164,9 +4297,9 @@ def test_classic_room_replaces_only_the_recorded_grok_role_and_keeps_profile_pee
     )
 
     assert failures == []
-    assert [call for call in calls if call[:2] == ["tab", "close"]] == [
-        ["tab", "close", "w-agents:t-grok"]
-    ]
+    # The recorded tab hosts the live grok46-peer, not the requested grok-peer,
+    # so the stale record is dropped without closing the profile peer's tab.
+    assert not any(call[:2] in (["tab", "close"], ["pane", "close"]) for call in calls)
     starts = {call[2]: call for call in calls if call[:2] == ["agent", "start"]}
     assert set(starts) == {"pi-peer", "claude-peer", "codex-peer", "grok-peer"}
     recorded_grok_pane = state["participant_pane_ids"]["grok"]
@@ -4178,7 +4311,7 @@ def test_classic_room_replaces_only_the_recorded_grok_role_and_keeps_profile_pee
     assert state["participant_tab_ids"]["sol"] == "w-agents:t-sol"
     assert state["participant_tab_ids"]["fable"] == "w-agents:t-fable"
     assert state["participant_tab_ids"]["grok"] != "w-agents:t-grok"
-    assert "replace @grok" in capsys.readouterr().out.splitlines()
+    assert "stale   @grok record" in capsys.readouterr().out.splitlines()
 
 
 def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
@@ -4247,9 +4380,8 @@ def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
     )
 
     assert failures == []
-    assert [call for call in calls if call[:2] == ["tab", "close"]] == [
-        ["tab", "close", "w-agents:t-grok-peer"]
-    ]
+    # The recorded tab hosts the live grok-peer, not the requested grok46-peer.
+    assert [call for call in calls if call[:2] == ["tab", "close"]] == []
     starts = {call[2]: call for call in calls if call[:2] == ["agent", "start"]}
     assert set(starts) == {"grok46-peer"}
     grok46 = starts["grok46-peer"]
@@ -4267,7 +4399,7 @@ def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
         "grok": "w-agents:t-fresh1",
     }
     output = capsys.readouterr().out.splitlines()
-    assert "replace @grok" in output
+    assert "stale   @grok record" in output
     assert "ready  @sol (existing sol-peer)" in output
     assert "ready  @fable (existing fable-peer)" in output
 
@@ -4294,9 +4426,7 @@ def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
         )
         == []
     )
-    assert [call for call in pi_calls if call[:2] == ["tab", "close"]] == [
-        ["tab", "close", "w-agents:t-grok"]
-    ]
+    assert [call for call in pi_calls if call[:2] == ["tab", "close"]] == []
     pi_starts = {call[2]: call for call in pi_calls if call[:2] == ["agent", "start"]}
     assert set(pi_starts) == {"grok46pi-peer"}
     assert pi_state["participant_pane_ids"] == {
@@ -4328,9 +4458,7 @@ def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
         )
         == []
     )
-    assert [call for call in native_calls if call[:2] == ["tab", "close"]] == [
-        ["tab", "close", "w-agents:t-grokpi"]
-    ]
+    assert [call for call in native_calls if call[:2] == ["tab", "close"]] == []
     native_starts = {call[2]: call for call in native_calls if call[:2] == ["agent", "start"]}
     assert set(native_starts) == {"grok46-peer"}
     assert native_state["participant_pane_ids"] == {
@@ -6105,6 +6233,83 @@ def test_place_compact_creates_the_labelled_workspace_on_demand(
         == []
     )
     assert not any(call[:2] in (["pane", "move"], ["workspace", "create"]) for call in calls)
+
+
+def test_place_compact_recreates_a_workspace_that_vanished_mid_placement(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Herdr auto-closes an emptied workspace between the list and the move."""
+    calls: list[list[str]] = []
+    workspace_gone = {"gone": False}
+    created = {"id": ""}
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["workspace", "list"]:
+            workspaces = [
+                {"workspace_id": "w-caller", "focused": True, "active_tab_id": "w-caller:t9"}
+            ]
+            if not workspace_gone["gone"]:
+                workspaces.insert(0, {"workspace_id": "w-agents", "label": "agents · group-chat"})
+            if created["id"]:
+                workspaces.insert(
+                    0, {"workspace_id": created["id"], "label": "agents · group-chat"}
+                )
+            return {"result": {"workspaces": workspaces}}
+        if arguments[:2] == ["workspace", "create"]:
+            assert arguments[arguments.index("--label") + 1] == "agents · group-chat"
+            assert "--no-focus" in arguments
+            assert arguments[arguments.index("--cwd") + 1] == PLACE_AGENTS_CWD
+            created["id"] = "w-new"
+            return {"result": {"workspace": {"workspace_id": "w-new"}}}
+        if arguments[:2] == ["agent", "get"]:
+            name = arguments[2]
+            workspace_id = created["id"] or "w-room"
+            return place_agent_record(
+                name,
+                "pi",
+                pane_id=f"{workspace_id}:p-{name}",
+                tab_id=f"{workspace_id}:t-{name}",
+                workspace_id=workspace_id,
+            )
+        if arguments[:2] == ["pane", "move"]:
+            if arguments[arguments.index("--workspace") + 1] == "w-agents":
+                # The labelled workspace lost its last pane and auto-closed.
+                workspace_gone["gone"] = True
+                raise BootstrapError("workspace gone", code="workspace_not_found")
+            return {"result": {"type": "ok"}}
+        if arguments[:2] in (["workspace", "focus"], ["tab", "focus"]):
+            return {"result": {"type": "ok"}}
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {"agents_cwd": PLACE_AGENTS_CWD}
+    assert module.place(
+        "herdr",
+        "compact",
+        state,
+        module.resolve_profile("sol-fable")[:1],
+        room_pane_id="",
+        room_tab_id="",
+        room_workspace_id="",
+    ) == ["sol"]
+    assert [
+        "workspace",
+        "create",
+        "--cwd",
+        PLACE_AGENTS_CWD,
+        "--label",
+        "agents · group-chat",
+        "--no-focus",
+    ] in calls
+    moves = [call for call in calls if call[:2] == ["pane", "move"]]
+    assert len(moves) == 2
+    assert moves[0][moves[0].index("--workspace") + 1] == "w-agents"
+    assert moves[1][moves[1].index("--workspace") + 1] == "w-new"
+    assert moves[1][2] == moves[0][2]
+    assert calls[-2:] == [["workspace", "focus", "w-caller"], ["tab", "focus", "w-caller:t9"]]
+    assert not any(call[:2] == ["workspace", "close"] for call in calls)
 
 
 def test_launch_passes_layout_env_and_opus_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

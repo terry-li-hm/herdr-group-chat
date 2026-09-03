@@ -52,6 +52,23 @@ Phase B of the 0.12 redesign:
   layout is determined live from one `agent get` of the first roster
   participant against the room's own tab, never from the launcher state file.
 
+Phase C of the 0.12 redesign, hardenings from the Grok challenge:
+
+- **Compact placement survives Herdr auto-closing the labelled workspace.**
+  When a `pane move` into the `agents · group-chat` workspace fails with
+  `workspace_not_found` — Herdr closes any workspace whose last pane leaves,
+  so the target can vanish between the list and the move — the launcher
+  recreates the labelled workspace unfocused through the same ensure path,
+  retries that move exactly once against the new id, and uses the new id for
+  every later mover; any other error, or a second failure, still raises.
+- **Stale recorded pane ids never close a foreign pane.** Before closing a
+  recorded participant tab the launcher now reads `pane get` on the recorded
+  pane and closes it only when the pane still hosts that participant's
+  agent name (falling back to `agent list` when the pane record carries no
+  agent). A pane that is gone, hosts no agent, or hosts a different name
+  leaves its recorded ids dropped from state with nothing closed, reported
+  as `stale @<role> record` in the launcher's system lines.
+
 ## [0.11.3] - 2026-09-03
 
 - Relaunching a grid-layout room no longer aborts after the peers are
