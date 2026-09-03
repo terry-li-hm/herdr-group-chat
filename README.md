@@ -375,13 +375,14 @@ missing participants, and then becomes a fresh `group-chat` room. **New classic
 four-agent chat** separately opens the Pi/Claude/Codex/Grok composition. New
 launches replace the previous plugin-owned room pane but retain that room's
 transcript. Fresh launches never steal your focus, even when an earlier room
-already exists: the recorded room pane is revalidated through read-only tab
-listing, the replacement pane opens with `--no-focus`, and the `group-chat`
-and `agents · group-chat` workspaces are created without focus, so you stay
-where you were. **Open group chat** focuses
-the exact recorded plugin pane or
-reopens the last room without starting models; because that action is
+already exists: the replacement pane opens with `--no-focus`, and the
+`group-chat` and `agents · group-chat` workspaces are created without focus,
+so you stay where you were. **Open group chat** focuses the recorded plugin
+pane or reopens the last room without starting models; because that action is
 explicitly focus-oriented, recreating a missing room pane may take focus.
+Reopen never depends on the old room pane surviving: a missing pane or a
+workspace Herdr has since closed simply means a fresh room pane opens in the
+recorded or a newly created chat workspace.
 The transcript and input remain visible while you switch among participant
 tabs. Failed cleanup remains recorded for a later retry instead of silently
 losing ownership of the old pane. Participant setup failures are recorded as
@@ -391,11 +392,18 @@ rather than silently offline.
 Compact mode keeps the room alone in the initiating workspace and places the
 participant tabs in a secondary `agents · group-chat` workspace, with each
 participant tab labeled `<role> · group-chat` (for example `pi · group-chat` or
-`sol · group-chat`). These labels are display-only; routing and reuse still key
-on the exact recorded workspace and pane identifiers. Enter `/agents` to
-reveal that workspace or `/show pi`, `/show claude`, `/show codex`, or `/show
-grok` to focus one native agent directly. Use Herdr's workspace switcher or
-**Open group chat** to return.
+`sol · group-chat`). A participant is owned when `agent get` reports it live
+with the matching kind and the room's cwd, nothing else, so routing and reuse
+key on the agent's name and the recorded pane, tab and workspace ids are
+display caches that no decision branches on. Placement is one re-runnable
+step: it reads only live state, moves each owned peer that is not already
+where the layout puts it, records your workspace and tab before the first move
+and restores them after the last, and never closes a workspace — Herdr closes
+an emptied one itself. `./new-room --place compact` or `--place grid` re-runs
+that step for the recorded room at any time and prints one JSON result line.
+Enter `/agents` to reveal the backstage workspace or `/show pi`, `/show
+claude`, `/show codex`, or `/show grok` to focus one native agent directly.
+Use Herdr's workspace switcher or **Open group chat** to return.
 
 If Codex reports unreviewed lifecycle hooks during startup, setup detects the
 dialog even when the pane read clips its text, retries briefly while it renders,
@@ -431,20 +439,22 @@ runs Claude Code as `fable-peer` with `--model fable --effort high` and no
 fallback. Before either participant becomes routable, the launcher verifies
 native host evidence: Sol requires an exact `openai-codex  gpt-5.6-sol` row
 from `pi --list-models gpt-5.6-sol`, with no competing provider for that exact
-model id, plus the model and high-thinking tokens in the native pane; Fable
-requires `Fable 5` and `high effort` in its native
-pane. Reads retry briefly because startup UIs render asynchronously, and both the
-catalog row and the pane evidence are matched as exact tokens and bounded
-sequences, so lookalikes such as `gpt-5.6-sol-01` or `Fable 5-deluxe` never
-verify. A `sol-fable` room is atomic: if any required role fails, the launch
+model id; after start, each participant's live pane is proven through
+`pane process-info`, whose foreground process must be exactly the
+participant's executable and carry its start arguments as one contiguous argv
+sequence. Reads retry briefly because startups are asynchronous, so a
+lookalike model string, reordered arguments, or an MCP child process with the
+right flags never verifies, and a model rename in a vendor UI can no longer
+break a launch because screen text is never evidence. A `sol-fable` room is
+atomic: if any required role fails, the launch
 or reopen fails closed and no room opens. A mismatching existing session is
 left open and excluded; a newly created tab that fails verification is closed
-and never routed. The room records one non-secret `native-ui verified` system
-receipt per profile in the transcript, generated only after complete
-verification and deduplicated across reopens by its exact structured payload;
-this describes what the launcher saw in the native UIs, not a cryptographic or
-model-service attestation. Sol synthesizes reviews by default, and the classic
-four-agent composition is unchanged.
+and never routed. The room records one non-secret verified system receipt per
+profile in the transcript, generated only after complete verification and
+deduplicated across reopens by its exact structured payload; this describes
+what the launcher observed on the host, not a cryptographic or model-service
+attestation. Sol synthesizes reviews by default, and the classic four-agent
+composition is unchanged.
 
 ## Default Sol + Fable + Pi-xAI Grok profile
 
@@ -456,9 +466,10 @@ no fallback provider, model, effort, or native Grok Build invocation.
 
 Before `@grok` becomes routable, Pi must return the exact `xai  grok-4.6` row
 from `pi --list-models grok-4.6`, with no competing provider for that exact
-model id. Its native pane must contain the bounded `grok-4.6 • high` token
-sequence. The same proof is required when reopening. Lookalikes, split model
-tokens, wrong separators, and wrong effort fail closed.
+model id, and its live pane's foreground process must be `pi` carrying
+`--provider xai --model grok-4.6 --thinking high` contiguously. The same
+proof is required when reopening. Lookalikes, split model tokens, and wrong
+effort fail closed.
 The atomic receipt carries harness `pi`, provider `xai`, model `grok-4.6`, and
 effort `high` only after every role verifies.
 
@@ -480,21 +491,25 @@ With `layout = "grid"`, the default room becomes one tab: the room pane on the
 left and each participant's native session stacked on the right in roster
 order, so the group chat and every model's own dialogue are visible together.
 Peers still start and verify in the backstage workspace exactly as in compact
-layout; only after the whole profile verifies are they moved, their recorded
-pane ids rewritten, and the caller's workspace and tab restored. `/agents`
+layout; once every participant is owned, the placement step moves each peer
+that is not already in the room tab into it — the room pane anchors the stack,
+and the probed split ratios keep the right-hand column at equal heights —
+then restores your workspace and tab. `/agents`
 reports the backstage workspace as unavailable in grid layout; `/show <role>`
-focuses the peer pane inside the room tab.
+focuses the peer pane inside the room tab. `./new-room --place grid` rebuilds
+the stack for the recorded room at any time; `--place compact` moves every
+owned peer back into an `agents · group-chat` workspace.
 
 With `opus = true`, `New group chat` launches the `sol-fable-grok-opus-pi`
 profile: `@sol`, `@fable` and `@grok` as before plus `@opus` running Claude
-Code as `opus-peer` with `--model opus --effort high`, verified by the bounded
-`Opus 5` and `high effort` tokens in its native pane. Sol synthesises reviews.
+Code as `opus-peer` with `--model opus --effort high`, proven by the exact
+foreground-process argv on its live pane. Sol synthesises reviews.
 
 ## Retained native Sol + Fable + Grok profile
 
 `New Sol + Fable + Grok native chat` retains `sol-fable-grok` for stored rooms
 and explicit new launches. Its `@grok` remains Grok Build `grok46-peer` with
-the existing exact native arguments and pane-plus-process re-verification.
+the existing exact native arguments, proven by its foreground process.
 Switching between native and Pi-xAI profiles replaces the single `@grok` role
 and closes the prior profile-owned Grok tab under the existing replacement semantics.
 Stored `sol-fable-grok`, `sol-fable`, and classic rooms keep their own profiles.
@@ -509,12 +524,10 @@ opens the bounded three-role `sol-fable-glm` room: the existing `@sol` and
 native arguments `--provider bigmodel-coding --model glm-5.3 --thinking high`
 and no fallback. Before `@glm` becomes routable, the launcher requires the
 exact `bigmodel-coding  glm-5.3` catalog row from `pi --list-models glm-5.3`
-with no competing provider for that exact model id, plus the bounded `glm-5.3`
-bullet `high` token sequence in its native pane; a live canary confirmed Pi
-keeps `glm-5.3 • high` on its status and footer lines after the first turn, so
-the same pane proof applies on reopen and, like Sol, no foreground-process argv
-evidence is required. Suffixed or split
-lookalikes such as `glm-5.3.1` or `glm 5.3` never verify. The room is atomic:
+with no competing provider for that exact model id, plus the foreground
+process `pi` carrying `--provider bigmodel-coding --model glm-5.3 --thinking
+high` contiguously on its live pane. Suffixed or split lookalikes such as
+`glm-5.3.1` or `glm 5.3` never verify. The room is atomic:
 if any of the three roles fails verification, the launch or reopen fails
 closed, no room opens, and the non-secret `native-ui verified` receipt —
 carrying harness `pi`, provider `bigmodel-coding`, model `glm-5.3`, effort
@@ -568,18 +581,15 @@ See [SECURITY.md](SECURITY.md) for private vulnerability reporting and
 
 **After a Herdr restart.** A server restart gives the launcher a new
 server-instance state key, so its fresh state has no participant records while
-the previous launch's peers stay live in the `agents · group-chat` workspace.
-Every such peer then fails the ownership check with the exact reason (different
-workspace, different cwd, or pane not recorded), and an atomic profile aborts
-with `profile_incomplete` listing each failed role. Run the **Adopt stale
-group-chat peers** action (or `./new-room --adopt-peers`) to re-record the
-orphaned peers: it verifies each live peer's kind and native evidence, adopts
-only when all of them share exactly one `agents · group-chat` workspace that no
-other launcher state file still claims and one common cwd, and never closes,
-prompts, or moves a pane. On success it records the workspace, the common cwd,
-and each adopted pane and tab, after which the normal launch actions reuse the
-peers; a previous empty placeholder workspace is left untouched and named in
-the summary.
+the previous launch's peers stay live. Ownership is by name, so peers whose
+kind and cwd still match are reused directly by the next launch; only a peer
+running under a different cwd needs re-recording. Run the **Adopt stale
+group-chat peers** action (or `./new-room --adopt-peers`) to see the current
+state of every configured role: it runs the owned check for each one against
+the recorded room cwd (or the cwd you invoke it from) and reports which are
+owned and why the rest are not, recording the owned roles' live panes and tabs
+as display caches. It never closes, prompts, or moves a pane, and workspace
+labels carry no weight in its verdict.
 
 The setup pane and the room pane are short-lived processes, so a launcher
 failure would otherwise vanish with the pane. Every failure — a known setup

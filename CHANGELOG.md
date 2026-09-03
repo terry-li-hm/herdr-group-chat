@@ -2,6 +2,40 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+Phase A of the 0.12 redesign ([docs/0.12-redesign.md](docs/0.12-redesign.md)):
+the launcher stops owning Herdr topology it cannot control.
+
+- **Ownership by name.** A participant is owned exactly when `agent get`
+  reports it live with the matching kind and the room's cwd. Fresh launch,
+  reopen and `adopt-peers` all reduce to that single check; the recorded
+  workspace, pane and tab identifiers lose all authority and become display
+  caches, the workspace-label refusal and cross-state workspace claims are
+  deleted, and `adopt-peers` now reports which roles are owned and why the
+  rest are not.
+- **Identity by process.** The only post-start native proof is
+  `pane process-info`: the foreground process must be exactly the
+  participant's executable and carry its start arguments as one contiguous
+  argv. Every screen-token banner proof, the scrollback fallback and the
+  reopen proof variants are deleted; the Pi catalog preflight is unchanged.
+- **Placement as a re-runnable step.** `place(layout)` runs after ownership
+  from live state alone: compact moves each owned peer that is not in an
+  `agents · group-chat` workspace into one (created unfocused on demand),
+  grid moves each peer that is not already in the room tab into the
+  right-hand stack anchored on the room pane with the probed split ratios.
+  It is idempotent, restores the caller's focus, never closes a workspace,
+  and `./new-room --place <compact|grid>` re-runs it on demand.
+- **Workspace lifecycle is Herdr's.** `close_empty_agents_workspace` is
+  deleted; every list or focus on a possibly-vanished id treats
+  `workspace_not_found` and `tab_not_found` as already gone.
+- **Reopen never depends on a room pane existing.** A missing recorded room
+  pane opens a new one in the recorded or a freshly created chat workspace,
+  and the recorded-id revalidation that could wipe launcher state is gone.
+- **Migration.** Older launcher state files are read for `last_room_id`,
+  `selected_profile`, `layout` and the room ids only; unknown or stale id
+  fields are ignored, never errors.
+
 ## [0.11.3] - 2026-09-03
 
 - Relaunching a grid-layout room no longer aborts after the peers are

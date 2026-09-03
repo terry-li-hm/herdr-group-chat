@@ -1051,6 +1051,55 @@ def test_participant_start_does_not_move_a_globally_named_external_agent(
     assert calls == [["agent", "list"], ["agent", "get", "pi-peer"]]
 
 
+def test_owned_participant_is_the_live_record_with_matching_kind_and_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    participant = module.Participant(role="fable", kind="claude", name="fable-peer")
+    record = {
+        "name": "fable-peer",
+        "kind": "claude",
+        "cwd": "/srv/room",
+        "pane_id": "w-agents:p-fable",
+        "tab_id": "w-agents:t-fable",
+        "workspace_id": "w-anywhere",
+    }
+
+    def install(agent: dict | None, code: str | None = None) -> None:
+        def fake_run_json(
+            _herdr_bin: str, arguments: list[str], timeout: float | None = 30
+        ) -> dict:
+            del timeout
+            assert arguments == ["agent", "get", "fable-peer"]
+            if agent is None:
+                raise BootstrapError("not found", code=code or "agent_not_found")
+            return {"result": {"agent": agent}}
+
+        monkeypatch.setattr(module, "run_json", fake_run_json)
+
+    install(dict(record))
+    assert module.owned_participant("herdr", participant, "/srv/room") == record
+    # cwd equivalence is resolved, not literal.
+    assert module.owned_participant("herdr", participant, "/srv/room/") == record
+    # Each negative: absent agent, different kind, different cwd.
+    install(None)
+    assert module.owned_participant("herdr", participant, "/srv/room") is None
+    install({**record, "kind": "pi"})
+    assert module.owned_participant("herdr", participant, "/srv/room") is None
+    install({**record, "cwd": "/srv/elsewhere"})
+    assert module.owned_participant("herdr", participant, "/srv/room") is None
+    install({**record, "cwd": None, "foreground_cwd": "/srv/room"})
+    assert module.owned_participant("herdr", participant, "/srv/room") == {
+        **record,
+        "cwd": None,
+        "foreground_cwd": "/srv/room",
+    }
+    # A reporting error still raises; only agent_not_found means absent.
+    install(None, code="server_unavailable")
+    with pytest.raises(BootstrapError) as raised:
+        module.owned_participant("herdr", participant, "/srv/room")
+    assert raised.value.code == "server_unavailable"
+
+
 @pytest.mark.parametrize(
     ("reported_kind", "reported_agent"),
     [("claude", "pi"), ("pi", "claude")],
