@@ -179,6 +179,41 @@ def test_invalid_launcher_state_fails_closed(tmp_path: Path) -> None:
         load_launcher_state(tmp_path)
 
 
+def test_migration_reads_an_old_state_file_with_stale_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 0.11 state file loads: its ids are data, and unknown fields are ignored."""
+    old_state = {
+        "schema_version": 1,
+        "chat_workspace_id": "w-dead-chat",
+        "agents_workspace_id": "w-dead-agents",
+        "room_pane_id": "w-dead-chat:p-dead",
+        "room_tab_id": "w-dead-chat:t-dead",
+        "last_room_id": "chat-old",
+        "selected_profile": "sol-fable-grok",
+        "layout": "grid",
+        "agents_cwd": "/gone/room",
+        "participant_pane_ids": {"sol": "w-dead:p-1", "fable": "w-dead:p-2"},
+        "participant_tab_ids": {"sol": "w-dead:t-1", "fable": "w-dead:t-2"},
+        "participant_workspace_id": "w-dead-room",
+        "chat_placeholder_tab_id": "w-dead-chat:t-ph",
+        "agents_placeholder_tab_id": "w-dead-agents:t-ph",
+        "stale_room_pane_ids": ["w-dead-chat:p-older"],
+        "future_unknown_field": {"anything": ["goes", 1]},
+    }
+    save_launcher_state(tmp_path, old_state)
+
+    state = load_launcher_state(tmp_path)
+
+    assert state["last_room_id"] == "chat-old"
+    assert state["selected_profile"] == "sol-fable-grok"
+    assert state["layout"] == "grid"
+    assert state["room_pane_id"] == "w-dead-chat:p-dead"
+    assert state["room_tab_id"] == "w-dead-chat:t-dead"
+    assert state["chat_workspace_id"] == "w-dead-chat"
+    assert state["future_unknown_field"] == {"anything": ["goes", 1]}
+
+
 def test_launcher_state_is_partitioned_by_herdr_socket(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -420,6 +420,13 @@ def launcher_state_path(state_dir: Path) -> Path:
 
 
 def _validate_launcher_state(state: object) -> dict[str, Any]:
+    """Validate the fields this version reads; unknown fields are ignored.
+
+    Migration: an older launcher's state is read for `last_room_id`,
+    `selected_profile`, `layout` and the room ids only. Stale recorded ids are
+    carried as data and never validated against live Herdr, and fields this
+    version does not know are ignored rather than rejected.
+    """
     if not isinstance(state, dict) or state.get("schema_version") != LAUNCHER_STATE_VERSION:
         raise BootstrapError("invalid launcher state schema")
     string_fields = (
@@ -437,6 +444,8 @@ def _validate_launcher_state(state: object) -> dict[str, Any]:
         "pending_room_profile",
         "selected_profile",
         "agents_cwd",
+        "layout",
+        "participant_workspace_id",
     )
     if any(field in state and not isinstance(state[field], str) for field in string_fields):
         raise BootstrapError("invalid launcher state fields")
