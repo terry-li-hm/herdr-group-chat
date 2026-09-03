@@ -2565,13 +2565,20 @@ def process_running(argv0: str, args: tuple[str, ...]) -> list[dict]:
     return [{"name": argv0, "argv": [argv0, *args]}]
 
 
+def rewritten_title_process(name: str) -> list[dict]:
+    """One foreground process that rewrote its own title, as Herdr reports it."""
+    return [{"name": name, "cmdline": name, "argv": [name]}]
+
+
+# Pi rewrites its own process title, so Herdr can never report its start argv.
+PI_PROCESS = rewritten_title_process("pi")
 PARTICIPANT_PROCESSES: dict[str, list[dict]] = {
-    "sol-peer": process_running("pi", module.SOL_PARTICIPANT.start_args),
+    "sol-peer": list(PI_PROCESS),
     "fable-peer": CLAUDE_FABLE_PROCESS,
     "opus-peer": process_running("claude", module.OPUS_PARTICIPANT.start_args),
     "grok46-peer": process_running("grok", module.GROK_START_ARGS),
-    "glm-peer": process_running("pi", module.GLM_PARTICIPANT.start_args),
-    "grok46pi-peer": process_running("pi", module.GROK_PI_PARTICIPANT.start_args),
+    "glm-peer": list(PI_PROCESS),
+    "grok46pi-peer": list(PI_PROCESS),
 }
 # Freshly created tabs are addressed by role; the profile rosters fix which
 # participant each role starts in the tests that rely on the default.
@@ -2584,6 +2591,50 @@ ROLE_PROCESSES: dict[str, list[dict]] = {
 }
 
 
+# The session-file identities `agent get` can report for each Pi participant.
+PI_SESSION_IDENTITIES: dict[str, tuple[str, str]] = {
+    "sol-peer": ("openai-codex", "gpt-5.6-sol"),
+    "glm-peer": ("bigmodel-coding", "glm-5.3"),
+    "grok46pi-peer": ("xai", "grok-4.6"),
+}
+
+
+def pi_session_lines(provider: str, model: str, effort: str = "high") -> str:
+    """The session events a started Pi agent writes for this exact identity."""
+    return (
+        json.dumps({"type": "session", "version": 3, "id": "s0", "timestamp": "t0", "cwd": "/w"})
+        + "\n"
+        + json.dumps(
+            {
+                "type": "model_change",
+                "id": "m0",
+                "parentId": "s0",
+                "timestamp": "t1",
+                "provider": provider,
+                "modelId": model,
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "thinking_level_change",
+                "id": "k0",
+                "parentId": "m0",
+                "timestamp": "t2",
+                "thinkingLevel": effort,
+            }
+        )
+        + "\n"
+    )
+
+
+def write_pi_session(tmp_path: Path, name: str, content: str) -> Path:
+    """Write one Pi session file and return its path."""
+    path = tmp_path / f"session-{name}.jsonl"
+    path.write_text(content)
+    return path
+
+
 def install_profile_host(
     monkeypatch: pytest.MonkeyPatch,
     calls: list[list[str]],
@@ -2592,8 +2643,16 @@ def install_profile_host(
     live_agents: list[dict] | None = None,
     process_infos: dict[str, list[dict]] | None = None,
     workspaces: list[dict] | None = None,
+    tmp_path: Path | None = None,
+    agent_sessions: dict[str, Path | str | None] | None = None,
 ) -> None:
-    """Fake Herdr plus the native Pi catalog for profile participant flows."""
+    """Fake Herdr plus the native Pi catalog for profile participant flows.
+
+    With `tmp_path`, every configured Pi participant gets a valid session file
+    that `agent get` reports through `agent_session`; `agent_sessions` overrides
+    per name with a path (used as-is, may not exist), raw file content, or
+    None for no session at all.
+    """
     catalog_rows = catalog_rows if catalog_rows is not None else {}
     live_agents = [] if live_agents is None else live_agents
     workspaces = (
@@ -2612,6 +2671,22 @@ def install_profile_host(
         if agent.get("name") in PARTICIPANT_PROCESSES and agent.get("pane_id")
     }
     pane_processes.update(process_infos or {})
+    sessions: dict[str, str] = {}
+    if tmp_path is not None:
+        for name, (provider, model) in PI_SESSION_IDENTITIES.items():
+            if agent_sessions is None or name not in agent_sessions:
+                sessions[name] = str(
+                    write_pi_session(tmp_path, name, pi_session_lines(provider, model))
+                )
+    for name, value in (agent_sessions or {}).items():
+        if value is None:
+            sessions.pop(name, None)
+        elif isinstance(value, str):
+            assert tmp_path is not None
+            sessions[name] = str(write_pi_session(tmp_path, name, value))
+        else:
+            sessions[name] = str(value)
+    started_agents: dict[str, dict] = {}
 
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
@@ -2620,12 +2695,19 @@ def install_profile_host(
             return {"result": {"agents": live_agents}}
         if arguments[:2] == ["agent", "get"]:
             matches = [item for item in live_agents if item.get("name") == arguments[2]]
-            if not matches:
-                raise BootstrapError(
-                    json.dumps({"error": {"code": "agent_not_found", "message": "not found"}}),
-                    code="agent_not_found",
-                )
-            return {"result": {"agent": matches[0]}}
+            if matches:
+                record = dict(matches[0])
+            else:
+                started = started_agents.get(arguments[2])
+                if started is None:
+                    raise BootstrapError(
+                        json.dumps({"error": {"code": "agent_not_found", "message": "not found"}}),
+                        code="agent_not_found",
+                    )
+                record = dict(started)
+            if arguments[2] in sessions:
+                record["agent_session"] = {"kind": "path", "value": sessions[arguments[2]]}
+            return {"result": {"agent": record}}
         if arguments == ["workspace", "list"]:
             return {"result": {"workspaces": workspaces}}
         if arguments[:2] == ["tab", "create"]:
@@ -2647,6 +2729,7 @@ def install_profile_host(
                 pane,
                 PARTICIPANT_PROCESSES.get(arguments[2], [{"name": kind, "argv": [kind]}]),
             )
+            started_agents[arguments[2]] = {"name": arguments[2], "kind": kind, "pane_id": pane}
             return {"result": {"type": "ok"}}
         if arguments[:2] == ["pane", "process-info"]:
             pane = arguments[arguments.index("--pane") + 1]
@@ -2680,6 +2763,7 @@ def test_sol_fable_start_uses_exact_ordered_participants_and_native_argv(
         monkeypatch,
         calls,
         {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        tmp_path=tmp_path,
     )
     state: dict = {"schema_version": 1}
 
@@ -2856,6 +2940,7 @@ def test_failed_catalog_preflight_creates_and_starts_no_sol_tab(
         calls,
         {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
         catalog_rows={("openai-codex", "gpt-5.6-sol"): False},
+        tmp_path=tmp_path,
     )
     state: dict = {"schema_version": 1}
 
@@ -2885,6 +2970,7 @@ def test_new_tab_failing_pane_verification_is_closed_and_not_routable(
         calls,
         {"w-agents:p-fable": "Claude Code\n"},
         process_infos={"w-agents:p-fable": [{"name": "claude", "argv": ["claude", "--help"]}]},
+        tmp_path=tmp_path,
     )
     state: dict = {"schema_version": 1}
 
@@ -3051,6 +3137,7 @@ def install_launch_host(
     catalog_rows: dict[tuple[str, str], bool] | None = None,
     live_agents: list[dict] | None = None,
     process_infos: dict[str, list[dict]] | None = None,
+    agent_sessions: dict[str, Path | str | None] | None = None,
 ) -> list[list[str]]:
     """Wire a fake Herdr for main() with a pre-existing agents workspace/agents."""
     calls: list[list[str]] = []
@@ -3080,6 +3167,8 @@ def install_launch_host(
         catalog_rows=catalog_rows,
         live_agents=live_agents,
         process_infos=process_infos,
+        tmp_path=tmp_path,
+        agent_sessions=agent_sessions,
     )
     return calls
 
@@ -3139,14 +3228,10 @@ def test_main_never_execs_a_profile_room_when_one_role_fails(
         tmp_path,
         monkeypatch,
         {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
-        # Sol's process runs a suffixed model identifier: verification fails.
-        process_infos={
-            "w-agents:p-sol": [
-                {
-                    "name": "pi",
-                    "argv": ["pi", "--provider", "openai-codex", "--model", "gpt-5.6-sol-01"],
-                }
-            ]
+        # Sol's session file names a suffixed model identifier: the session
+        # proof fails; argv can no longer carry the identity at all.
+        agent_sessions={
+            "sol-peer": pi_session_lines("openai-codex", "gpt-5.6-sol-01"),
         },
     )
     save_launcher_state(tmp_path, profile_room_state(tmp_path))
@@ -3347,14 +3432,10 @@ def test_room_reopen_fails_closed_when_native_evidence_lapsed(
         tmp_path,
         monkeypatch,
         {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
-        process_infos={
-            # Sol's process has lapsed onto a different model: re-verification fails.
-            "w-agents:p-sol": [
-                {
-                    "name": "pi",
-                    "argv": ["pi", "--provider", "openai-codex", "--model", "gpt-5.6-sol-01"],
-                }
-            ]
+        # Sol's session file has lapsed onto a different model: re-verification
+        # fails; argv can no longer carry the identity at all.
+        agent_sessions={
+            "sol-peer": pi_session_lines("openai-codex", "gpt-5.6-sol-01"),
         },
     )
     state = profile_room_state(tmp_path)
@@ -3670,6 +3751,7 @@ def test_launch_then_inner_claim_completes_the_two_phase_registration(
         monkeypatch,
         [],
         {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        tmp_path=tmp_path,
     )
     original_run_json = module.run_json
 
@@ -3853,6 +3935,7 @@ def install_sfg_host(
     pane_screens: dict[str, str],
     live_agents: list[dict] | None = None,
     process_infos: dict[str, list[dict]] | None = None,
+    agent_sessions: dict[str, Path | str | None] | None = None,
 ) -> list[list[str]]:
     """Fake Herdr for the three-role profile with all live sessions pre-seeded."""
     calls: list[list[str]] = []
@@ -3865,6 +3948,8 @@ def install_sfg_host(
         pane_screens,
         live_agents=live,
         process_infos=process_infos,
+        tmp_path=tmp_path,
+        agent_sessions=agent_sessions,
     )
     return calls
 
@@ -3894,6 +3979,7 @@ def test_sol_fable_grok_composes_reused_participants_in_exact_order() -> None:
         "model": "grok-4.6",
         "effort": "high",
         "verification": "native-ui verified",
+        "evidence": "process-argv",
     }
     assert len(sol_fable) == 2  # the stored sol-fable profile is unchanged
 
@@ -4193,8 +4279,13 @@ def install_role_replacement_host(
     calls: list[list[str]] = []
     created = 0
     started_processes: dict[str, list[dict]] = {}
+    started_agents: dict[str, dict] = {}
     for agent in live_agents:
         agent["cwd"] = str(tmp_path)
+    sessions = {
+        name: str(write_pi_session(tmp_path, name, pi_session_lines(provider, model)))
+        for name, (provider, model) in PI_SESSION_IDENTITIES.items()
+    }
 
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         nonlocal created
@@ -4207,15 +4298,26 @@ def install_role_replacement_host(
             started_processes[pane] = PARTICIPANT_PROCESSES.get(
                 arguments[2], [{"name": arguments[2], "argv": [arguments[2]]}]
             )
+            started_agents[arguments[2]] = {
+                "name": arguments[2],
+                "kind": arguments[arguments.index("--kind") + 1],
+                "pane_id": pane,
+            }
             return {"result": {"type": "ok"}}
         if arguments[:2] == ["agent", "get"]:
             matches = [agent for agent in live_agents if agent.get("name") == arguments[2]]
-            if not matches:
+            record = dict(matches[0]) if matches else started_agents.get(arguments[2])
+            if record is None:
                 raise BootstrapError(
                     json.dumps({"error": {"code": "agent_not_found", "message": "not found"}}),
                     code="agent_not_found",
                 )
-            return {"result": {"agent": matches[0]}}
+            if arguments[2] in sessions:
+                record = {
+                    **record,
+                    "agent_session": {"kind": "path", "value": sessions[arguments[2]]},
+                }
+            return {"result": {"agent": record}}
         if arguments[:2] == ["pane", "get"]:
             # The pane reports the agent it hosts; a pane without one is a shell.
             occupant = next(
@@ -4622,6 +4724,7 @@ def install_sfglm_host(
     pane_screens: dict[str, str],
     live_agents: list[dict] | None = None,
     process_infos: dict[str, list[dict]] | None = None,
+    agent_sessions: dict[str, Path | str | None] | None = None,
 ) -> list[list[str]]:
     """Fake Herdr for the three-role GLM profile with all sessions pre-seeded."""
     calls: list[list[str]] = []
@@ -4634,6 +4737,8 @@ def install_sfglm_host(
         pane_screens,
         live_agents=live,
         process_infos=process_infos,
+        tmp_path=tmp_path,
+        agent_sessions=agent_sessions,
     )
     return calls
 
@@ -4662,6 +4767,7 @@ def test_sol_fable_glm_composes_reused_participants_in_exact_order() -> None:
         "model": "glm-5.3",
         "effort": "high",
         "verification": "native-ui verified",
+        "evidence": "pi-session",
     }
     # The stored profiles are unchanged and never pick up the GLM participant.
     assert sol_fable == (module.SOL_PARTICIPANT, module.FABLE_PARTICIPANT)
@@ -4690,30 +4796,226 @@ def test_glm_participant_uses_exact_start_argv() -> None:
     assert glm.kind == "pi"
 
 
-def test_glm_process_proof_requires_the_exact_glm_53_argv(
+def test_pi_session_proves_accepts_the_exact_session_events(tmp_path: Path) -> None:
+    session = write_pi_session(
+        tmp_path, "sol-peer", pi_session_lines("openai-codex", "gpt-5.6-sol", "high")
+    )
+
+    assert module.pi_session_proves(str(session), "openai-codex", "gpt-5.6-sol", "high")
+
+
+def test_pi_session_proves_rejects_every_mismatch(tmp_path: Path) -> None:
+    def proves(
+        content_or_path: Path | str,
+        provider: str = "openai-codex",
+        model: str = "gpt-5.6-sol",
+        effort: str = "high",
+    ) -> bool:
+        path = (
+            content_or_path
+            if isinstance(content_or_path, Path)
+            else write_pi_session(tmp_path, "sol-peer", content_or_path)
+        )
+        return module.pi_session_proves(str(path), provider, model, effort)
+
+    assert proves(pi_session_lines("openai-codex", "gpt-5.6-sol"))
+    # A missing file fails closed.
+    assert not proves(tmp_path / "missing-session.jsonl")
+    # Wrong provider, wrong model, wrong thinking level.
+    assert not proves(pi_session_lines("bigmodel-coding", "gpt-5.6-sol"))
+    assert not proves(pi_session_lines("openai-codex", "gpt-5.6-sol-01"))
+    assert not proves(pi_session_lines("openai-codex", "gpt-5.6-sol", effort="medium"))
+    # No model_change event at all.
+    assert not proves(
+        json.dumps({"type": "session", "id": "s0", "cwd": "/w"})
+        + "\n"
+        + json.dumps(
+            {
+                "type": "thinking_level_change",
+                "id": "k0",
+                "parentId": "s0",
+                "thinkingLevel": "high",
+            }
+        )
+        + "\n"
+    )
+    # A truncated, malformed line fails closed even with the right events above it.
+    assert not proves(pi_session_lines("openai-codex", "gpt-5.6-sol")[:-8])
+    assert not proves(pi_session_lines("openai-codex", "gpt-5.6-sol") + '{"type": "thinking_level_')
+
+
+def test_pi_session_proves_takes_the_last_model_change(tmp_path: Path) -> None:
+    def model_change(event_id: str, parent: str, provider: str, model: str) -> str:
+        return json.dumps(
+            {
+                "type": "model_change",
+                "id": event_id,
+                "parentId": parent,
+                "provider": provider,
+                "modelId": model,
+            }
+        )
+
+    glm_first = model_change("m0", "s0", "bigmodel-coding", "glm-5.3")
+    sol_second = model_change("m1", "m0", "openai-codex", "gpt-5.6-sol")
+    thinking = json.dumps(
+        {"type": "thinking_level_change", "id": "k0", "parentId": "m1", "thinkingLevel": "high"}
+    )
+    changed_twice = write_pi_session(
+        tmp_path, "sol-peer", glm_first + "\n" + sol_second + "\n" + thinking + "\n"
+    )
+    reverted = write_pi_session(
+        tmp_path, "sol-revert", sol_second + "\n" + glm_first + "\n" + thinking + "\n"
+    )
+
+    # The last model_change wins in both directions.
+    assert module.pi_session_proves(str(changed_twice), "openai-codex", "gpt-5.6-sol", "high")
+    assert not module.pi_session_proves(str(reverted), "openai-codex", "gpt-5.6-sol", "high")
+    assert module.pi_session_proves(str(reverted), "bigmodel-coding", "glm-5.3", "high")
+
+
+def test_fresh_launch_proves_pi_from_the_session_file_and_claude_from_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One launch, two proof rules: Pi by session file, Claude by argv."""
+    calls: list[list[str]] = []
+    install_profile_host(
+        monkeypatch,
+        calls,
+        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        tmp_path=tmp_path,
+    )
+    state: dict = {"schema_version": 1}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=module.resolve_profile("sol-fable"),
+    )
+
+    assert failures == []
+    # Sol is proven by the session file `agent get` names, never its argv.
+    assert ["agent", "get", "sol-peer"] in calls
+    assert ["pane", "process-info", "--pane", "w-agents:p-sol"] in calls
+    # Fable is proven by its contiguous argv and never needs a session file.
+    assert ["agent", "get", "fable-peer"] not in calls
+    assert ["pane", "process-info", "--pane", "w-agents:p-fable"] in calls
+
+    # Each rule fails alone: a wrong Sol session fails Pi even though the pane
+    # runs `pi`, and a wrong Claude argv fails Claude even though Sol proved.
+    failing: list[list[str]] = []
+    install_profile_host(
+        monkeypatch,
+        failing,
+        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        tmp_path=tmp_path,
+        agent_sessions={"sol-peer": pi_session_lines("openai-codex", "gpt-5.6-sol-01")},
+    )
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        {"schema_version": 1},
+        participants=module.resolve_profile("sol-fable"),
+    )
+    assert [failure for failure in failures if failure.startswith("@sol")] == [
+        "@sol: sol-peer failed process verification; the new tab was closed"
+    ]
+
+    failing_argv: list[list[str]] = []
+    install_profile_host(
+        monkeypatch,
+        failing_argv,
+        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        tmp_path=tmp_path,
+        process_infos={
+            "w-agents:p-fable": [{"name": "claude", "argv": ["claude", "--model", "opus"]}]
+        },
+    )
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        {"schema_version": 1},
+        participants=module.resolve_profile("sol-fable"),
+    )
+    assert [failure for failure in failures if failure.startswith("@fable")] == [
+        "@fable: fable-peer failed process verification; the new tab was closed"
+    ]
+
+
+def test_profile_receipt_evidence_names_each_proof_kind() -> None:
+    _, receipt = module.profile_room_exec("sol-fable", module.resolve_profile("sol-fable"))
+
+    evidence = {entry["role"]: entry["evidence"] for entry in json.loads(receipt)["verified"]}
+    assert evidence == {"sol": "pi-session", "fable": "process-argv"}
+
+
+def pi_session_proof_harness(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    participant: module.Participant,
+    pane_id: str,
+):
+    """Prove one Pi participant against chosen process-info and session inputs.
+
+    `processes` is what `pane process-info` reports; `session` is either raw
+    session-file content, a Path used as-is (it may not exist), or None for an
+    `agent get` record that names no session file at all.
+    """
+
+    def proves(
+        processes: list[dict], session: Path | str | None, *, session_kind: str = "path"
+    ) -> bool:
+        if isinstance(session, str):
+            session = write_pi_session(tmp_path, participant.name, session)
+        record: dict = {"name": participant.name, "kind": "pi", "pane_id": pane_id}
+        if session is not None:
+            record["agent_session"] = {"kind": session_kind, "value": str(session)}
+
+        def fake_run_json(
+            _herdr_bin: str, arguments: list[str], timeout: float | None = 30
+        ) -> dict:
+            del timeout
+            if arguments[:2] == ["pane", "process-info"]:
+                return {"result": {"process_info": {"foreground_processes": processes}}}
+            if arguments[:2] == ["agent", "get"]:
+                return {"result": {"agent": record}}
+            raise AssertionError(arguments)
+
+        monkeypatch.setattr(module, "run_json", fake_run_json)
+        monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
+        return module.participant_process_proves("herdr", participant, pane_id)
+
+    return proves
+
+
+def test_glm_session_proof_requires_the_exact_glm_53_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     glm = module.resolve_profile("sol-fable-glm")[2]
+    proves = pi_session_proof_harness(monkeypatch, tmp_path, glm, "w-agents:p-glm")
 
-    def proves(processes: list[dict]) -> bool:
-        monkeypatch.setattr(
-            module,
-            "run_json",
-            lambda _herdr_bin, arguments, timeout=30: (
-                {"result": {"process_info": {"foreground_processes": processes}}}
-                if arguments[:2] == ["pane", "process-info"]
-                else (_ for _ in ()).throw(AssertionError(arguments))
-            ),
-        )
-        monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
-        return module.participant_process_proves("herdr", glm, "w-agents:p-glm")
-
-    assert proves(PARTICIPANT_PROCESSES["glm-peer"])
-    argv = PARTICIPANT_PROCESSES["glm-peer"][0]["argv"]
-    assert not proves([{"name": "pi", "argv": [*argv[:4], "glm-5.3.1", *argv[5:]]}])
-    assert not proves([{"name": "pi", "argv": [*argv[:3], "glm", "5.3", *argv[4:]]}])
-    assert not proves([{"name": "pi", "argv": [*argv[:-1], "medium"]}])
-    assert not proves([{"name": "codex", "argv": argv}])
+    # The rewritten-title process proves the executable; the session file
+    # carries the identity argv can never hold.
+    assert proves(PI_PROCESS, pi_session_lines("bigmodel-coding", "glm-5.3"))
+    assert not proves(PI_PROCESS, pi_session_lines("bigmodel-coding", "glm-5.3.1"))
+    assert not proves(PI_PROCESS, pi_session_lines("zhipu", "glm-5.3"))
+    assert not proves(PI_PROCESS, pi_session_lines("bigmodel-coding", "glm-5.3", effort="medium"))
+    assert not proves(PI_PROCESS, tmp_path / "missing-glm-session.jsonl")
+    assert not proves(PI_PROCESS, None)
+    assert not proves(PI_PROCESS, pi_session_lines("bigmodel-coding", "glm-5.3"), session_kind="id")
+    assert not proves(
+        [{"name": "claude", "argv": ["claude"]}], pi_session_lines("bigmodel-coding", "glm-5.3")
+    )
 
 
 def test_glm_tab_is_created_without_path_env_and_started_with_exact_argv(
@@ -4786,14 +5088,10 @@ def test_main_never_execs_sol_fable_glm_when_glm_fails(
             "w-agents:p-fable": FABLE_SCREEN,
             "w-agents:p-glm": GLM_SCREEN,
         },
-        # GLM's process runs a suffixed version: the existing session mismatches.
-        process_infos={
-            "w-agents:p-glm": [
-                {
-                    "name": "pi",
-                    "argv": ["pi", "--provider", "bigmodel-coding", "--model", "glm-5.3.1"],
-                }
-            ]
+        # GLM's session file names a suffixed version: the existing session
+        # mismatches; argv can no longer carry the identity at all.
+        agent_sessions={
+            "glm-peer": pi_session_lines("bigmodel-coding", "glm-5.3.1"),
         },
     )
     save_launcher_state(tmp_path, sfglm_room_state(tmp_path))
@@ -4916,6 +5214,7 @@ def install_sfgpi_host(
     tmp_path: Path,
     pane_screens: dict[str, str],
     live_agents: list[dict] | None = None,
+    agent_sessions: dict[str, Path | str | None] | None = None,
 ) -> list[list[str]]:
     calls: list[list[str]] = []
     live = live_agents if live_agents is not None else SFGPI_LIVE_AGENTS
@@ -4927,6 +5226,8 @@ def install_sfgpi_host(
         pane_screens,
         live_agents=live,
         process_infos={"w-agents:p-fable": CLAUDE_FABLE_PROCESS},
+        tmp_path=tmp_path,
+        agent_sessions=agent_sessions,
     )
     return calls
 
@@ -4957,6 +5258,7 @@ def test_sol_fable_grok_pi_reuses_sol_fable_and_preserves_native_grok_profile() 
         "model": "grok-4.6",
         "effort": "high",
         "verification": "native-ui verified",
+        "evidence": "pi-session",
     }
 
 
@@ -5001,29 +5303,23 @@ def test_grok_pi_catalog_requires_the_exact_xai_grok_46_row(
     assert not proves("other  grok-4.6\nxai  grok-4.6\n")
 
 
-def test_grok_pi_process_proof_requires_the_exact_xai_argv(
-    monkeypatch: pytest.MonkeyPatch,
+def test_grok_pi_session_proof_requires_the_exact_xai_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     grok = module.resolve_profile("sol-fable-grok-pi")[2]
+    proves = pi_session_proof_harness(monkeypatch, tmp_path, grok, "w-agents:p-grokpi")
 
-    def proves(processes: list[dict]) -> bool:
-        monkeypatch.setattr(
-            module,
-            "run_json",
-            lambda _herdr_bin, arguments, timeout=30: (
-                {"result": {"process_info": {"foreground_processes": processes}}}
-                if arguments[:2] == ["pane", "process-info"]
-                else (_ for _ in ()).throw(AssertionError(arguments))
-            ),
-        )
-        monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
-        return module.participant_process_proves("herdr", grok, "w-agents:p-grokpi")
-
-    assert proves(PARTICIPANT_PROCESSES["grok46pi-peer"])
-    argv = PARTICIPANT_PROCESSES["grok46pi-peer"][0]["argv"]
-    assert not proves([{"name": "pi", "argv": [*argv[:3], "glm-5.3", *argv[4:]]}])
-    assert not proves([{"name": "pi", "argv": [*argv[:-1], "low"]}])
-    assert not proves([{"name": "grok", "argv": argv}])
+    assert proves(PI_PROCESS, pi_session_lines("xai", "grok-4.6"))
+    assert not proves(PI_PROCESS, pi_session_lines("xai", "grok-4.6-fast"))
+    assert not proves(PI_PROCESS, pi_session_lines("openai-codex", "grok-4.6"))
+    assert not proves(PI_PROCESS, pi_session_lines("xai", "grok-4.6", effort="low"))
+    assert not proves(PI_PROCESS, tmp_path / "missing-grokpi-session.jsonl")
+    assert not proves(PI_PROCESS, None)
+    # Even a full perfect argv cannot prove a Pi participant without the session.
+    assert not proves(
+        [{"name": "pi", "argv": ["pi", *grok.start_args]}],
+        None,
+    )
 
 
 def test_grok_pi_catalog_failure_creates_no_tab_and_never_falls_back(
@@ -5035,6 +5331,7 @@ def test_grok_pi_catalog_failure_creates_no_tab_and_never_falls_back(
         calls,
         {"w-agents:p-grok": GROK_PI_SCREEN},
         catalog_rows={("xai", "grok-4.6"): False},
+        tmp_path=tmp_path,
     )
     state: dict = {"schema_version": 1}
 
@@ -5067,6 +5364,7 @@ def test_grok_pi_starts_with_exact_argv_after_catalog_proof(
             "w-agents:p-fable": FABLE_SCREEN,
             "w-agents:p-grok": GROK_PI_SCREEN,
         },
+        tmp_path=tmp_path,
     )
     state: dict = {"schema_version": 1}
 
@@ -5141,6 +5439,7 @@ def adopt_live_agents(workspace_id: str, cwd: str, names: tuple[str, ...] = ()) 
 def install_adopt_host(
     monkeypatch: pytest.MonkeyPatch,
     live: list[dict],
+    tmp_path: Path | None = None,
     workspaces: list[dict] | None = None,
     pane_screens: dict[str, str] | None = None,
 ) -> list[list[str]]:
@@ -5173,6 +5472,7 @@ def install_adopt_host(
         workspaces=workspaces
         if workspaces is not None
         else [{"workspace_id": "w1E", "label": "agents · group-chat"}],
+        tmp_path=tmp_path,
     )
     return calls
 
@@ -5206,6 +5506,7 @@ def test_adopt_peers_reports_the_owned_roles_from_any_workspace(
             {"workspace_id": "w1E", "label": "agents · group-chat"},
             {"workspace_id": "w-somewhere-else", "label": "scratch"},
         ],
+        tmp_path=tmp_path,
     )
 
     assert module.adopt_stale_peers() == 0
@@ -5265,7 +5566,11 @@ def test_adopt_peers_reports_each_not_owned_reason_and_records_nothing(
 ) -> None:
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_cwd": str(tmp_path)}))
-    calls = install_adopt_host(monkeypatch, live)
+    calls = install_adopt_host(
+        monkeypatch,
+        live,
+        tmp_path=tmp_path,
+    )
 
     assert module.adopt_stale_peers() == 0
 
@@ -5290,6 +5595,7 @@ def test_adopt_peers_reports_two_live_peers_for_one_role(
             "w1E:p-grok46": GROK_POST_TURN_SCREEN,
             "w1E:p-grok46pi": GROK_PI_POST_TURN_SCREEN,
         },
+        tmp_path=tmp_path,
     )
 
     assert module.adopt_stale_peers() == 0
@@ -5321,6 +5627,7 @@ def test_adopt_peers_never_touches_workspaces_or_placeholders(
             {"workspace_id": "w1E", "label": "agents · group-chat"},
             {"workspace_id": "w1Z", "label": "agents · group-chat"},
         ],
+        tmp_path=tmp_path,
     )
 
     assert module.adopt_stale_peers() == 0
@@ -5352,6 +5659,7 @@ def test_adopt_then_atomic_profile_launch_succeeds_against_the_same_fake(
             "w1E:p-fable": FABLE_SCREEN,
             "w1E:p-grok46": GROK_POST_TURN_SCREEN,
         },
+        tmp_path=tmp_path,
     )
     state = sfg_room_state(tmp_path)
     # The restart wiped the cwd and pane records; the workspace id survives as
@@ -6375,6 +6683,7 @@ def test_grid_relaunch_reuses_live_peers_in_any_workspace(
             screens,
             live_agents=live,
             process_infos={f"{live_workspace_id}:p-fable": CLAUDE_FABLE_PROCESS},
+            tmp_path=tmp_path,
         )
         state: dict = {
             "schema_version": 1,
@@ -6563,9 +6872,13 @@ def test_grid_relaunch_reuses_live_peers_and_leaves_lifecycle_to_herdr(
         {"w-room:p-sol": SOL_SCREEN, "w-room:p-fable": FABLE_SCREEN, "w-room:p-grok": GROK_SCREEN},
         live_agents=live,
         process_infos={"w-room:p-fable": CLAUDE_FABLE_PROCESS, "w-room:p-grok": GROK_PROCESS},
+        tmp_path=tmp_path,
     )
     moved_names: set[str] = set()
     pane_to_name = {agent["pane_id"]: agent["name"] for agent in live}
+    sol_session = write_pi_session(
+        tmp_path, "sol-peer", pi_session_lines("openai-codex", "gpt-5.6-sol")
+    )
 
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
         del timeout
@@ -6595,29 +6908,41 @@ def test_grid_relaunch_reuses_live_peers_and_leaves_lifecycle_to_herdr(
             def name_for(name: str) -> str:
                 return name.removesuffix("-peer").replace("grok46", "grok")
 
+            def with_session(record: dict) -> dict:
+                if record["name"] == "sol-peer":
+                    record = {
+                        **record,
+                        "agent_session": {"kind": "path", "value": str(sol_session)},
+                    }
+                return record
+
             if arguments[2] in moved_names:
                 return {
                     "result": {
-                        "agent": {
-                            "name": arguments[2],
-                            "kind": kinds[arguments[2]],
-                            "cwd": str(tmp_path),
-                            "pane_id": f"w-chat:p-{arguments[2]}",
-                            "tab_id": "w-chat:t-room",
-                            "workspace_id": "w-chat",
-                        }
+                        "agent": with_session(
+                            {
+                                "name": arguments[2],
+                                "kind": kinds[arguments[2]],
+                                "cwd": str(tmp_path),
+                                "pane_id": f"w-chat:p-{arguments[2]}",
+                                "tab_id": "w-chat:t-room",
+                                "workspace_id": "w-chat",
+                            }
+                        )
                     }
                 }
             return {
                 "result": {
-                    "agent": {
-                        "name": arguments[2],
-                        "kind": kinds[arguments[2]],
-                        "cwd": str(tmp_path),
-                        "pane_id": f"w-room:p-{name_for(arguments[2])}",
-                        "tab_id": f"w-room:t-{name_for(arguments[2])}",
-                        "workspace_id": "w-room",
-                    }
+                    "agent": with_session(
+                        {
+                            "name": arguments[2],
+                            "kind": kinds[arguments[2]],
+                            "cwd": str(tmp_path),
+                            "pane_id": f"w-room:p-{name_for(arguments[2])}",
+                            "tab_id": f"w-room:t-{name_for(arguments[2])}",
+                            "workspace_id": "w-room",
+                        }
+                    )
                 }
             }
         if arguments[:2] == ["pane", "process-info"]:

@@ -68,6 +68,19 @@ Phase C of the 0.12 redesign, hardenings from the Grok challenge:
   agent). A pane that is gone, hosts no agent, or hosts a different name
   leaves its recorded ids dropped from state with nothing closed, reported
   as `stale @<role> record` in the launcher's system lines.
+- **Pi identity comes from its session file, not argv.** Pi rewrites its own
+  process title, so Herdr reports a Pi pane as `{"argv": ["pi"], "cmdline":
+  "pi", "name": "pi"}` and the contiguous start-argument match can never
+  hold; the phase-A process proof therefore failed every Pi participant. For
+  `kind == "pi"` the post-start proof is now the session file `agent get`
+  reports (`agent_session` path): reading at most its first 64 KiB, the last
+  `model_change` must name the exact provider and model and the last
+  `thinking_level_change` the exact effort, with the pane still running a
+  foreground process named exactly `pi`; a missing file, a missing event, a
+  malformed line, or any mismatch fails closed, under the same bounded
+  retries because the file appears a moment after the start. Every other
+  kind keeps the argv proof, and the profile receipt records which proof
+  kind verified each participant (`pi-session` or `process-argv`).
 
 ## [0.11.3] - 2026-09-03
 

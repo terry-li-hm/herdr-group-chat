@@ -774,6 +774,7 @@ AGENT_START_BUSY_INTERVAL_S = 2.0
 
 VERIFY_PANE_ATTEMPTS = 15
 VERIFY_PANE_INTERVAL_S = 1.0
+PI_SESSION_READ_LIMIT = 64 * 1024
 
 
 def native_catalog_row_present(command: Sequence[str], provider: str, model: str) -> bool:
@@ -844,18 +845,123 @@ def native_pane_process_proves(
 
 
 def participant_process_proves(herdr_bin: str, participant: Participant, pane_id: str) -> bool:
-    """The only post-start native proof: the participant's own foreground process.
+    """The post-start native proof for one participant, by its own rule.
 
-    A participant without start arguments is never process-proofed. Otherwise
-    the proof is `pane process-info` on the agent's live pane: the foreground
-    process's executable identity must be exactly the participant's kind (the
-    canonical executable Herdr starts for that kind) and its argv must contain
-    the start arguments as one contiguous sequence. Screen text is never
-    evidence, so a model rename in a vendor UI cannot break a launch.
+    A participant without start arguments is never process-proofed. Pi
+    rewrites its own process title, so its argv can never carry the start
+    arguments; its proof is the session file `agent get` names, plus a `pi`
+    foreground process on the live pane. Every other kind is proven by
+    `pane process-info`: the foreground process's executable identity must
+    be exactly the participant's kind and its argv must contain the start
+    arguments as one contiguous sequence. Screen text is never evidence, so
+    a model rename in a vendor UI cannot break a launch.
     """
     if not participant.start_args:
         return True
+    if participant.kind == "pi":
+        return pi_participant_proves(herdr_bin, participant, pane_id)
     return native_pane_process_proves(herdr_bin, pane_id, participant.kind, participant.start_args)
+
+
+def participant_proof_kind(participant: Participant) -> str:
+    """Which post-start proof kind the receipt records for this participant."""
+    return "pi-session" if participant.kind == "pi" else "process-argv"
+
+
+def pi_session_proves(session_path: str, provider: str, model: str, effort: str) -> bool:
+    """Prove a Pi participant's identity from its session file.
+
+    The session JSONL carries the exact provider, model and thinking level in
+    its last `model_change` and `thinking_level_change` events. A missing
+    file, a missing event, a malformed line, or any mismatch fails closed.
+    Only the first 64 KiB are read; the identity events sit at the top.
+    """
+    try:
+        with open(session_path, "rb") as handle:
+            raw = handle.read(PI_SESSION_READ_LIMIT)
+    except OSError:
+        return False
+    last_model: dict[str, Any] | None = None
+    last_thinking: dict[str, Any] | None = None
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(event, dict):
+            return False
+        if event.get("type") == "model_change":
+            last_model = event
+        elif event.get("type") == "thinking_level_change":
+            last_thinking = event
+    if last_model is None or last_thinking is None:
+        return False
+    return (
+        str(last_model.get("provider")) == provider
+        and str(last_model.get("modelId")) == model
+        and str(last_thinking.get("thinkingLevel")) == effort
+    )
+
+
+def pi_agent_session_path(live_agent: object) -> str:
+    """The session-file path `agent get` reports, or "" when it names none."""
+    if not isinstance(live_agent, dict):
+        return ""
+    session = live_agent.get("agent_session")
+    if not isinstance(session, dict) or session.get("kind") != "path":
+        return ""
+    value = session.get("value")
+    return value if isinstance(value, str) and value else ""
+
+
+def pi_pane_identity_proves(processes: object) -> bool:
+    """Whether the pane runs a foreground process whose exact identity is `pi`."""
+    if not isinstance(processes, list):
+        return False
+    for process in processes:
+        if not isinstance(process, dict):
+            continue
+        argv = [str(argument) for argument in process.get("argv", [])]
+        identity = str(process.get("argv0") or process.get("name") or (argv[0] if argv else ""))
+        if identity == "pi":
+            return True
+    return False
+
+
+def pi_participant_proves(herdr_bin: str, participant: Participant, pane_id: str) -> bool:
+    """The Pi post-start proof: a `pi` process on the pane plus its session file.
+
+    Pi rewrites its own process title, so argv can never carry its start
+    arguments; identity comes from the session file `agent get` names, which
+    must prove the exact provider, model and effort. The same bounded retries
+    as the process proof apply, because the file appears a moment after the
+    agent starts.
+    """
+    for attempt in range(VERIFY_PANE_ATTEMPTS):
+        payload = run_json(herdr_bin, ["pane", "process-info", "--pane", pane_id])
+        processes = (
+            payload.get("result", {}).get("process_info", {}).get("foreground_processes", [])
+        )
+        if pi_pane_identity_proves(processes):
+            try:
+                live = run_json(herdr_bin, ["agent", "get", participant.name])
+            except BootstrapError as error:
+                if error.code != "agent_not_found":
+                    raise
+                live = {}
+            session_path = pi_agent_session_path(live.get("result", {}).get("agent"))
+            if session_path and pi_session_proves(
+                session_path,
+                str(participant.provider or ""),
+                participant.model,
+                participant.effort,
+            ):
+                return True
+        if attempt + 1 < VERIFY_PANE_ATTEMPTS:
+            time.sleep(VERIFY_PANE_INTERVAL_S)
+    return False
 
 
 def live_agent_kind_matches(live_agent: Mapping[str, Any], expected_kind: str) -> bool:
@@ -881,6 +987,7 @@ def profile_receipt_payload(profile: str, participants: Sequence[Participant]) -
             "model": participant.model,
             "effort": participant.effort,
             "verification": "native-ui verified",
+            "evidence": participant_proof_kind(participant),
         }
         if participant.provider:
             verified["provider"] = participant.provider

@@ -439,10 +439,9 @@ runs Claude Code as `fable-peer` with `--model fable --effort high` and no
 fallback. Before either participant becomes routable, the launcher verifies
 native host evidence: Sol requires an exact `openai-codex  gpt-5.6-sol` row
 from `pi --list-models gpt-5.6-sol`, with no competing provider for that exact
-model id; after start, each participant's live pane is proven through
-`pane process-info`, whose foreground process must be exactly the
-participant's executable and carry its start arguments as one contiguous argv
-sequence. Reads retry briefly because startups are asynchronous, so a
+model id; after start, each participant's live pane is proven
+by process for Claude, Codex and Grok Build, and by Pi's session file for Pi.
+Reads retry briefly because startups are asynchronous, so a
 lookalike model string, reordered arguments, or an MCP child process with the
 right flags never verifies, and a model rename in a vendor UI can no longer
 break a launch because screen text is never evidence. A `sol-fable` room is
@@ -466,8 +465,8 @@ no fallback provider, model, effort, or native Grok Build invocation.
 
 Before `@grok` becomes routable, Pi must return the exact `xai  grok-4.6` row
 from `pi --list-models grok-4.6`, with no competing provider for that exact
-model id, and its live pane's foreground process must be `pi` carrying
-`--provider xai --model grok-4.6 --thinking high` contiguously. The same
+model id, and its live pane's foreground process must be exactly `pi` while
+its session file names `xai`, `grok-4.6`, and thinking level `high`. The same
 proof is required when reopening. Lookalikes, split model tokens, and wrong
 effort fail closed.
 The atomic receipt carries harness `pi`, provider `xai`, model `grok-4.6`, and
