@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [0.12.0] - 2026-09-03
 
 Phase A of the 0.12 redesign ([docs/0.12-redesign.md](docs/0.12-redesign.md)):
 the launcher stops owning Herdr topology it cannot control.
