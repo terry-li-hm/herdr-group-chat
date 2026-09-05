@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-### Unreleased
+## [0.13.0] - 2026-09-06
 
 - **Sticky addressee for plain messages.** A plain message now goes to the
   participant the human is currently talking to — the single recipient of the
