@@ -130,7 +130,12 @@ description = "new group chat (Sol + Fable + Grok)"
 
 ## Use
 
-Plain messages address everyone. Prefix a message to select participants:
+Plain messages go to the participant you are currently talking to, not to
+everyone: the single recipient of your most recent message when it named
+exactly one current participant, and otherwise the lead, which defaults to the
+synthesizer and can be set with `--lead NAME`. While the room is idle the
+status row shows `To: @name` so the destination is always visible before you
+send. Fan-out stays explicit; prefix a message to select participants:
 
 ```text
 @all Review this email draft and agree the two most important changes.

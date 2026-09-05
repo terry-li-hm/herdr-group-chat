@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+### Unreleased
+
+- **Sticky addressee for plain messages.** A plain message now goes to the
+  participant the human is currently talking to — the single recipient of the
+  most recent human message when it named exactly one current participant —
+  and otherwise to the lead, which defaults to the synthesizer and can be set
+  with `--lead NAME`. The idle status row shows `To: @name`, the `Delivered.`
+  notice names where the next plain message goes, fan-out stays explicit via
+  `@all` and multi-recipient mentions, and unmentioned `/review` and
+  `/consensus` still select every participant.
+
 ## [0.12.0] - 2026-09-03
 
 Phase A of the 0.12 redesign ([docs/0.12-redesign.md](docs/0.12-redesign.md)):
