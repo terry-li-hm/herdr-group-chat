@@ -37,14 +37,14 @@ if TYPE_CHECKING:
 INSTALLED_PLUGIN_ID = "terry.herdr-group-chat"
 ACTION_CONTEXTS = ("workspace", "tab", "pane")
 EXPECTED_ACTION_CONTRACTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
-    "new": (("./new-room", "--launch", "--profile", "sol-fable-grok-pi"), ACTION_CONTEXTS),
-    "new-sol-fable": (("./new-room", "--launch", "--profile", "sol-fable"), ACTION_CONTEXTS),
-    "new-sol-fable-grok-native": (
-        ("./new-room", "--launch", "--profile", "sol-fable-grok"),
+    "new": (("./new-room", "--launch", "--profile", "astra-fable-grok-pi"), ACTION_CONTEXTS),
+    "new-astra-fable": (("./new-room", "--launch", "--profile", "astra-fable"), ACTION_CONTEXTS),
+    "new-astra-fable-grok-native": (
+        ("./new-room", "--launch", "--profile", "astra-fable-grok"),
         ACTION_CONTEXTS,
     ),
-    "new-sol-fable-glm": (
-        ("./new-room", "--launch", "--profile", "sol-fable-glm"),
+    "new-astra-fable-glm": (
+        ("./new-room", "--launch", "--profile", "astra-fable-glm"),
         ACTION_CONTEXTS,
     ),
     "new-classic": (("./new-room", "--launch"), ACTION_CONTEXTS),
@@ -55,9 +55,9 @@ EXPECTED_PANE_CONTRACTS: dict[str, tuple[tuple[str, ...], str]] = {
     "new-room": (("./new-room",), "tab"),
     "room": (("./new-room", "--room-entrypoint"), "tab"),
 }
-DEFAULT_PROFILE = "sol-fable-grok-pi"
+DEFAULT_PROFILE = "astra-fable-grok-pi"
 DEFAULT_PARTICIPANTS = (
-    ("sol", "sol-peer"),
+    ("astra", "astra-peer"),
     ("fable", "fable-peer"),
     ("grok", "grok46pi-peer"),
 )

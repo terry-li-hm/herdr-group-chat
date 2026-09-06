@@ -39,10 +39,10 @@ loader.exec_module(module)
 
 # The real production contracts, spelled out independently of the harness.
 REAL_ACTION_COMMANDS: dict[str, list[str]] = {
-    "new": ["./new-room", "--launch", "--profile", "sol-fable-grok-pi"],
-    "new-sol-fable": ["./new-room", "--launch", "--profile", "sol-fable"],
-    "new-sol-fable-grok-native": ["./new-room", "--launch", "--profile", "sol-fable-grok"],
-    "new-sol-fable-glm": ["./new-room", "--launch", "--profile", "sol-fable-glm"],
+    "new": ["./new-room", "--launch", "--profile", "astra-fable-grok-pi"],
+    "new-astra-fable": ["./new-room", "--launch", "--profile", "astra-fable"],
+    "new-astra-fable-grok-native": ["./new-room", "--launch", "--profile", "astra-fable-grok"],
+    "new-astra-fable-glm": ["./new-room", "--launch", "--profile", "astra-fable-glm"],
     "new-classic": ["./new-room", "--launch"],
     "open": ["./new-room", "--open"],
     "adopt-peers": ["./new-room", "--adopt-peers"],
@@ -52,11 +52,11 @@ REAL_PANE_COMMANDS: dict[str, list[str]] = {
     "room": ["./new-room", "--room-entrypoint"],
 }
 ROOM_ROLES = {
-    "new": ["sol", "fable", "grok"],
+    "new": ["astra", "fable", "grok"],
     "new-classic": ["pi", "claude", "codex", "grok"],
 }
 ROOM_PEERS = {
-    "new": ["sol-peer", "fable-peer", "grok46pi-peer"],
+    "new": ["astra-peer", "fable-peer", "grok46pi-peer"],
     "new-classic": ["pi-peer", "claude-peer", "codex-peer", "grok-peer"],
 }
 
@@ -1067,10 +1067,10 @@ def test_readiness_polls_live_surfaces_until_the_room_is_ready(harness: Harness)
     # reading partial state; two rooms cost at least a virtual second.
     assert harness.clock.monotonic() - started >= 1.0
     assert [room["participants"] for room in payload["rooms"]] == [
-        ["sol", "fable", "grok"],
+        ["astra", "fable", "grok"],
         ["pi", "claude", "codex", "grok"],
     ]
-    assert payload["rooms"][0]["profile"] == "sol-fable-grok-pi"
+    assert payload["rooms"][0]["profile"] == "astra-fable-grok-pi"
     assert payload["rooms"][1]["profile"] is None
     for room in payload["rooms"]:
         assert room["replies"] == {name: "SMOKE-OK" for name in room["participants"]}
@@ -1078,7 +1078,7 @@ def test_readiness_polls_live_surfaces_until_the_room_is_ready(harness: Harness)
 
 def test_blocked_and_missing_peers_time_out_bounded(harness: Harness) -> None:
     for env_extra, expected_stage in (
-        ({"FAKE_HERDR_BLOCKED_PEER": "sol-peer"}, "round-new"),
+        ({"FAKE_HERDR_BLOCKED_PEER": "astra-peer"}, "round-new"),
         ({"FAKE_HERDR_MISSING_PEER": "grok-peer"}, "round-new-classic"),
     ):
         result = harness.run_candidate(env_extra=env_extra, timeout="2")
@@ -1111,7 +1111,7 @@ def test_stale_default_peers_survive_into_the_classic_room(harness: Harness) -> 
     assert classic_agents == ["pi-peer", "claude-peer", "codex-peer", "grok-peer"]
     # The stale default-room peers remain listed as live backstage agents.
     all_peers = {p["name"] for room in rooms for p in room["peers"]}
-    assert {"sol-peer", "fable-peer", "grok46pi-peer"} <= all_peers
+    assert {"astra-peer", "fable-peer", "grok46pi-peer"} <= all_peers
 
 
 def test_replacement_requires_a_new_room_pane_identity(harness: Harness) -> None:

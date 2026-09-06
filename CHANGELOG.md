@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+- **Renamed the Sol role to Astra.** The OpenAI participant is now `@astra`,
+  a Pi peer on `gpt-6-astra` (still provider `openai-codex`, thinking
+  `high`). The profiles rename to `astra-fable`, `astra-fable-grok`,
+  `astra-fable-grok-pi`, `astra-fable-grok-opus-pi`, and `astra-fable-glm`;
+  the actions to `new-astra-fable`, `new-astra-fable-grok-native`, and
+  `new-astra-fable-glm`; and the default `new` action opens the
+  `astra-fable-grok-pi` profile. Verification flow, receipts, peer identity
+  proofs, Grok and GLM routing, and the classic room are unchanged.
 - **Terminal default colours in the room.** The TUI now adopts the
   terminal's own foreground and background via `curses.use_default_colors()`
   at startup, so the room no longer repaints itself white-on-black and light

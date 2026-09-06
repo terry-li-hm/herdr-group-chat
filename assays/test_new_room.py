@@ -190,11 +190,11 @@ def test_migration_reads_an_old_state_file_with_stale_ids(
         "room_pane_id": "w-dead-chat:p-dead",
         "room_tab_id": "w-dead-chat:t-dead",
         "last_room_id": "chat-old",
-        "selected_profile": "sol-fable-grok",
+        "selected_profile": "astra-fable-grok",
         "layout": "grid",
         "agents_cwd": "/gone/room",
-        "participant_pane_ids": {"sol": "w-dead:p-1", "fable": "w-dead:p-2"},
-        "participant_tab_ids": {"sol": "w-dead:t-1", "fable": "w-dead:t-2"},
+        "participant_pane_ids": {"astra": "w-dead:p-1", "fable": "w-dead:p-2"},
+        "participant_tab_ids": {"astra": "w-dead:t-1", "fable": "w-dead:t-2"},
         "participant_workspace_id": "w-dead-room",
         "chat_placeholder_tab_id": "w-dead-chat:t-ph",
         "agents_placeholder_tab_id": "w-dead-agents:t-ph",
@@ -206,7 +206,7 @@ def test_migration_reads_an_old_state_file_with_stale_ids(
     state = load_launcher_state(tmp_path)
 
     assert state["last_room_id"] == "chat-old"
-    assert state["selected_profile"] == "sol-fable-grok"
+    assert state["selected_profile"] == "astra-fable-grok"
     assert state["layout"] == "grid"
     assert state["room_pane_id"] == "w-dead-chat:p-dead"
     assert state["room_tab_id"] == "w-dead-chat:t-dead"
@@ -951,7 +951,7 @@ def test_outer_registration_records_ownership_but_retains_pending_operation() ->
         "room_pane_id": "w-chat:p-old",
         "pending_room_id": "chat-new",
         "pending_room_operation_id": "operation-new",
-        "pending_room_profile": "sol-fable",
+        "pending_room_profile": "astra-fable",
         "pending_room_started_unix_ms": 1,
     }
 
@@ -971,7 +971,7 @@ def test_outer_registration_records_ownership_but_retains_pending_operation() ->
     assert state["last_room_id"] == "chat-new"
     assert state["pending_room_id"] == "chat-new"
     assert state["pending_room_operation_id"] == "operation-new"
-    assert state["pending_room_profile"] == "sol-fable"
+    assert state["pending_room_profile"] == "astra-fable"
     assert state["pending_room_started_unix_ms"] == 1
 
     # The matching inner registration then consumes the pending fields.
@@ -998,7 +998,7 @@ def test_inner_registration_with_mismatched_operation_fails_without_consuming() 
     state = {
         "pending_room_id": "chat-new",
         "pending_room_operation_id": "operation-new",
-        "pending_room_profile": "sol-fable",
+        "pending_room_profile": "astra-fable",
         "pending_room_started_unix_ms": 1,
     }
 
@@ -1013,7 +1013,7 @@ def test_inner_registration_with_mismatched_operation_fails_without_consuming() 
         )
 
     assert state["pending_room_operation_id"] == "operation-new"
-    assert state["pending_room_profile"] == "sol-fable"
+    assert state["pending_room_profile"] == "astra-fable"
     assert "room_pane_id" not in state
 
 
@@ -2546,9 +2546,9 @@ def test_owned_live_agent_is_reused_wherever_it_sits_and_closes_only_a_stale_pen
         assert not any(call[:2] in (["tab", "close"], ["pane", "close"]) for call in calls)
 
 
-# --- bounded sol-fable model profile -------------------------------------------------
+# --- bounded astra-fable model profile -------------------------------------------------
 
-SOL_SCREEN = "Pi\nprovider openai-codex\nmodel gpt-5.6-sol • high\n"
+ASTRA_SCREEN = "Pi\nprovider openai-codex\nmodel gpt-6-astra • high\n"
 FABLE_SCREEN = "Claude Code\nFable 5\nreasoning: high effort\n"
 FABLE_POST_TURN_SCREEN = "Claude Code\nFable 5\nwaiting for input\n"
 CLAUDE_FABLE_PROCESS = [
@@ -2573,7 +2573,7 @@ def rewritten_title_process(name: str) -> list[dict]:
 # Pi rewrites its own process title, so Herdr can never report its start argv.
 PI_PROCESS = rewritten_title_process("pi")
 PARTICIPANT_PROCESSES: dict[str, list[dict]] = {
-    "sol-peer": list(PI_PROCESS),
+    "astra-peer": list(PI_PROCESS),
     "fable-peer": CLAUDE_FABLE_PROCESS,
     "opus-peer": process_running("claude", module.OPUS_PARTICIPANT.start_args),
     "grok46-peer": process_running("grok", module.GROK_START_ARGS),
@@ -2583,7 +2583,7 @@ PARTICIPANT_PROCESSES: dict[str, list[dict]] = {
 # Freshly created tabs are addressed by role; the profile rosters fix which
 # participant each role starts in the tests that rely on the default.
 ROLE_PROCESSES: dict[str, list[dict]] = {
-    "sol": PARTICIPANT_PROCESSES["sol-peer"],
+    "astra": PARTICIPANT_PROCESSES["astra-peer"],
     "fable": PARTICIPANT_PROCESSES["fable-peer"],
     "opus": PARTICIPANT_PROCESSES["opus-peer"],
     "grok": PARTICIPANT_PROCESSES["grok46-peer"],
@@ -2593,7 +2593,7 @@ ROLE_PROCESSES: dict[str, list[dict]] = {
 
 # The session-file identities `agent get` can report for each Pi participant.
 PI_SESSION_IDENTITIES: dict[str, tuple[str, str]] = {
-    "sol-peer": ("openai-codex", "gpt-5.6-sol"),
+    "astra-peer": ("openai-codex", "gpt-6-astra"),
     "glm-peer": ("bigmodel-coding", "glm-5.3"),
     "grok46pi-peer": ("xai", "grok-4.6"),
 }
@@ -2755,14 +2755,14 @@ def install_profile_host(
     monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
 
 
-def test_sol_fable_start_uses_exact_ordered_participants_and_native_argv(
+def test_astra_fable_start_uses_exact_ordered_participants_and_native_argv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[list[str]] = []
     install_profile_host(
         monkeypatch,
         calls,
-        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
         tmp_path=tmp_path,
     )
     state: dict = {"schema_version": 1}
@@ -2774,7 +2774,7 @@ def test_sol_fable_start_uses_exact_ordered_participants_and_native_argv(
         tmp_path,
         launcher_state_path(tmp_path),
         state,
-        participants=module.resolve_profile("sol-fable"),
+        participants=module.resolve_profile("astra-fable"),
     )
 
     assert failures == []
@@ -2783,18 +2783,18 @@ def test_sol_fable_start_uses_exact_ordered_participants_and_native_argv(
         [
             "agent",
             "start",
-            "sol-peer",
+            "astra-peer",
             "--kind",
             "pi",
             "--pane",
-            "w-agents:p-sol",
+            "w-agents:p-astra",
             "--timeout",
             "120000",
             "--",
             "--provider",
             "openai-codex",
             "--model",
-            "gpt-5.6-sol",
+            "gpt-6-astra",
             "--thinking",
             "high",
         ],
@@ -2815,10 +2815,10 @@ def test_sol_fable_start_uses_exact_ordered_participants_and_native_argv(
             "high",
         ],
     ]
-    # The catalog proof precedes every Sol tab creation and agent start.
-    first_sol_tab = next(i for i, call in enumerate(calls) if call[:2] == ["tab", "create"])
-    sol_catalog = calls.index(["pi", "--list-models", "gpt-5.6-sol"])
-    assert sol_catalog < first_sol_tab
+    # The catalog proof precedes every Astra tab creation and agent start.
+    first_astra_tab = next(i for i, call in enumerate(calls) if call[:2] == ["tab", "create"])
+    astra_catalog = calls.index(["pi", "--list-models", "gpt-6-astra"])
+    assert astra_catalog < first_astra_tab
 
 
 def test_catalog_proof_is_structural_not_substring(
@@ -2835,18 +2835,18 @@ def test_catalog_proof_is_structural_not_substring(
         )
 
     catalog = module.native_catalog_row_present
-    install("openai-codex  gpt-5.6-sol\n")
-    assert catalog(("pi",), "openai-codex", "gpt-5.6-sol")
-    install("  openai-codex  gpt-5.6-sol  extra columns\n")
-    assert catalog(("pi",), "openai-codex", "gpt-5.6-sol")
-    install("openai-codex  gpt-5.6-sol-01\n")  # suffixed model
-    assert not catalog(("pi",), "openai-codex", "gpt-5.6-sol")
-    install("xopenai-codex  gpt-5.6-sol\n")  # prefixed provider
-    assert not catalog(("pi",), "openai-codex", "gpt-5.6-sol")
-    install("openai-codex-remote  gpt-5.6-sol\n")
-    assert not catalog(("pi",), "openai-codex", "gpt-5.6-sol")
-    install("openai-codex  gpt-5.6-sol\n", returncode=1)
-    assert not catalog(("pi",), "openai-codex", "gpt-5.6-sol")
+    install("openai-codex  gpt-6-astra\n")
+    assert catalog(("pi",), "openai-codex", "gpt-6-astra")
+    install("  openai-codex  gpt-6-astra  extra columns\n")
+    assert catalog(("pi",), "openai-codex", "gpt-6-astra")
+    install("openai-codex  gpt-6-astra-01\n")  # suffixed model
+    assert not catalog(("pi",), "openai-codex", "gpt-6-astra")
+    install("xopenai-codex  gpt-6-astra\n")  # prefixed provider
+    assert not catalog(("pi",), "openai-codex", "gpt-6-astra")
+    install("openai-codex-remote  gpt-6-astra\n")
+    assert not catalog(("pi",), "openai-codex", "gpt-6-astra")
+    install("openai-codex  gpt-6-astra\n", returncode=1)
+    assert not catalog(("pi",), "openai-codex", "gpt-6-astra")
 
 
 def test_process_proof_requires_exact_argv0_and_contiguous_args(
@@ -2931,15 +2931,15 @@ def test_process_proof_retries_because_startups_are_asynchronous(
     assert len(calls) == 2
 
 
-def test_failed_catalog_preflight_creates_and_starts_no_sol_tab(
+def test_failed_catalog_preflight_creates_and_starts_no_astra_tab(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[list[str]] = []
     install_profile_host(
         monkeypatch,
         calls,
-        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
-        catalog_rows={("openai-codex", "gpt-5.6-sol"): False},
+        {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        catalog_rows={("openai-codex", "gpt-6-astra"): False},
         tmp_path=tmp_path,
     )
     state: dict = {"schema_version": 1}
@@ -2951,13 +2951,13 @@ def test_failed_catalog_preflight_creates_and_starts_no_sol_tab(
         tmp_path,
         launcher_state_path(tmp_path),
         state,
-        participants=module.resolve_profile("sol-fable"),
+        participants=module.resolve_profile("astra-fable"),
     )
 
-    assert any("catalog preflight" in failure and "@sol" in failure for failure in failures)
-    sol_calls = [call for call in calls if "sol" in " ".join(call)]
-    assert not any(call[:2] in (["tab", "create"], ["agent", "start"]) for call in sol_calls)
-    # Fable still started: the preflight is per-role and precedes only Sol's tab.
+    assert any("catalog preflight" in failure and "@astra" in failure for failure in failures)
+    astra_calls = [call for call in calls if "astra" in " ".join(call)]
+    assert not any(call[:2] in (["tab", "create"], ["agent", "start"]) for call in astra_calls)
+    # Fable still started: the preflight is per-role and precedes only Astra's tab.
     assert any(call[:2] == ["agent", "start"] and call[2] == "fable-peer" for call in calls)
 
 
@@ -2981,7 +2981,7 @@ def test_new_tab_failing_pane_verification_is_closed_and_not_routable(
         tmp_path,
         launcher_state_path(tmp_path),
         state,
-        participants=(module.PROFILE_PARTICIPANTS["sol-fable"][1],),
+        participants=(module.PROFILE_PARTICIPANTS["astra-fable"][1],),
     )
 
     assert len(failures) == 1 and "the new tab was closed" in failures[0]
@@ -3003,8 +3003,8 @@ def test_agent_start_passes_native_arguments_behind_exactly_one_separator(
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
 
-    sol, fable = module.resolve_profile("sol-fable")
-    module.start_agent("herdr", "sol-peer", sol.kind, "w-agents:p-sol", sol.start_args)
+    astra, fable = module.resolve_profile("astra-fable")
+    module.start_agent("herdr", "astra-peer", astra.kind, "w-agents:p-astra", astra.start_args)
     module.start_agent("herdr", "fable-peer", fable.kind, "w-agents:p-fable", fable.start_args)
     # A default participant with no native arguments adds no separator.
     module.start_agent("herdr", "pi-peer", "pi", "w-agents:p-pi")
@@ -3014,18 +3014,18 @@ def test_agent_start_passes_native_arguments_behind_exactly_one_separator(
         [
             "agent",
             "start",
-            "sol-peer",
+            "astra-peer",
             "--kind",
             "pi",
             "--pane",
-            "w-agents:p-sol",
+            "w-agents:p-astra",
             "--timeout",
             "120000",
             "--",
             "--provider",
             "openai-codex",
             "--model",
-            "gpt-5.6-sol",
+            "gpt-6-astra",
             "--thinking",
             "high",
         ],
@@ -3144,12 +3144,12 @@ def install_launch_host(
     if live_agents is None:
         live_agents = [
             {
-                "name": "sol-peer",
+                "name": "astra-peer",
                 "kind": "pi",
                 "workspace_id": "w-agents",
                 "cwd": str(tmp_path),
-                "pane_id": "w-agents:p-sol",
-                "tab_id": "w-agents:t-sol",
+                "pane_id": "w-agents:p-astra",
+                "tab_id": "w-agents:t-astra",
             },
             {
                 "name": "fable-peer",
@@ -3178,11 +3178,11 @@ def profile_room_state(tmp_path: Path, room: str = "chat-profile") -> dict:
         "schema_version": 1,
         "agents_workspace_id": "w-agents",
         "agents_cwd": str(tmp_path),
-        "participant_pane_ids": {"sol": "w-agents:p-sol", "fable": "w-agents:p-fable"},
-        "participant_tab_ids": {"sol": "w-agents:t-sol", "fable": "w-agents:t-fable"},
+        "participant_pane_ids": {"astra": "w-agents:p-astra", "fable": "w-agents:p-fable"},
+        "participant_tab_ids": {"astra": "w-agents:t-astra", "fable": "w-agents:t-fable"},
         "pending_room_id": room,
         "pending_room_operation_id": "operation-test",
-        "pending_room_profile": "sol-fable",
+        "pending_room_profile": "astra-fable",
         "pending_room_started_unix_ms": int(module.time.time() * 1000),
     }
 
@@ -3192,10 +3192,10 @@ def test_main_execs_profile_room_only_after_complete_verification(
 ) -> None:
     captured: dict[str, object] = {}
     profile_launch_env(tmp_path, monkeypatch, captured)
-    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable")
+    monkeypatch.setenv(module.PROFILE_ENV, "astra-fable")
     monkeypatch.setenv(module.ROOM_ENV, "chat-profile")
     calls = install_launch_host(
-        tmp_path, monkeypatch, {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+        tmp_path, monkeypatch, {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
     )
     save_launcher_state(tmp_path, profile_room_state(tmp_path))
 
@@ -3203,17 +3203,17 @@ def test_main_execs_profile_room_only_after_complete_verification(
 
     # The verified existing sessions are reused and re-verified, not restarted.
     assert not any(call[:2] in (["tab", "create"], ["agent", "start"]) for call in calls)
-    assert ["pi", "--list-models", "gpt-5.6-sol"] in calls
+    assert ["pi", "--list-models", "gpt-6-astra"] in calls
     argv = captured["argv"]
-    assert argv[argv.index("--profile") + 1] == "sol-fable"
+    assert argv[argv.index("--profile") + 1] == "astra-fable"
     mappings = [value for index, value in enumerate(argv) if argv[index - 1] == "--agent"]
-    assert mappings == ["sol=sol-peer", "fable=fable-peer"]
-    assert argv[argv.index("--synthesizer") + 1] == "sol"
+    assert mappings == ["astra=astra-peer", "fable=fable-peer"]
+    assert argv[argv.index("--synthesizer") + 1] == "astra"
     receipt = json.loads(captured["env"][module.PROFILE_RECEIPT_ENV])
-    assert receipt["profile"] == "sol-fable"
-    assert {entry["role"] for entry in receipt["verified"]} == {"sol", "fable"}
+    assert receipt["profile"] == "astra-fable"
+    assert {entry["role"] for entry in receipt["verified"]} == {"astra", "fable"}
     state = load_launcher_state(tmp_path)
-    assert state["selected_profile"] == "sol-fable"
+    assert state["selected_profile"] == "astra-fable"
     assert state["last_room_id"] == "chat-profile"
 
 
@@ -3222,16 +3222,16 @@ def test_main_never_execs_a_profile_room_when_one_role_fails(
 ) -> None:
     captured: dict[str, object] = {}
     profile_launch_env(tmp_path, monkeypatch, captured)
-    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable")
+    monkeypatch.setenv(module.PROFILE_ENV, "astra-fable")
     monkeypatch.setenv(module.ROOM_ENV, "chat-profile")
     calls = install_launch_host(
         tmp_path,
         monkeypatch,
-        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
-        # Sol's session file names a suffixed model identifier: the session
+        {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        # Astra's session file names a suffixed model identifier: the session
         # proof fails; argv can no longer carry the identity at all.
         agent_sessions={
-            "sol-peer": pi_session_lines("openai-codex", "gpt-5.6-sol-01"),
+            "astra-peer": pi_session_lines("openai-codex", "gpt-6-astra-01"),
         },
     )
     save_launcher_state(tmp_path, profile_room_state(tmp_path))
@@ -3241,7 +3241,7 @@ def test_main_never_execs_a_profile_room_when_one_role_fails(
 
     assert "argv" not in captured
     assert "selected_profile" not in load_launcher_state(tmp_path)
-    # The mismatched existing Sol session is excluded without being closed.
+    # The mismatched existing Astra session is excluded without being closed.
     mutations = (("tab", "close"), ("pane", "close"), ("agent", "send-keys"))
     assert not any(tuple(call[:2]) in mutations for call in calls)
 
@@ -3251,14 +3251,14 @@ def test_main_never_execs_a_profile_room_when_both_roles_fail(
 ) -> None:
     captured: dict[str, object] = {}
     profile_launch_env(tmp_path, monkeypatch, captured)
-    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable")
+    monkeypatch.setenv(module.PROFILE_ENV, "astra-fable")
     monkeypatch.setenv(module.ROOM_ENV, "chat-profile")
     install_launch_host(
         tmp_path,
         monkeypatch,
-        {"w-agents:p-sol": "Pi\n", "w-agents:p-fable": "Claude Code\n"},
+        {"w-agents:p-astra": "Pi\n", "w-agents:p-fable": "Claude Code\n"},
         process_infos={
-            "w-agents:p-sol": [{"name": "pi", "argv": ["pi", "--model", "glm-5.3"]}],
+            "w-agents:p-astra": [{"name": "pi", "argv": ["pi", "--model", "glm-5.3"]}],
             "w-agents:p-fable": [{"name": "claude", "argv": ["claude", "--model", "opus"]}],
         },
     )
@@ -3278,11 +3278,11 @@ def test_main_default_room_exec_carries_no_profile_and_clears_stale_binding(
     launch_env(tmp_path, monkeypatch, captured)
     monkeypatch.setenv(module.ROOM_ENV, "chat-default")
     install_launch_host(
-        tmp_path, monkeypatch, {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+        tmp_path, monkeypatch, {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
     )
     state = profile_room_state(tmp_path, room="chat-default")
     state.pop("pending_room_profile")
-    state["selected_profile"] = "sol-fable"
+    state["selected_profile"] = "astra-fable"
     state["last_room_id"] = "chat-older"
     save_launcher_state(tmp_path, state)
 
@@ -3315,27 +3315,27 @@ def test_room_reopen_reverifies_and_execs_with_receipt_and_mappings(
     captured: dict[str, object] = {}
     room_reopen_env(tmp_path, monkeypatch, captured, "chat-profile")
     calls = install_launch_host(
-        tmp_path, monkeypatch, {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+        tmp_path, monkeypatch, {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
     )
     state = profile_room_state(tmp_path)
     state.pop("pending_room_id")
     state.pop("pending_room_operation_id")
     state.pop("pending_room_profile")
     state.pop("pending_room_started_unix_ms")
-    state["selected_profile"] = "sol-fable"
+    state["selected_profile"] = "astra-fable"
     state["last_room_id"] = "chat-profile"
     save_launcher_state(tmp_path, state)
 
     module.room_entrypoint()
 
     argv = captured["argv"]
-    assert argv[argv.index("--profile") + 1] == "sol-fable"
+    assert argv[argv.index("--profile") + 1] == "astra-fable"
     mappings = [value for index, value in enumerate(argv) if argv[index - 1] == "--agent"]
-    assert mappings == ["sol=sol-peer", "fable=fable-peer"]
-    assert argv[argv.index("--synthesizer") + 1] == "sol"
+    assert mappings == ["astra=astra-peer", "fable=fable-peer"]
+    assert argv[argv.index("--synthesizer") + 1] == "astra"
     receipt = json.loads(os.environ[module.PROFILE_RECEIPT_ENV])
     assert receipt == module.profile_receipt_payload(
-        "sol-fable", module.resolve_profile("sol-fable")
+        "astra-fable", module.resolve_profile("astra-fable")
     )
     # Reopen only re-verifies: nothing is started or closed.
     assert not any(
@@ -3387,11 +3387,11 @@ def test_room_reopen_accepts_a_moved_pane(tmp_path: Path, monkeypatch: pytest.Mo
         tmp_path,
         monkeypatch,
         {
-            "w-agents:p-sol": SOL_SCREEN,
-            "w-agents:p-replaced": SOL_SCREEN,
+            "w-agents:p-astra": ASTRA_SCREEN,
+            "w-agents:p-replaced": ASTRA_SCREEN,
             "w-agents:p-fable": FABLE_SCREEN,
         },
-        process_infos={"w-agents:p-replaced": PARTICIPANT_PROCESSES["sol-peer"]},
+        process_infos={"w-agents:p-replaced": PARTICIPANT_PROCESSES["astra-peer"]},
     )
     calls.clear()
     original = module.run_json
@@ -3400,9 +3400,9 @@ def test_room_reopen_accepts_a_moved_pane(tmp_path: Path, monkeypatch: pytest.Mo
         result = original(herdr_bin, arguments, timeout)
         if arguments == ["agent", "list"]:
             for agent in result["result"]["agents"]:
-                if agent["name"] == "sol-peer":
+                if agent["name"] == "astra-peer":
                     agent["pane_id"] = "w-agents:p-replaced"
-        if arguments == ["agent", "get", "sol-peer"]:
+        if arguments == ["agent", "get", "astra-peer"]:
             result["result"]["agent"]["pane_id"] = "w-agents:p-replaced"
         return result
 
@@ -3412,7 +3412,7 @@ def test_room_reopen_accepts_a_moved_pane(tmp_path: Path, monkeypatch: pytest.Mo
     state.pop("pending_room_operation_id")
     state.pop("pending_room_profile")
     state.pop("pending_room_started_unix_ms")
-    state["selected_profile"] = "sol-fable"
+    state["selected_profile"] = "astra-fable"
     state["last_room_id"] = "chat-profile"
     save_launcher_state(tmp_path, state)
 
@@ -3431,11 +3431,11 @@ def test_room_reopen_fails_closed_when_native_evidence_lapsed(
     install_launch_host(
         tmp_path,
         monkeypatch,
-        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
-        # Sol's session file has lapsed onto a different model: re-verification
+        {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        # Astra's session file has lapsed onto a different model: re-verification
         # fails; argv can no longer carry the identity at all.
         agent_sessions={
-            "sol-peer": pi_session_lines("openai-codex", "gpt-5.6-sol-01"),
+            "astra-peer": pi_session_lines("openai-codex", "gpt-6-astra-01"),
         },
     )
     state = profile_room_state(tmp_path)
@@ -3443,11 +3443,11 @@ def test_room_reopen_fails_closed_when_native_evidence_lapsed(
     state.pop("pending_room_operation_id")
     state.pop("pending_room_profile")
     state.pop("pending_room_started_unix_ms")
-    state["selected_profile"] = "sol-fable"
+    state["selected_profile"] = "astra-fable"
     state["last_room_id"] = "chat-profile"
     save_launcher_state(tmp_path, state)
 
-    with pytest.raises(BootstrapError, match=r"@sol.*re-verification"):
+    with pytest.raises(BootstrapError, match=r"@astra.*re-verification"):
         module.room_entrypoint()
 
     assert "argv" not in captured
@@ -3462,25 +3462,25 @@ def test_reopen_process_verifies_every_profile_pane(
     calls = install_launch_host(
         tmp_path,
         monkeypatch,
-        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_POST_TURN_SCREEN},
+        {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_POST_TURN_SCREEN},
     )
     state = profile_room_state(tmp_path)
     state.pop("pending_room_id")
     state.pop("pending_room_operation_id")
     state.pop("pending_room_profile")
     state.pop("pending_room_started_unix_ms")
-    state["selected_profile"] = "sol-fable"
+    state["selected_profile"] = "astra-fable"
     state["last_room_id"] = "chat-profile"
     save_launcher_state(tmp_path, state)
 
     module.room_entrypoint()
 
     receipt = json.loads(os.environ[module.PROFILE_RECEIPT_ENV])
-    assert receipt["profile"] == "sol-fable"
+    assert receipt["profile"] == "astra-fable"
     process_panes = {
         call[call.index("--pane") + 1] for call in calls if call[:2] == ["pane", "process-info"]
     }
-    assert process_panes == {"w-agents:p-sol", "w-agents:p-fable"}
+    assert process_panes == {"w-agents:p-astra", "w-agents:p-fable"}
 
 
 @pytest.mark.parametrize(
@@ -3579,7 +3579,7 @@ def test_fable_process_proof_fails_closed_on_inexact_evidence(
             else (_ for _ in ()).throw(AssertionError(arguments))
         ),
     )
-    fable = module.resolve_profile("sol-fable")[1]
+    fable = module.resolve_profile("astra-fable")[1]
 
     assert not module.participant_process_proves("herdr", fable, "w-agents:p-fable")
 
@@ -3590,14 +3590,14 @@ def test_room_reopen_rejects_stale_cross_room_profile_binding(
     captured: dict[str, object] = {}
     room_reopen_env(tmp_path, monkeypatch, captured, "chat-newer")
     install_launch_host(
-        tmp_path, monkeypatch, {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+        tmp_path, monkeypatch, {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
     )
     state = profile_room_state(tmp_path)
     state.pop("pending_room_id")
     state.pop("pending_room_operation_id")
     state.pop("pending_room_profile")
     state.pop("pending_room_started_unix_ms")
-    state["selected_profile"] = "sol-fable"
+    state["selected_profile"] = "astra-fable"
     state["last_room_id"] = "chat-profile"  # bound to a different room
     save_launcher_state(tmp_path, state)
 
@@ -3613,7 +3613,7 @@ def test_room_reopen_without_a_profile_skips_reverification(
     captured: dict[str, object] = {}
     room_reopen_env(tmp_path, monkeypatch, captured, "chat-default")
     calls = install_launch_host(
-        tmp_path, monkeypatch, {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+        tmp_path, monkeypatch, {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
     )
     save_launcher_state(tmp_path, {"agents_workspace_id": "w-agents"})
 
@@ -3632,7 +3632,7 @@ def test_room_reopen_consumes_its_matching_pending_operation(
     captured: dict[str, object] = {}
     room_reopen_env(tmp_path, monkeypatch, captured, "chat-default")
     install_launch_host(
-        tmp_path, monkeypatch, {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+        tmp_path, monkeypatch, {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
     )
     save_launcher_state(
         tmp_path,
@@ -3710,9 +3710,9 @@ def test_launch_room_with_profile_propagates_env_and_pending_operation(
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
 
-    assert launch_room(open_existing=False, profile="sol-fable") == 0
+    assert launch_room(open_existing=False, profile="astra-fable") == 0
     open_arguments = next(call for call in calls if call[:3] == ["plugin", "pane", "open"])
-    assert f"{module.PROFILE_ENV}=sol-fable" in open_arguments
+    assert f"{module.PROFILE_ENV}=astra-fable" in open_arguments
     state = load_launcher_state(tmp_path)
     assert state["room_pane_id"] == "w-chat:p-new"
     # The outer registration records pane ownership but retains the pending
@@ -3723,7 +3723,7 @@ def test_launch_room_with_profile_propagates_env_and_pending_operation(
         if setting.startswith(f"{module.ROOM_OPERATION_ENV}=")
     )
     assert state["pending_room_operation_id"] == operation
-    assert state["pending_room_profile"] == "sol-fable"
+    assert state["pending_room_profile"] == "astra-fable"
     assert state["pending_room_id"].startswith("chat-")
     assert state["last_room_id"] == state["pending_room_id"]
 
@@ -3738,7 +3738,7 @@ def test_launch_then_inner_claim_completes_the_two_phase_registration(
     monkeypatch.setenv("HERDR_WORKSPACE_ID", "w-chat")
     monkeypatch.setenv("HERDR_TAB_ID", "w-chat:p-room:t")
     monkeypatch.setenv("HERDR_PANE_ID", "w-chat:p-room")
-    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable")
+    monkeypatch.setenv(module.PROFILE_ENV, "astra-fable")
     monkeypatch.setenv(module.ROOM_ENV, "chat-profile")
     monkeypatch.delenv(module.PROFILE_RECEIPT_ENV, raising=False)
     captured: dict[str, object] = {}
@@ -3750,7 +3750,7 @@ def test_launch_then_inner_claim_completes_the_two_phase_registration(
     install_profile_host(
         monkeypatch,
         [],
-        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
         tmp_path=tmp_path,
     )
     original_run_json = module.run_json
@@ -3784,13 +3784,13 @@ def test_launch_then_inner_claim_completes_the_two_phase_registration(
         tmp_path, {"chat_workspace_id": "w-chat", "agents_workspace_id": "w-agents"}
     )
 
-    launch_room(open_existing=False, profile="sol-fable")
+    launch_room(open_existing=False, profile="astra-fable")
     # The inner claim now succeeds instead of failing with profile_operation_mismatch.
     module.main()
 
     assert captured["argv"][0].endswith("herdr-group-chat")
     state = load_launcher_state(tmp_path)
-    assert state["selected_profile"] == "sol-fable"
+    assert state["selected_profile"] == "astra-fable"
     for field in (
         "pending_room_id",
         "pending_room_operation_id",
@@ -3817,7 +3817,7 @@ def test_profile_must_be_tied_to_the_pending_room_operation(
 ) -> None:
     captured: dict[str, object] = {}
     profile_launch_env(tmp_path, monkeypatch, captured)
-    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable")
+    monkeypatch.setenv(module.PROFILE_ENV, "astra-fable")
     save_launcher_state(
         tmp_path,
         {
@@ -3842,22 +3842,22 @@ def test_profile_must_be_tied_to_the_pending_room_operation(
 def test_launch_argument_parsing_is_exact() -> None:
     assert module.parse_launch_arguments([]) == ("setup", None)
     assert module.parse_launch_arguments(["--launch"]) == ("--launch", None)
-    assert module.parse_launch_arguments(["--launch", "--profile", "sol-fable"]) == (
+    assert module.parse_launch_arguments(["--launch", "--profile", "astra-fable"]) == (
         "--launch",
-        "sol-fable",
+        "astra-fable",
     )
     assert module.parse_launch_arguments(["--open"]) == ("--open", None)
     with pytest.raises(BootstrapError, match="only applies to --launch"):
-        module.parse_launch_arguments(["--open", "--profile", "sol-fable"])
+        module.parse_launch_arguments(["--open", "--profile", "astra-fable"])
     with pytest.raises(BootstrapError, match="requires a profile name"):
         module.parse_launch_arguments(["--launch", "--profile"])
     with pytest.raises(BootstrapError, match="unknown arguments"):
-        module.parse_launch_arguments(["--launch", "--profile", "sol-fable", "extra"])
+        module.parse_launch_arguments(["--launch", "--profile", "astra-fable", "extra"])
     with pytest.raises(BootstrapError, match="unknown arguments"):
         module.parse_launch_arguments(["--frobnicate"])
 
 
-# --- default sol-fable-grok profile ---------------------------------------------------
+# --- default astra-fable-grok profile ---------------------------------------------------
 
 GROK_SCREEN = "Grok CLI\nmodel Grok 4.6\nreasoning effort: high\n"
 GROK_POST_TURN_SCREEN = "Grok CLI\nGrok 4.6 (high)\nwaiting for input\n"
@@ -3881,12 +3881,12 @@ GROK_PROCESS = [
 ]
 SFG_LIVE_AGENTS = [
     {
-        "name": "sol-peer",
+        "name": "astra-peer",
         "kind": "pi",
         "workspace_id": "w-agents",
         "cwd": None,
-        "pane_id": "w-agents:p-sol",
-        "tab_id": "w-agents:t-sol",
+        "pane_id": "w-agents:p-astra",
+        "tab_id": "w-agents:t-astra",
     },
     {
         "name": "fable-peer",
@@ -3913,18 +3913,18 @@ def sfg_room_state(tmp_path: Path, room: str = "chat-sfg") -> dict:
         "agents_workspace_id": "w-agents",
         "agents_cwd": str(tmp_path),
         "participant_pane_ids": {
-            "sol": "w-agents:p-sol",
+            "astra": "w-agents:p-astra",
             "fable": "w-agents:p-fable",
             "grok": "w-agents:p-grok",
         },
         "participant_tab_ids": {
-            "sol": "w-agents:t-sol",
+            "astra": "w-agents:t-astra",
             "fable": "w-agents:t-fable",
             "grok": "w-agents:t-grok",
         },
         "pending_room_id": room,
         "pending_room_operation_id": "operation-test",
-        "pending_room_profile": "sol-fable-grok",
+        "pending_room_profile": "astra-fable-grok",
         "pending_room_started_unix_ms": int(module.time.time() * 1000),
     }
 
@@ -3954,22 +3954,22 @@ def install_sfg_host(
     return calls
 
 
-def test_sol_fable_grok_composes_reused_participants_in_exact_order() -> None:
-    sol_fable = module.resolve_profile("sol-fable")
-    triple = module.resolve_profile("sol-fable-grok")
+def test_astra_fable_grok_composes_reused_participants_in_exact_order() -> None:
+    astra_fable = module.resolve_profile("astra-fable")
+    triple = module.resolve_profile("astra-fable-grok")
 
     assert [(p.role, p.name, p.kind) for p in triple] == [
-        ("sol", "sol-peer", "pi"),
+        ("astra", "astra-peer", "pi"),
         ("fable", "fable-peer", "claude"),
         ("grok", "grok46-peer", "grok"),
     ]
-    assert triple[0] is sol_fable[0]  # Sol and Fable are reused, not duplicated
-    assert triple[1] is sol_fable[1]
-    # The stored sol-fable tuple is exactly the same objects and no Grok.
-    assert sol_fable == (module.SOL_PARTICIPANT, module.FABLE_PARTICIPANT)
-    assert all(participant is not module.GROK_PARTICIPANT for participant in sol_fable)
-    arguments, receipt = module.profile_room_exec("sol-fable-grok", triple)
-    assert arguments[arguments.index("--synthesizer") + 1] == "sol"
+    assert triple[0] is astra_fable[0]  # Astra and Fable are reused, not duplicated
+    assert triple[1] is astra_fable[1]
+    # The stored astra-fable tuple is exactly the same objects and no Grok.
+    assert astra_fable == (module.ASTRA_PARTICIPANT, module.FABLE_PARTICIPANT)
+    assert all(participant is not module.GROK_PARTICIPANT for participant in astra_fable)
+    arguments, receipt = module.profile_room_exec("astra-fable-grok", triple)
+    assert arguments[arguments.index("--synthesizer") + 1] == "astra"
     grok_entry = json.loads(receipt)["verified"]
     grok = next(entry for entry in grok_entry if entry["role"] == "grok")
     assert grok == {
@@ -3981,13 +3981,13 @@ def test_sol_fable_grok_composes_reused_participants_in_exact_order() -> None:
         "verification": "native-ui verified",
         "evidence": "process-argv",
     }
-    assert len(sol_fable) == 2  # the stored sol-fable profile is unchanged
+    assert len(astra_fable) == 2  # the stored astra-fable profile is unchanged
 
 
 def test_grok_participant_uses_exact_start_argv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    grok = module.resolve_profile("sol-fable-grok")[2]
+    grok = module.resolve_profile("astra-fable-grok")[2]
 
     assert grok.start_args == (
         "--model",
@@ -4012,7 +4012,7 @@ def test_grok_tab_gets_prepended_grok_bin_path_and_exact_start_argv(
         monkeypatch,
         tmp_path,
         {
-            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-astra": ASTRA_SCREEN,
             "w-agents:p-fable": FABLE_SCREEN,
             "w-agents:p-grok": GROK_SCREEN,
         },
@@ -4027,7 +4027,7 @@ def test_grok_tab_gets_prepended_grok_bin_path_and_exact_start_argv(
         tmp_path,
         launcher_state_path(tmp_path),
         state,
-        participants=module.resolve_profile("sol-fable-grok"),
+        participants=module.resolve_profile("astra-fable-grok"),
     )
 
     assert failures == []
@@ -4083,13 +4083,13 @@ def test_grok_tab_env_has_no_trailing_separator_without_parent_path(
     monkeypatch.delenv("PATH", raising=False)
     assert module.participant_tab_env(grok) == ["--env", expected]
     # Only a participant that declares a prefix gets any env at all.
-    assert module.participant_tab_env(module.SOL_PARTICIPANT) == []
+    assert module.participant_tab_env(module.ASTRA_PARTICIPANT) == []
 
 
 def test_grok_process_proof_requires_the_exact_grok_46_argv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    grok = module.resolve_profile("sol-fable-grok")[2]
+    grok = module.resolve_profile("astra-fable-grok")[2]
 
     def proves(processes: list[dict]) -> bool:
         monkeypatch.setattr(
@@ -4173,7 +4173,7 @@ def test_grok_process_proof_fails_closed_on_inexact_evidence(
             else (_ for _ in ()).throw(AssertionError(arguments))
         ),
     )
-    grok = module.resolve_profile("sol-fable-grok")[2]
+    grok = module.resolve_profile("astra-fable-grok")[2]
 
     assert not module.participant_process_proves("herdr", grok, "w-agents:p-grok")
 
@@ -4191,23 +4191,23 @@ def test_grok_process_proof_accepts_exact_process_argv(
             else (_ for _ in ()).throw(AssertionError(arguments))
         ),
     )
-    grok = module.resolve_profile("sol-fable-grok")[2]
+    grok = module.resolve_profile("astra-fable-grok")[2]
 
     assert module.participant_process_proves("herdr", grok, "w-agents:p-grok")
 
 
-def test_main_never_execs_sol_fable_grok_when_grok_fails(
+def test_main_never_execs_astra_fable_grok_when_grok_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, object] = {}
     profile_launch_env(tmp_path, monkeypatch, captured)
-    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable-grok")
+    monkeypatch.setenv(module.PROFILE_ENV, "astra-fable-grok")
     monkeypatch.setenv(module.ROOM_ENV, "chat-sfg")
     calls = install_sfg_host(
         monkeypatch,
         tmp_path,
         {
-            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-astra": ASTRA_SCREEN,
             "w-agents:p-fable": FABLE_SCREEN,
             "w-agents:p-grok": GROK_SCREEN,
         },
@@ -4233,7 +4233,7 @@ def test_main_never_execs_sol_fable_grok_when_grok_fails(
     assert not any(tuple(call[:2]) in mutations for call in calls)
     # Already-verified earlier peers remain recorded so a retry can reuse them.
     state = load_launcher_state(tmp_path)
-    assert state["participant_pane_ids"]["sol"] == "w-agents:p-sol"
+    assert state["participant_pane_ids"]["astra"] == "w-agents:p-astra"
     assert state["participant_pane_ids"]["fable"] == "w-agents:p-fable"
 
 
@@ -4244,7 +4244,7 @@ def test_failed_new_grok_tab_is_closed_while_verified_peers_remain(
     calls = install_sfg_host(
         monkeypatch,
         tmp_path,
-        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN, "w-agents:p-grok": ""},
+        {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN, "w-agents:p-grok": ""},
         live_agents=[],
         # The started Grok process never runs the exact start argv: proof fails.
         process_infos={"w-agents:p-grok": [{"name": "grok", "argv": ["grok", "--help"]}]},
@@ -4258,14 +4258,14 @@ def test_failed_new_grok_tab_is_closed_while_verified_peers_remain(
         tmp_path,
         launcher_state_path(tmp_path),
         state,
-        participants=module.resolve_profile("sol-fable-grok"),
+        participants=module.resolve_profile("astra-fable-grok"),
     )
 
     assert any("@grok" in failure and "the new tab was closed" in failure for failure in failures)
     assert ["tab", "close", "w-agents:t-grok"] in calls
     assert "grok" not in state.get("participant_pane_ids", {})
     assert "grok" not in state.get("pending_participant_tabs", {})
-    assert state["participant_pane_ids"]["sol"] == "w-agents:p-sol"
+    assert state["participant_pane_ids"]["astra"] == "w-agents:p-astra"
     assert state["participant_pane_ids"]["fable"] == "w-agents:p-fable"
 
 
@@ -4333,7 +4333,7 @@ def install_role_replacement_host(
             # the protocol-21 ``name`` identity field.
             for agent in live_agents:
                 if agent.get("pane_id") == arguments[-1] and agent["name"] in (
-                    "sol-peer",
+                    "astra-peer",
                     "fable-peer",
                     "grok46-peer",
                 ):
@@ -4378,7 +4378,7 @@ def test_classic_room_replaces_only_the_recorded_grok_role_and_keeps_profile_pee
         monkeypatch,
         tmp_path,
         [dict(agent) for agent in SFG_LIVE_AGENTS],
-        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
     )
     state = sfg_room_state(tmp_path)
     for field in (
@@ -4408,9 +4408,9 @@ def test_classic_room_replaces_only_the_recorded_grok_role_and_keeps_profile_pee
     assert recorded_grok_pane != "w-agents:p-grok"
     assert starts["grok-peer"][starts["grok-peer"].index("--kind") + 1] == "grok"
     assert starts["grok-peer"][starts["grok-peer"].index("--pane") + 1] == recorded_grok_pane
-    assert state["participant_pane_ids"]["sol"] == "w-agents:p-sol"
+    assert state["participant_pane_ids"]["astra"] == "w-agents:p-astra"
     assert state["participant_pane_ids"]["fable"] == "w-agents:p-fable"
-    assert state["participant_tab_ids"]["sol"] == "w-agents:t-sol"
+    assert state["participant_tab_ids"]["astra"] == "w-agents:t-astra"
     assert state["participant_tab_ids"]["fable"] == "w-agents:t-fable"
     assert state["participant_tab_ids"]["grok"] != "w-agents:t-grok"
     assert "stale   @grok record" in capsys.readouterr().out.splitlines()
@@ -4421,12 +4421,12 @@ def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
 ) -> None:
     live_agents = [
         {
-            "name": "sol-peer",
+            "name": "astra-peer",
             "kind": "pi",
             "workspace_id": "w-agents",
             "cwd": None,
-            "pane_id": "w-agents:p-sol",
-            "tab_id": "w-agents:t-sol",
+            "pane_id": "w-agents:p-astra",
+            "tab_id": "w-agents:t-astra",
         },
         {
             "name": "fable-peer",
@@ -4450,7 +4450,7 @@ def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
         tmp_path,
         live_agents,
         {
-            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-astra": ASTRA_SCREEN,
             "w-agents:p-fable": FABLE_SCREEN,
             "w-agents:p-fresh1": GROK_SCREEN,
         },
@@ -4460,12 +4460,12 @@ def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
         "agents_workspace_id": "w-agents",
         "agents_cwd": str(tmp_path),
         "participant_pane_ids": {
-            "sol": "w-agents:p-sol",
+            "astra": "w-agents:p-astra",
             "fable": "w-agents:p-fable",
             "grok": "w-agents:p-grok-peer",
         },
         "participant_tab_ids": {
-            "sol": "w-agents:t-sol",
+            "astra": "w-agents:t-astra",
             "fable": "w-agents:t-fable",
             "grok": "w-agents:t-grok-peer",
         },
@@ -4478,7 +4478,7 @@ def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
         tmp_path,
         launcher_state_path(tmp_path),
         state,
-        participants=module.resolve_profile("sol-fable-grok"),
+        participants=module.resolve_profile("astra-fable-grok"),
     )
 
     assert failures == []
@@ -4491,18 +4491,18 @@ def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
     assert grok46[grok46.index("--pane") + 1] == "w-agents:p-fresh1"
     assert grok46[grok46.index("--") + 1 :] == list(module.GROK_START_ARGS)
     assert state["participant_pane_ids"] == {
-        "sol": "w-agents:p-sol",
+        "astra": "w-agents:p-astra",
         "fable": "w-agents:p-fable",
         "grok": "w-agents:p-fresh1",
     }
     assert state["participant_tab_ids"] == {
-        "sol": "w-agents:t-sol",
+        "astra": "w-agents:t-astra",
         "fable": "w-agents:t-fable",
         "grok": "w-agents:t-fresh1",
     }
     output = capsys.readouterr().out.splitlines()
     assert "stale   @grok record" in output
-    assert "ready  @sol (existing sol-peer)" in output
+    assert "ready  @astra (existing astra-peer)" in output
     assert "ready  @fable (existing fable-peer)" in output
 
     pi_calls = install_role_replacement_host(
@@ -4510,7 +4510,7 @@ def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
         tmp_path,
         [dict(agent) for agent in SFG_LIVE_AGENTS],
         {
-            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-astra": ASTRA_SCREEN,
             "w-agents:p-fable": FABLE_POST_TURN_SCREEN,
             "w-agents:p-fresh1": GROK_PI_SCREEN,
         },
@@ -4524,7 +4524,7 @@ def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
             tmp_path,
             launcher_state_path(tmp_path),
             pi_state,
-            participants=module.resolve_profile("sol-fable-grok-pi"),
+            participants=module.resolve_profile("astra-fable-grok-pi"),
         )
         == []
     )
@@ -4532,7 +4532,7 @@ def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
     pi_starts = {call[2]: call for call in pi_calls if call[:2] == ["agent", "start"]}
     assert set(pi_starts) == {"grok46pi-peer"}
     assert pi_state["participant_pane_ids"] == {
-        "sol": "w-agents:p-sol",
+        "astra": "w-agents:p-astra",
         "fable": "w-agents:p-fable",
         "grok": "w-agents:p-fresh1",
     }
@@ -4542,7 +4542,7 @@ def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
         tmp_path,
         [dict(agent) for agent in SFGPI_LIVE_AGENTS],
         {
-            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-astra": ASTRA_SCREEN,
             "w-agents:p-fable": FABLE_POST_TURN_SCREEN,
             "w-agents:p-fresh1": GROK_SCREEN,
         },
@@ -4556,7 +4556,7 @@ def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
             tmp_path,
             launcher_state_path(tmp_path),
             native_state,
-            participants=module.resolve_profile("sol-fable-grok"),
+            participants=module.resolve_profile("astra-fable-grok"),
         )
         == []
     )
@@ -4564,13 +4564,13 @@ def test_profile_relaunch_replaces_only_the_recorded_classic_grok_role(
     native_starts = {call[2]: call for call in native_calls if call[:2] == ["agent", "start"]}
     assert set(native_starts) == {"grok46-peer"}
     assert native_state["participant_pane_ids"] == {
-        "sol": "w-agents:p-sol",
+        "astra": "w-agents:p-astra",
         "fable": "w-agents:p-fable",
         "grok": "w-agents:p-fresh1",
     }
 
 
-def test_room_reopen_reverifies_sol_fable_grok_and_execs_with_receipt(
+def test_room_reopen_reverifies_astra_fable_grok_and_execs_with_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, object] = {}
@@ -4579,7 +4579,7 @@ def test_room_reopen_reverifies_sol_fable_grok_and_execs_with_receipt(
         monkeypatch,
         tmp_path,
         {
-            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-astra": ASTRA_SCREEN,
             "w-agents:p-fable": FABLE_POST_TURN_SCREEN,
             "w-agents:p-grok": GROK_POST_TURN_SCREEN,
         },
@@ -4593,20 +4593,20 @@ def test_room_reopen_reverifies_sol_fable_grok_and_execs_with_receipt(
     state.pop("pending_room_operation_id")
     state.pop("pending_room_profile")
     state.pop("pending_room_started_unix_ms")
-    state["selected_profile"] = "sol-fable-grok"
+    state["selected_profile"] = "astra-fable-grok"
     state["last_room_id"] = "chat-sfg"
     save_launcher_state(tmp_path, state)
 
     module.room_entrypoint()
 
     argv = captured["argv"]
-    assert argv[argv.index("--profile") + 1] == "sol-fable-grok"
+    assert argv[argv.index("--profile") + 1] == "astra-fable-grok"
     mappings = [value for index, value in enumerate(argv) if argv[index - 1] == "--agent"]
-    assert mappings == ["sol=sol-peer", "fable=fable-peer", "grok=grok46-peer"]
-    assert argv[argv.index("--synthesizer") + 1] == "sol"
+    assert mappings == ["astra=astra-peer", "fable=fable-peer", "grok=grok46-peer"]
+    assert argv[argv.index("--synthesizer") + 1] == "astra"
     receipt = json.loads(os.environ[module.PROFILE_RECEIPT_ENV])
     assert receipt == module.profile_receipt_payload(
-        "sol-fable-grok", module.resolve_profile("sol-fable-grok")
+        "astra-fable-grok", module.resolve_profile("astra-fable-grok")
     )
     # Reopen only re-verifies: nothing is started or closed.
     assert not any(
@@ -4615,7 +4615,7 @@ def test_room_reopen_reverifies_sol_fable_grok_and_execs_with_receipt(
     process_panes = {
         call[call.index("--pane") + 1] for call in calls if call[:2] == ["pane", "process-info"]
     }
-    assert process_panes == {"w-agents:p-sol", "w-agents:p-fable", "w-agents:p-grok"}
+    assert process_panes == {"w-agents:p-astra", "w-agents:p-fable", "w-agents:p-grok"}
 
     pi_captured: dict[str, object] = {}
     room_reopen_env(tmp_path, monkeypatch, pi_captured, "chat-sfgpi")
@@ -4623,7 +4623,7 @@ def test_room_reopen_reverifies_sol_fable_grok_and_execs_with_receipt(
         monkeypatch,
         tmp_path,
         {
-            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-astra": ASTRA_SCREEN,
             "w-agents:p-fable": FABLE_POST_TURN_SCREEN,
             "w-agents:p-grokpi": GROK_PI_POST_TURN_SCREEN,
         },
@@ -4636,31 +4636,31 @@ def test_room_reopen_reverifies_sol_fable_grok_and_execs_with_receipt(
         "pending_room_started_unix_ms",
     ):
         pi_state.pop(field)
-    pi_state["selected_profile"] = "sol-fable-grok-pi"
+    pi_state["selected_profile"] = "astra-fable-grok-pi"
     pi_state["last_room_id"] = "chat-sfgpi"
     save_launcher_state(tmp_path, pi_state)
 
     module.room_entrypoint()
 
     pi_argv = pi_captured["argv"]
-    assert pi_argv[pi_argv.index("--profile") + 1] == "sol-fable-grok-pi"
+    assert pi_argv[pi_argv.index("--profile") + 1] == "astra-fable-grok-pi"
     assert [value for index, value in enumerate(pi_argv) if pi_argv[index - 1] == "--agent"] == [
-        "sol=sol-peer",
+        "astra=astra-peer",
         "fable=fable-peer",
         "grok=grok46pi-peer",
     ]
     assert json.loads(os.environ[module.PROFILE_RECEIPT_ENV]) == module.profile_receipt_payload(
-        "sol-fable-grok-pi", module.resolve_profile("sol-fable-grok-pi")
+        "astra-fable-grok-pi", module.resolve_profile("astra-fable-grok-pi")
     )
     assert not any(
         call[:2] in (["agent", "start"], ["tab", "close"], ["pane", "close"]) for call in pi_calls
     )
     assert {
         call[call.index("--pane") + 1] for call in pi_calls if call[:2] == ["pane", "process-info"]
-    } == {"w-agents:p-sol", "w-agents:p-fable", "w-agents:p-grokpi"}
+    } == {"w-agents:p-astra", "w-agents:p-fable", "w-agents:p-grokpi"}
 
 
-# --- sol-fable-glm profile ------------------------------------------------------------
+# --- astra-fable-glm profile ------------------------------------------------------------
 
 # Derived from a live scratch run of `pi --provider bigmodel-coding --model
 # glm-5.3 --thinking high` (pi v0.84.4): the startup status line shows
@@ -4670,12 +4670,12 @@ GLM_SCREEN = "Pi\nprovider bigmodel-coding\nmodel glm-5.3 • high\n"
 GLM_POST_TURN_SCREEN = "Pi\nturn complete\n╰ glm-5.3 • high ─────────────────────── ctx 2% ╯\n"
 SFGLM_LIVE_AGENTS = [
     {
-        "name": "sol-peer",
+        "name": "astra-peer",
         "kind": "pi",
         "workspace_id": "w-agents",
         "cwd": None,
-        "pane_id": "w-agents:p-sol",
-        "tab_id": "w-agents:t-sol",
+        "pane_id": "w-agents:p-astra",
+        "tab_id": "w-agents:t-astra",
     },
     {
         "name": "fable-peer",
@@ -4702,18 +4702,18 @@ def sfglm_room_state(tmp_path: Path, room: str = "chat-sfglm") -> dict:
         "agents_workspace_id": "w-agents",
         "agents_cwd": str(tmp_path),
         "participant_pane_ids": {
-            "sol": "w-agents:p-sol",
+            "astra": "w-agents:p-astra",
             "fable": "w-agents:p-fable",
             "glm": "w-agents:p-glm",
         },
         "participant_tab_ids": {
-            "sol": "w-agents:t-sol",
+            "astra": "w-agents:t-astra",
             "fable": "w-agents:t-fable",
             "glm": "w-agents:t-glm",
         },
         "pending_room_id": room,
         "pending_room_operation_id": "operation-test",
-        "pending_room_profile": "sol-fable-glm",
+        "pending_room_profile": "astra-fable-glm",
         "pending_room_started_unix_ms": int(module.time.time() * 1000),
     }
 
@@ -4743,20 +4743,20 @@ def install_sfglm_host(
     return calls
 
 
-def test_sol_fable_glm_composes_reused_participants_in_exact_order() -> None:
-    sol_fable = module.resolve_profile("sol-fable")
-    triple = module.resolve_profile("sol-fable-glm")
+def test_astra_fable_glm_composes_reused_participants_in_exact_order() -> None:
+    astra_fable = module.resolve_profile("astra-fable")
+    triple = module.resolve_profile("astra-fable-glm")
 
     assert [(p.role, p.name, p.kind) for p in triple] == [
-        ("sol", "sol-peer", "pi"),
+        ("astra", "astra-peer", "pi"),
         ("fable", "fable-peer", "claude"),
         ("glm", "glm-peer", "pi"),
     ]
-    assert triple[0] is sol_fable[0]  # Sol and Fable are reused, not duplicated
-    assert triple[1] is sol_fable[1]
-    assert all(participant is not module.GLM_PARTICIPANT for participant in sol_fable)
-    arguments, receipt = module.profile_room_exec("sol-fable-glm", triple)
-    assert arguments[arguments.index("--synthesizer") + 1] == "sol"
+    assert triple[0] is astra_fable[0]  # Astra and Fable are reused, not duplicated
+    assert triple[1] is astra_fable[1]
+    assert all(participant is not module.GLM_PARTICIPANT for participant in astra_fable)
+    arguments, receipt = module.profile_room_exec("astra-fable-glm", triple)
+    assert arguments[arguments.index("--synthesizer") + 1] == "astra"
     glm_entry = json.loads(receipt)["verified"]
     glm = next(entry for entry in glm_entry if entry["role"] == "glm")
     assert glm == {
@@ -4770,16 +4770,16 @@ def test_sol_fable_glm_composes_reused_participants_in_exact_order() -> None:
         "evidence": "pi-session",
     }
     # The stored profiles are unchanged and never pick up the GLM participant.
-    assert sol_fable == (module.SOL_PARTICIPANT, module.FABLE_PARTICIPANT)
-    assert module.resolve_profile("sol-fable-grok") == (
-        module.SOL_PARTICIPANT,
+    assert astra_fable == (module.ASTRA_PARTICIPANT, module.FABLE_PARTICIPANT)
+    assert module.resolve_profile("astra-fable-grok") == (
+        module.ASTRA_PARTICIPANT,
         module.FABLE_PARTICIPANT,
         module.GROK_PARTICIPANT,
     )
 
 
 def test_glm_participant_uses_exact_start_argv() -> None:
-    glm = module.resolve_profile("sol-fable-glm")[2]
+    glm = module.resolve_profile("astra-fable-glm")[2]
 
     assert glm.start_args == (
         "--provider",
@@ -4791,40 +4791,40 @@ def test_glm_participant_uses_exact_start_argv() -> None:
     )
     assert glm.catalog_command == ("pi", "--list-models", "glm-5.3")
     assert (glm.provider, glm.model, glm.effort) == ("bigmodel-coding", "glm-5.3", "high")
-    # Like Sol, GLM needs no tab PATH prefix; its proof is the pi process argv.
+    # Like Astra, GLM needs no tab PATH prefix; its proof is the pi process argv.
     assert glm.tab_path_prefix == ""
     assert glm.kind == "pi"
 
 
 def test_pi_session_proves_accepts_the_exact_session_events(tmp_path: Path) -> None:
     session = write_pi_session(
-        tmp_path, "sol-peer", pi_session_lines("openai-codex", "gpt-5.6-sol", "high")
+        tmp_path, "astra-peer", pi_session_lines("openai-codex", "gpt-6-astra", "high")
     )
 
-    assert module.pi_session_proves(str(session), "openai-codex", "gpt-5.6-sol", "high")
+    assert module.pi_session_proves(str(session), "openai-codex", "gpt-6-astra", "high")
 
 
 def test_pi_session_proves_rejects_every_mismatch(tmp_path: Path) -> None:
     def proves(
         content_or_path: Path | str,
         provider: str = "openai-codex",
-        model: str = "gpt-5.6-sol",
+        model: str = "gpt-6-astra",
         effort: str = "high",
     ) -> bool:
         path = (
             content_or_path
             if isinstance(content_or_path, Path)
-            else write_pi_session(tmp_path, "sol-peer", content_or_path)
+            else write_pi_session(tmp_path, "astra-peer", content_or_path)
         )
         return module.pi_session_proves(str(path), provider, model, effort)
 
-    assert proves(pi_session_lines("openai-codex", "gpt-5.6-sol"))
+    assert proves(pi_session_lines("openai-codex", "gpt-6-astra"))
     # A missing file fails closed.
     assert not proves(tmp_path / "missing-session.jsonl")
     # Wrong provider, wrong model, wrong thinking level.
-    assert not proves(pi_session_lines("bigmodel-coding", "gpt-5.6-sol"))
-    assert not proves(pi_session_lines("openai-codex", "gpt-5.6-sol-01"))
-    assert not proves(pi_session_lines("openai-codex", "gpt-5.6-sol", effort="medium"))
+    assert not proves(pi_session_lines("bigmodel-coding", "gpt-6-astra"))
+    assert not proves(pi_session_lines("openai-codex", "gpt-6-astra-01"))
+    assert not proves(pi_session_lines("openai-codex", "gpt-6-astra", effort="medium"))
     # No model_change event at all.
     assert not proves(
         json.dumps({"type": "session", "id": "s0", "cwd": "/w"})
@@ -4840,8 +4840,8 @@ def test_pi_session_proves_rejects_every_mismatch(tmp_path: Path) -> None:
         + "\n"
     )
     # A truncated, malformed line fails closed even with the right events above it.
-    assert not proves(pi_session_lines("openai-codex", "gpt-5.6-sol")[:-8])
-    assert not proves(pi_session_lines("openai-codex", "gpt-5.6-sol") + '{"type": "thinking_level_')
+    assert not proves(pi_session_lines("openai-codex", "gpt-6-astra")[:-8])
+    assert not proves(pi_session_lines("openai-codex", "gpt-6-astra") + '{"type": "thinking_level_')
 
 
 def test_pi_session_proves_takes_the_last_model_change(tmp_path: Path) -> None:
@@ -4857,20 +4857,20 @@ def test_pi_session_proves_takes_the_last_model_change(tmp_path: Path) -> None:
         )
 
     glm_first = model_change("m0", "s0", "bigmodel-coding", "glm-5.3")
-    sol_second = model_change("m1", "m0", "openai-codex", "gpt-5.6-sol")
+    astra_second = model_change("m1", "m0", "openai-codex", "gpt-6-astra")
     thinking = json.dumps(
         {"type": "thinking_level_change", "id": "k0", "parentId": "m1", "thinkingLevel": "high"}
     )
     changed_twice = write_pi_session(
-        tmp_path, "sol-peer", glm_first + "\n" + sol_second + "\n" + thinking + "\n"
+        tmp_path, "astra-peer", glm_first + "\n" + astra_second + "\n" + thinking + "\n"
     )
     reverted = write_pi_session(
-        tmp_path, "sol-revert", sol_second + "\n" + glm_first + "\n" + thinking + "\n"
+        tmp_path, "astra-revert", astra_second + "\n" + glm_first + "\n" + thinking + "\n"
     )
 
     # The last model_change wins in both directions.
-    assert module.pi_session_proves(str(changed_twice), "openai-codex", "gpt-5.6-sol", "high")
-    assert not module.pi_session_proves(str(reverted), "openai-codex", "gpt-5.6-sol", "high")
+    assert module.pi_session_proves(str(changed_twice), "openai-codex", "gpt-6-astra", "high")
+    assert not module.pi_session_proves(str(reverted), "openai-codex", "gpt-6-astra", "high")
     assert module.pi_session_proves(str(reverted), "bigmodel-coding", "glm-5.3", "high")
 
 
@@ -4882,7 +4882,7 @@ def test_fresh_launch_proves_pi_from_the_session_file_and_claude_from_argv(
     install_profile_host(
         monkeypatch,
         calls,
-        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
         tmp_path=tmp_path,
     )
     state: dict = {"schema_version": 1}
@@ -4894,26 +4894,26 @@ def test_fresh_launch_proves_pi_from_the_session_file_and_claude_from_argv(
         tmp_path,
         launcher_state_path(tmp_path),
         state,
-        participants=module.resolve_profile("sol-fable"),
+        participants=module.resolve_profile("astra-fable"),
     )
 
     assert failures == []
-    # Sol is proven by the session file `agent get` names, never its argv.
-    assert ["agent", "get", "sol-peer"] in calls
-    assert ["pane", "process-info", "--pane", "w-agents:p-sol"] in calls
+    # Astra is proven by the session file `agent get` names, never its argv.
+    assert ["agent", "get", "astra-peer"] in calls
+    assert ["pane", "process-info", "--pane", "w-agents:p-astra"] in calls
     # Fable is proven by its contiguous argv and never needs a session file.
     assert ["agent", "get", "fable-peer"] not in calls
     assert ["pane", "process-info", "--pane", "w-agents:p-fable"] in calls
 
-    # Each rule fails alone: a wrong Sol session fails Pi even though the pane
-    # runs `pi`, and a wrong Claude argv fails Claude even though Sol proved.
+    # Each rule fails alone: a wrong Astra session fails Pi even though the pane
+    # runs `pi`, and a wrong Claude argv fails Claude even though Astra proved.
     failing: list[list[str]] = []
     install_profile_host(
         monkeypatch,
         failing,
-        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
         tmp_path=tmp_path,
-        agent_sessions={"sol-peer": pi_session_lines("openai-codex", "gpt-5.6-sol-01")},
+        agent_sessions={"astra-peer": pi_session_lines("openai-codex", "gpt-6-astra-01")},
     )
     failures = module.start_participants(
         "herdr",
@@ -4922,17 +4922,17 @@ def test_fresh_launch_proves_pi_from_the_session_file_and_claude_from_argv(
         tmp_path,
         launcher_state_path(tmp_path),
         {"schema_version": 1},
-        participants=module.resolve_profile("sol-fable"),
+        participants=module.resolve_profile("astra-fable"),
     )
-    assert [failure for failure in failures if failure.startswith("@sol")] == [
-        "@sol: sol-peer failed process verification; the new tab was closed"
+    assert [failure for failure in failures if failure.startswith("@astra")] == [
+        "@astra: astra-peer failed process verification; the new tab was closed"
     ]
 
     failing_argv: list[list[str]] = []
     install_profile_host(
         monkeypatch,
         failing_argv,
-        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
         tmp_path=tmp_path,
         process_infos={
             "w-agents:p-fable": [{"name": "claude", "argv": ["claude", "--model", "opus"]}]
@@ -4945,7 +4945,7 @@ def test_fresh_launch_proves_pi_from_the_session_file_and_claude_from_argv(
         tmp_path,
         launcher_state_path(tmp_path),
         {"schema_version": 1},
-        participants=module.resolve_profile("sol-fable"),
+        participants=module.resolve_profile("astra-fable"),
     )
     assert [failure for failure in failures if failure.startswith("@fable")] == [
         "@fable: fable-peer failed process verification; the new tab was closed"
@@ -4953,10 +4953,10 @@ def test_fresh_launch_proves_pi_from_the_session_file_and_claude_from_argv(
 
 
 def test_profile_receipt_evidence_names_each_proof_kind() -> None:
-    _, receipt = module.profile_room_exec("sol-fable", module.resolve_profile("sol-fable"))
+    _, receipt = module.profile_room_exec("astra-fable", module.resolve_profile("astra-fable"))
 
     evidence = {entry["role"]: entry["evidence"] for entry in json.loads(receipt)["verified"]}
-    assert evidence == {"sol": "pi-session", "fable": "process-argv"}
+    assert evidence == {"astra": "pi-session", "fable": "process-argv"}
 
 
 def test_fresh_pi_peer_without_a_session_file_is_bootstrapped_once(
@@ -4966,13 +4966,13 @@ def test_fresh_pi_peer_without_a_session_file_is_bootstrapped_once(
     monkeypatch.setattr(module, "PI_BOOTSTRAPPED_NAMES", set())
     # The fresh peer has never been prompted, so `agent get` names a session
     # path that does not exist yet.
-    session = tmp_path / "bootstrapped-sol-peer.jsonl"
+    session = tmp_path / "bootstrapped-astra-peer.jsonl"
     install_profile_host(
         monkeypatch,
         calls,
-        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
         tmp_path=tmp_path,
-        agent_sessions={"sol-peer": session},
+        agent_sessions={"astra-peer": session},
     )
     host_run_json = module.run_json
 
@@ -4981,7 +4981,7 @@ def test_fresh_pi_peer_without_a_session_file_is_bootstrapped_once(
     ) -> dict:
         if arguments[:2] == ["agent", "prompt"] and not session.exists():
             # Pi writes its session file lazily, on its first prompt.
-            session.write_text(pi_session_lines("openai-codex", "gpt-5.6-sol"))
+            session.write_text(pi_session_lines("openai-codex", "gpt-6-astra"))
         return host_run_json(herdr_bin, arguments, timeout)
 
     monkeypatch.setattr(module, "run_json", prompting_run_json)
@@ -4993,7 +4993,7 @@ def test_fresh_pi_peer_without_a_session_file_is_bootstrapped_once(
         tmp_path,
         launcher_state_path(tmp_path),
         {"schema_version": 1},
-        participants=module.resolve_profile("sol-fable"),
+        participants=module.resolve_profile("astra-fable"),
     )
 
     assert failures == []
@@ -5001,7 +5001,7 @@ def test_fresh_pi_peer_without_a_session_file_is_bootstrapped_once(
         [
             "agent",
             "prompt",
-            "sol-peer",
+            "astra-peer",
             "Do not inspect files or run tools. Reply READY only.",
             "--wait",
             "--timeout",
@@ -5009,7 +5009,7 @@ def test_fresh_pi_peer_without_a_session_file_is_bootstrapped_once(
         ]
     ]
     bootstrapped = module.PI_BOOTSTRAPPED_NAMES
-    assert bootstrapped == {"sol-peer"}
+    assert bootstrapped == {"astra-peer"}
 
 
 def test_fresh_pi_peer_with_a_session_file_is_never_prompted(
@@ -5020,7 +5020,7 @@ def test_fresh_pi_peer_with_a_session_file_is_never_prompted(
     install_profile_host(
         monkeypatch,
         calls,
-        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
         tmp_path=tmp_path,
     )
 
@@ -5031,7 +5031,7 @@ def test_fresh_pi_peer_with_a_session_file_is_never_prompted(
         tmp_path,
         launcher_state_path(tmp_path),
         {"schema_version": 1},
-        participants=module.resolve_profile("sol-fable"),
+        participants=module.resolve_profile("astra-fable"),
     )
 
     assert failures == []
@@ -5046,13 +5046,13 @@ def test_blocked_bootstrap_prompt_fails_closed_without_a_second_prompt(
 ) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(module, "PI_BOOTSTRAPPED_NAMES", set())
-    session = tmp_path / "blocked-sol-peer.jsonl"
+    session = tmp_path / "blocked-astra-peer.jsonl"
     install_profile_host(
         monkeypatch,
         calls,
-        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
         tmp_path=tmp_path,
-        agent_sessions={"sol-peer": session},
+        agent_sessions={"astra-peer": session},
     )
     host_run_json = module.run_json
 
@@ -5075,11 +5075,11 @@ def test_blocked_bootstrap_prompt_fails_closed_without_a_second_prompt(
         tmp_path,
         launcher_state_path(tmp_path),
         state,
-        participants=module.resolve_profile("sol-fable"),
+        participants=module.resolve_profile("astra-fable"),
     )
 
-    assert [failure for failure in failures if failure.startswith("@sol")] == [
-        "@sol: pi is waiting at a blocked startup prompt in the preserved tab; "
+    assert [failure for failure in failures if failure.startswith("@astra")] == [
+        "@astra: pi is waiting at a blocked startup prompt in the preserved tab; "
         "answer the prompt there, then rerun group-chat setup"
     ]
     # Exactly one prompt, never retried, and the blocked peer's tab survives.
@@ -5087,28 +5087,28 @@ def test_blocked_bootstrap_prompt_fails_closed_without_a_second_prompt(
         [
             "agent",
             "prompt",
-            "sol-peer",
+            "astra-peer",
             "Do not inspect files or run tools. Reply READY only.",
             "--wait",
             "--timeout",
             "90000",
         ]
     ]
-    assert state["pending_participant_tabs"]["sol"]["blocked_startup"] is True
+    assert state["pending_participant_tabs"]["astra"]["blocked_startup"] is True
     assert not any(
         tuple(call[:2]) in {("tab", "close"), ("pane", "close")}
         for call in calls
-        if call[2:3] == ["w-agents:t-sol"]
+        if call[2:3] == ["w-agents:t-astra"]
     )
 
 
 def test_bootstrap_is_sent_once_and_fails_closed_when_the_file_never_appears(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    sol = module.resolve_profile("sol-fable")[0]
+    astra = module.resolve_profile("astra-fable")[0]
     monkeypatch.setattr(module, "PI_BOOTSTRAPPED_NAMES", set())
     monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
-    session = tmp_path / "never-written-sol.jsonl"
+    session = tmp_path / "never-written-astra.jsonl"
     calls: list[list[str]] = []
 
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
@@ -5120,7 +5120,7 @@ def test_bootstrap_is_sent_once_and_fails_closed_when_the_file_never_appears(
             return {
                 "result": {
                     "agent": {
-                        "name": sol.name,
+                        "name": astra.name,
                         "kind": "pi",
                         "agent_session": {"kind": "path", "value": str(session)},
                     }
@@ -5132,15 +5132,15 @@ def test_bootstrap_is_sent_once_and_fails_closed_when_the_file_never_appears(
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
 
-    assert not module.participant_process_proves("herdr", sol, "w-agents:p-sol", bootstrap=True)
+    assert not module.participant_process_proves("herdr", astra, "w-agents:p-astra", bootstrap=True)
     assert len([call for call in calls if call[:2] == ["agent", "prompt"]]) == 1
     # A second proof within the same launch never bootstraps again.
-    assert not module.participant_process_proves("herdr", sol, "w-agents:p-sol", bootstrap=True)
+    assert not module.participant_process_proves("herdr", astra, "w-agents:p-astra", bootstrap=True)
     assert [call for call in calls if call[:2] == ["agent", "prompt"]] == [
         [
             "agent",
             "prompt",
-            "sol-peer",
+            "astra-peer",
             "Do not inspect files or run tools. Reply READY only.",
             "--wait",
             "--timeout",
@@ -5157,21 +5157,21 @@ def test_reopen_with_a_missing_session_file_is_not_owned_and_never_prompts(
     calls = install_launch_host(
         tmp_path,
         monkeypatch,
-        {"w-agents:p-sol": SOL_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
+        {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN},
         # The peer never wrote its session file: reopen treats it as not
         # owned rather than prompting a peer it did not launch.
-        agent_sessions={"sol-peer": tmp_path / "never-written-sol.jsonl"},
+        agent_sessions={"astra-peer": tmp_path / "never-written-astra.jsonl"},
     )
     state = profile_room_state(tmp_path)
     state.pop("pending_room_id")
     state.pop("pending_room_operation_id")
     state.pop("pending_room_profile")
     state.pop("pending_room_started_unix_ms")
-    state["selected_profile"] = "sol-fable"
+    state["selected_profile"] = "astra-fable"
     state["last_room_id"] = "chat-profile"
     save_launcher_state(tmp_path, state)
 
-    with pytest.raises(BootstrapError, match=r"@sol.*re-verification"):
+    with pytest.raises(BootstrapError, match=r"@astra.*re-verification"):
         module.room_entrypoint()
 
     assert not any(call[:2] == ["agent", "prompt"] for call in calls)
@@ -5180,14 +5180,14 @@ def test_reopen_with_a_missing_session_file_is_not_owned_and_never_prompts(
 
 def test_receipt_names_a_bootstrapped_pi_peer(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(module, "PI_BOOTSTRAPPED_NAMES", set())
-    assert module.participant_proof_kind(module.SOL_PARTICIPANT) == "pi-session"
+    assert module.participant_proof_kind(module.ASTRA_PARTICIPANT) == "pi-session"
 
-    module.PI_BOOTSTRAPPED_NAMES.add("sol-peer")
-    assert module.participant_proof_kind(module.SOL_PARTICIPANT) == "pi-session (bootstrapped)"
+    module.PI_BOOTSTRAPPED_NAMES.add("astra-peer")
+    assert module.participant_proof_kind(module.ASTRA_PARTICIPANT) == "pi-session (bootstrapped)"
     assert module.participant_proof_kind(module.FABLE_PARTICIPANT) == "process-argv"
-    _, receipt = module.profile_room_exec("sol-fable", module.resolve_profile("sol-fable"))
+    _, receipt = module.profile_room_exec("astra-fable", module.resolve_profile("astra-fable"))
     evidence = {entry["role"]: entry["evidence"] for entry in json.loads(receipt)["verified"]}
-    assert evidence == {"sol": "pi-session (bootstrapped)", "fable": "process-argv"}
+    assert evidence == {"astra": "pi-session (bootstrapped)", "fable": "process-argv"}
 
 
 def pi_session_proof_harness(
@@ -5232,7 +5232,7 @@ def pi_session_proof_harness(
 def test_glm_session_proof_requires_the_exact_glm_53_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    glm = module.resolve_profile("sol-fable-glm")[2]
+    glm = module.resolve_profile("astra-fable-glm")[2]
     proves = pi_session_proof_harness(monkeypatch, tmp_path, glm, "w-agents:p-glm")
 
     # The rewritten-title process proves the executable; the session file
@@ -5257,7 +5257,7 @@ def test_glm_tab_is_created_without_path_env_and_started_with_exact_argv(
         monkeypatch,
         tmp_path,
         {
-            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-astra": ASTRA_SCREEN,
             "w-agents:p-fable": FABLE_SCREEN,
             "w-agents:p-glm": GLM_SCREEN,
         },
@@ -5272,7 +5272,7 @@ def test_glm_tab_is_created_without_path_env_and_started_with_exact_argv(
         tmp_path,
         launcher_state_path(tmp_path),
         state,
-        participants=module.resolve_profile("sol-fable-glm"),
+        participants=module.resolve_profile("astra-fable-glm"),
     )
 
     assert failures == []
@@ -5304,18 +5304,18 @@ def test_glm_tab_is_created_without_path_env_and_started_with_exact_argv(
     assert state["participant_tab_ids"]["glm"] == "w-agents:t-glm"
 
 
-def test_main_never_execs_sol_fable_glm_when_glm_fails(
+def test_main_never_execs_astra_fable_glm_when_glm_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, object] = {}
     profile_launch_env(tmp_path, monkeypatch, captured)
-    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable-glm")
+    monkeypatch.setenv(module.PROFILE_ENV, "astra-fable-glm")
     monkeypatch.setenv(module.ROOM_ENV, "chat-sfglm")
     calls = install_sfglm_host(
         monkeypatch,
         tmp_path,
         {
-            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-astra": ASTRA_SCREEN,
             "w-agents:p-fable": FABLE_SCREEN,
             "w-agents:p-glm": GLM_SCREEN,
         },
@@ -5337,11 +5337,11 @@ def test_main_never_execs_sol_fable_glm_when_glm_fails(
     assert not any(tuple(call[:2]) in mutations for call in calls)
     # Already-verified earlier peers remain recorded so a retry can reuse them.
     state = load_launcher_state(tmp_path)
-    assert state["participant_pane_ids"]["sol"] == "w-agents:p-sol"
+    assert state["participant_pane_ids"]["astra"] == "w-agents:p-astra"
     assert state["participant_pane_ids"]["fable"] == "w-agents:p-fable"
 
 
-def test_room_reopen_reverifies_sol_fable_glm_and_execs_with_receipt(
+def test_room_reopen_reverifies_astra_fable_glm_and_execs_with_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, object] = {}
@@ -5350,7 +5350,7 @@ def test_room_reopen_reverifies_sol_fable_glm_and_execs_with_receipt(
         monkeypatch,
         tmp_path,
         {
-            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-astra": ASTRA_SCREEN,
             "w-agents:p-fable": FABLE_POST_TURN_SCREEN,
             "w-agents:p-glm": GLM_POST_TURN_SCREEN,
         },
@@ -5361,20 +5361,20 @@ def test_room_reopen_reverifies_sol_fable_glm_and_execs_with_receipt(
     state.pop("pending_room_operation_id")
     state.pop("pending_room_profile")
     state.pop("pending_room_started_unix_ms")
-    state["selected_profile"] = "sol-fable-glm"
+    state["selected_profile"] = "astra-fable-glm"
     state["last_room_id"] = "chat-sfglm"
     save_launcher_state(tmp_path, state)
 
     module.room_entrypoint()
 
     argv = captured["argv"]
-    assert argv[argv.index("--profile") + 1] == "sol-fable-glm"
+    assert argv[argv.index("--profile") + 1] == "astra-fable-glm"
     mappings = [value for index, value in enumerate(argv) if argv[index - 1] == "--agent"]
-    assert mappings == ["sol=sol-peer", "fable=fable-peer", "glm=glm-peer"]
-    assert argv[argv.index("--synthesizer") + 1] == "sol"
+    assert mappings == ["astra=astra-peer", "fable=fable-peer", "glm=glm-peer"]
+    assert argv[argv.index("--synthesizer") + 1] == "astra"
     receipt = json.loads(os.environ[module.PROFILE_RECEIPT_ENV])
     assert receipt == module.profile_receipt_payload(
-        "sol-fable-glm", module.resolve_profile("sol-fable-glm")
+        "astra-fable-glm", module.resolve_profile("astra-fable-glm")
     )
     # Reopen only re-verifies: nothing is started or closed.
     assert not any(
@@ -5383,21 +5383,21 @@ def test_room_reopen_reverifies_sol_fable_glm_and_execs_with_receipt(
     process_panes = {
         call[call.index("--pane") + 1] for call in calls if call[:2] == ["pane", "process-info"]
     }
-    assert process_panes == {"w-agents:p-sol", "w-agents:p-fable", "w-agents:p-glm"}
+    assert process_panes == {"w-agents:p-astra", "w-agents:p-fable", "w-agents:p-glm"}
 
 
-# --- default sol-fable-grok-pi profile -----------------------------------------------
+# --- default astra-fable-grok-pi profile -----------------------------------------------
 
 GROK_PI_SCREEN = "Pi\nprovider xai\nmodel grok-4.6 • high\n"
 GROK_PI_POST_TURN_SCREEN = "Pi\nturn complete\n╰ grok-4.6 • high ───────────── ctx 2% ╯\n"
 SFGPI_LIVE_AGENTS = [
     {
-        "name": "sol-peer",
+        "name": "astra-peer",
         "kind": "pi",
         "workspace_id": "w-agents",
         "cwd": None,
-        "pane_id": "w-agents:p-sol",
-        "tab_id": "w-agents:t-sol",
+        "pane_id": "w-agents:p-astra",
+        "tab_id": "w-agents:t-astra",
     },
     {
         "name": "fable-peer",
@@ -5424,18 +5424,18 @@ def sfgpi_room_state(tmp_path: Path, room: str = "chat-sfgpi") -> dict:
         "agents_workspace_id": "w-agents",
         "agents_cwd": str(tmp_path),
         "participant_pane_ids": {
-            "sol": "w-agents:p-sol",
+            "astra": "w-agents:p-astra",
             "fable": "w-agents:p-fable",
             "grok": "w-agents:p-grokpi",
         },
         "participant_tab_ids": {
-            "sol": "w-agents:t-sol",
+            "astra": "w-agents:t-astra",
             "fable": "w-agents:t-fable",
             "grok": "w-agents:t-grokpi",
         },
         "pending_room_id": room,
         "pending_room_operation_id": "operation-test",
-        "pending_room_profile": "sol-fable-grok-pi",
+        "pending_room_profile": "astra-fable-grok-pi",
         "pending_room_started_unix_ms": int(module.time.time() * 1000),
     }
 
@@ -5463,24 +5463,24 @@ def install_sfgpi_host(
     return calls
 
 
-def test_sol_fable_grok_pi_reuses_sol_fable_and_preserves_native_grok_profile() -> None:
-    sol_fable = module.resolve_profile("sol-fable")
-    pi_grok = module.resolve_profile("sol-fable-grok-pi")
+def test_astra_fable_grok_pi_reuses_astra_fable_and_preserves_native_grok_profile() -> None:
+    astra_fable = module.resolve_profile("astra-fable")
+    pi_grok = module.resolve_profile("astra-fable-grok-pi")
 
     assert [(p.role, p.name, p.kind) for p in pi_grok] == [
-        ("sol", "sol-peer", "pi"),
+        ("astra", "astra-peer", "pi"),
         ("fable", "fable-peer", "claude"),
         ("grok", "grok46pi-peer", "pi"),
     ]
-    assert pi_grok[:2] == sol_fable
-    assert pi_grok[0] is sol_fable[0]
-    assert pi_grok[1] is sol_fable[1]
-    assert module.resolve_profile("sol-fable-grok") == (
-        module.SOL_PARTICIPANT,
+    assert pi_grok[:2] == astra_fable
+    assert pi_grok[0] is astra_fable[0]
+    assert pi_grok[1] is astra_fable[1]
+    assert module.resolve_profile("astra-fable-grok") == (
+        module.ASTRA_PARTICIPANT,
         module.FABLE_PARTICIPANT,
         module.GROK_PARTICIPANT,
     )
-    _, receipt = module.profile_room_exec("sol-fable-grok-pi", pi_grok)
+    _, receipt = module.profile_room_exec("astra-fable-grok-pi", pi_grok)
     assert next(entry for entry in json.loads(receipt)["verified"] if entry["role"] == "grok") == {
         "role": "grok",
         "target": "grok46pi-peer",
@@ -5494,7 +5494,7 @@ def test_sol_fable_grok_pi_reuses_sol_fable_and_preserves_native_grok_profile() 
 
 
 def test_grok_pi_uses_the_exact_xai_argv_and_no_fallback() -> None:
-    grok = module.resolve_profile("sol-fable-grok-pi")[2]
+    grok = module.resolve_profile("astra-fable-grok-pi")[2]
 
     assert grok.start_args == (
         "--provider",
@@ -5513,7 +5513,7 @@ def test_grok_pi_uses_the_exact_xai_argv_and_no_fallback() -> None:
 def test_grok_pi_catalog_requires_the_exact_xai_grok_46_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    grok = module.resolve_profile("sol-fable-grok-pi")[2]
+    grok = module.resolve_profile("astra-fable-grok-pi")[2]
 
     def proves(stdout: str) -> bool:
         monkeypatch.setattr(
@@ -5537,7 +5537,7 @@ def test_grok_pi_catalog_requires_the_exact_xai_grok_46_row(
 def test_grok_pi_session_proof_requires_the_exact_xai_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    grok = module.resolve_profile("sol-fable-grok-pi")[2]
+    grok = module.resolve_profile("astra-fable-grok-pi")[2]
     proves = pi_session_proof_harness(monkeypatch, tmp_path, grok, "w-agents:p-grokpi")
 
     assert proves(PI_PROCESS, pi_session_lines("xai", "grok-4.6"))
@@ -5591,7 +5591,7 @@ def test_grok_pi_starts_with_exact_argv_after_catalog_proof(
         monkeypatch,
         calls,
         {
-            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-astra": ASTRA_SCREEN,
             "w-agents:p-fable": FABLE_SCREEN,
             "w-agents:p-grok": GROK_PI_SCREEN,
         },
@@ -5606,7 +5606,7 @@ def test_grok_pi_starts_with_exact_argv_after_catalog_proof(
         tmp_path,
         launcher_state_path(tmp_path),
         state,
-        participants=module.resolve_profile("sol-fable-grok-pi"),
+        participants=module.resolve_profile("astra-fable-grok-pi"),
     )
 
     assert failures == []
@@ -5644,7 +5644,7 @@ def test_grok_pi_starts_with_exact_argv_after_catalog_proof(
 def adopt_live_agents(workspace_id: str, cwd: str, names: tuple[str, ...] = ()) -> list[dict]:
     """The six live peers the restart orphaned, exact names and kinds."""
     specs = [
-        ("sol-peer", "pi"),
+        ("astra-peer", "pi"),
         ("fable-peer", "claude"),
         ("grok46-peer", "grok"),
         ("pi-peer", "pi"),
@@ -5678,7 +5678,7 @@ def install_adopt_host(
     calls: list[list[str]] = []
     # Adopted peers have already taken turns, so Fable and Grok present their
     # reopen evidence — post-turn pane text plus the exact native foreground
-    # process argv — wherever they are live; Sol keeps its persistent footer.
+    # process argv — wherever they are live; Astra keeps its persistent footer.
     reopen_processes: dict[str, list[dict]] = {}
     for agent in live:
         if agent.get("name") == "fable-peer":
@@ -5689,7 +5689,7 @@ def install_adopt_host(
         pane_screens
         if pane_screens is not None
         else {
-            "w1E:p-sol": SOL_SCREEN,
+            "w1E:p-astra": ASTRA_SCREEN,
             "w1E:p-fable": FABLE_POST_TURN_SCREEN,
             "w1E:p-grok46": GROK_POST_TURN_SCREEN,
         }
@@ -5727,7 +5727,7 @@ def test_adopt_peers_reports_the_owned_roles_from_any_workspace(
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_cwd": str(tmp_path)}))
     live = [
-        *adopt_live_agents("w1E", str(tmp_path), names=("sol-peer", "fable-peer")),
+        *adopt_live_agents("w1E", str(tmp_path), names=("astra-peer", "fable-peer")),
         *adopt_live_agents("w-somewhere-else", str(tmp_path), names=("pi-peer",)),
     ]
     calls = install_adopt_host(
@@ -5746,24 +5746,24 @@ def test_adopt_peers_reports_the_owned_roles_from_any_workspace(
     assert state["agents_cwd"] == str(tmp_path)
     assert state["participant_pane_ids"] == {
         "pi": "w-somewhere-else:p-pi",
-        "sol": "w1E:p-sol",
+        "astra": "w1E:p-astra",
         "fable": "w1E:p-fable",
     }
     assert state["participant_tab_ids"] == {
         "pi": "w-somewhere-else:t-pi",
-        "sol": "w1E:t-sol",
+        "astra": "w1E:t-astra",
         "fable": "w1E:t-fable",
     }
     out = capsys.readouterr().out.splitlines()
     owned_lines = [line for line in out if line.startswith("owned @")]
-    assert [line.split()[1] for line in owned_lines] == ["@pi", "@sol", "@fable"]
+    assert [line.split()[1] for line in owned_lines] == ["@pi", "@astra", "@fable"]
     assert "owned @pi (pi-peer, pane w-somewhere-else:p-pi)" in out
     assert "3 peers owned at cwd " in out[-1]
     assert not any(tuple(call[:2]) in ADOPT_MUTATIONS for call in calls)
 
 
 def _adopt_kind_mismatch_live() -> list[dict]:
-    live = adopt_live_agents("w1E", "/gone", names=("sol-peer", "codex-peer"))
+    live = adopt_live_agents("w1E", "/gone", names=("astra-peer", "codex-peer"))
     live[1]["kind"] = "pi"  # codex-peer is reported as a pi agent
     return live
 
@@ -5777,8 +5777,8 @@ def _adopt_kind_mismatch_live() -> list[dict]:
             id="kind-mismatch",
         ),
         pytest.param(
-            adopt_live_agents("w1E", "/gone", names=("sol-peer",)),
-            "not owned @sol (sol-peer): cwd /gone, not ",
+            adopt_live_agents("w1E", "/gone", names=("astra-peer",)),
+            "not owned @astra (astra-peer): cwd /gone, not ",
             id="different-cwd",
         ),
         pytest.param(
@@ -5853,7 +5853,7 @@ def test_adopt_peers_never_touches_workspaces_or_placeholders(
     )
     calls = install_adopt_host(
         monkeypatch,
-        adopt_live_agents("w1E", str(tmp_path), names=("sol-peer",)),
+        adopt_live_agents("w1E", str(tmp_path), names=("astra-peer",)),
         workspaces=[
             {"workspace_id": "w1E", "label": "agents · group-chat"},
             {"workspace_id": "w1Z", "label": "agents · group-chat"},
@@ -5874,19 +5874,19 @@ def test_adopt_then_atomic_profile_launch_succeeds_against_the_same_fake(
 ) -> None:
     captured: dict[str, object] = {}
     profile_launch_env(tmp_path, monkeypatch, captured)
-    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable-grok")
+    monkeypatch.setenv(module.PROFILE_ENV, "astra-fable-grok")
     monkeypatch.setenv(module.ROOM_ENV, "chat-sfg")
     calls = install_adopt_host(
         monkeypatch,
         [
-            *adopt_live_agents("w1E", str(tmp_path), names=("sol-peer", "fable-peer")),
+            *adopt_live_agents("w1E", str(tmp_path), names=("astra-peer", "fable-peer")),
             *adopt_live_agents("w1E", str(tmp_path), names=("grok46-peer",)),
         ],
         # The launch after adoption re-verifies Fable on reuse with the fresh
         # banner, so its pane keeps the startup screen, which also carries the
         # reopen `Fable 5` sequence; the reopen process argv is still supplied.
         pane_screens={
-            "w1E:p-sol": SOL_SCREEN,
+            "w1E:p-astra": ASTRA_SCREEN,
             "w1E:p-fable": FABLE_SCREEN,
             "w1E:p-grok46": GROK_POST_TURN_SCREEN,
         },
@@ -5906,13 +5906,13 @@ def test_adopt_then_atomic_profile_launch_succeeds_against_the_same_fake(
     module.main()
 
     argv = captured["argv"]
-    assert argv[argv.index("--profile") + 1] == "sol-fable-grok"
+    assert argv[argv.index("--profile") + 1] == "astra-fable-grok"
     mappings = [value for index, value in enumerate(argv) if argv[index - 1] == "--agent"]
-    assert mappings == ["sol=sol-peer", "fable=fable-peer", "grok=grok46-peer"]
+    assert mappings == ["astra=astra-peer", "fable=fable-peer", "grok=grok46-peer"]
     # The adopted sessions are reused and re-verified, never restarted.
     assert not any(call[:2] in (["tab", "create"], ["agent", "start"]) for call in calls)
     final_state = load_launcher_state(tmp_path)
-    assert final_state["selected_profile"] == "sol-fable-grok"
+    assert final_state["selected_profile"] == "astra-fable-grok"
     assert final_state["agents_workspace_id"] == "w1E"
 
 
@@ -5921,14 +5921,14 @@ def test_profile_incomplete_message_and_record_carry_each_role_reason(
 ) -> None:
     captured: dict[str, object] = {}
     profile_launch_env(tmp_path, monkeypatch, captured)
-    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable-grok")
+    monkeypatch.setenv(module.PROFILE_ENV, "astra-fable-grok")
     monkeypatch.setenv(module.ROOM_ENV, "chat-sfg")
     live = [dict(agent) for agent in SFG_LIVE_AGENTS]
     calls = install_sfg_host(
         monkeypatch,
         tmp_path,
         {
-            "w-agents:p-sol": SOL_SCREEN,
+            "w-agents:p-astra": ASTRA_SCREEN,
             "w-agents:p-fable": FABLE_SCREEN,
             "w-agents:p-grok": GROK_SCREEN,
         },
@@ -5965,7 +5965,7 @@ def test_profile_incomplete_message_and_record_carry_each_role_reason(
         "@grok: grok46-peer failed process verification; the session was left open"
     )
     record = module._launcher_error_record(
-        "--launch", ["--launch", "--profile", "sol-fable-grok"], error
+        "--launch", ["--launch", "--profile", "astra-fable-grok"], error
     )
     assert record["failures"] == error.failures
     plain = module._launcher_error_record("setup", [], BootstrapError("boom"))
@@ -6002,7 +6002,7 @@ def _record_failure(
     monkeypatch.setenv("HERDR_WORKSPACE_ID", "w-ctx")
     monkeypatch.setenv("HERDR_TAB_ID", "w-ctx:t-ctx")
     monkeypatch.setenv("HERDR_PANE_ID", "w-ctx:p-ctx")
-    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable")
+    monkeypatch.setenv(module.PROFILE_ENV, "astra-fable")
     monkeypatch.setenv(
         "HERDR_PLUGIN_CONTEXT_JSON",
         json.dumps(
@@ -6049,7 +6049,7 @@ def test_bootstrap_failure_is_recorded_and_exits_two(
         "tab_id": "w-ctx:t-ctx",
         "pane_id": "w-ctx:p-ctx",
         "plugin_state_dir": str(tmp_path),
-        "profile": "sol-fable",
+        "profile": "astra-fable",
         "plugin_context": {
             "workspace_id": "w-ctx",
             "tab_id": "w-ctx:t-ctx",
@@ -6199,7 +6199,7 @@ def test_inspection_argument_parsing_is_exact() -> None:
         ["--place"],
         ["--place", "diagonal"],
         ["--place", "compact", "grid"],
-        ["--place", "compact", "--profile", "sol-fable"],
+        ["--place", "compact", "--profile", "astra-fable"],
     ):
         with pytest.raises(BootstrapError, match="requires exactly one layout"):
             module.parse_launch_arguments(arguments)
@@ -6220,7 +6220,7 @@ def test_place_mode_reads_recorded_ids_and_prints_one_json_line(
             "room_pane_id": "w-chat:p-room",
             "room_tab_id": "w-chat:t-room",
             "chat_workspace_id": "w-chat",
-            "selected_profile": "sol-fable",
+            "selected_profile": "astra-fable",
             "agents_cwd": PLACE_AGENTS_CWD,
         },
     )
@@ -6254,9 +6254,9 @@ def test_place_mode_reads_recorded_ids_and_prints_one_json_line(
     assert module.run_launcher(["--place", "grid"]) == 0
 
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
-    assert lines == ['{"layout":"grid","moved":["sol"]}']
+    assert lines == ['{"layout":"grid","moved":["astra"]}']
     moves = [call for call in calls if call[:2] == ["pane", "move"]]
-    assert [move[2] for move in moves] == ["w-room:p-sol-peer"]
+    assert [move[2] for move in moves] == ["w-room:p-astra-peer"]
     assert moves[0][moves[0].index("--target-pane") + 1] == "w-chat:p-room"
     assert load_launcher_state(tmp_path)["layout"] == "grid"
 
@@ -6276,11 +6276,14 @@ def test_settings_parse_grid_and_opus(tmp_path: Path, monkeypatch: pytest.Monkey
     monkeypatch.setenv("HERDR_GROUP_CHAT_SETTINGS", str(path))
     settings = module.load_settings("terry.herdr-group-chat")
     assert settings == module.Settings(layout="grid", opus=True)
-    assert module.apply_settings_profile("sol-fable-grok-pi", settings) == "sol-fable-grok-opus-pi"
-    assert module.apply_settings_profile("sol-fable", settings) == "sol-fable"
+    assert (
+        module.apply_settings_profile("astra-fable-grok-pi", settings) == "astra-fable-grok-opus-pi"
+    )
+    assert module.apply_settings_profile("astra-fable", settings) == "astra-fable"
     assert module.apply_settings_profile(None, settings) is None
     assert (
-        module.apply_settings_profile("sol-fable-grok-pi", module.Settings()) == "sol-fable-grok-pi"
+        module.apply_settings_profile("astra-fable-grok-pi", module.Settings())
+        == "astra-fable-grok-pi"
     )
 
 
@@ -6322,11 +6325,11 @@ def test_opus_participant_and_profile_are_exact():
         ("--model", "opus", "--effort", "high"),
     )
 
-    roster = module.resolve_profile("sol-fable-grok-opus-pi")
-    assert [participant.role for participant in roster] == ["sol", "fable", "grok", "opus"]
+    roster = module.resolve_profile("astra-fable-grok-opus-pi")
+    assert [participant.role for participant in roster] == ["astra", "fable", "grok", "opus"]
     assert roster[2] is module.GROK_PI_PARTICIPANT
-    arguments, _ = module.profile_room_exec("sol-fable-grok-opus-pi", roster)
-    assert arguments[-2:] == ["--synthesizer", "sol"]
+    arguments, _ = module.profile_room_exec("astra-fable-grok-opus-pi", roster)
+    assert arguments[-2:] == ["--synthesizer", "astra"]
     assert "--agent" in arguments and "opus=opus-peer" in arguments
 
 
@@ -6356,9 +6359,9 @@ def test_place_grid_moves_new_peers_in_roster_order_and_restores_focus(
 ):
     """The room pane anchors the stack; peers already in the room tab stay put."""
     calls: list[list[str]] = []
-    roster = module.resolve_profile("sol-fable-grok-pi")
+    roster = module.resolve_profile("astra-fable-grok-pi")
     moved: set[str] = set()
-    kinds = {"sol-peer": "pi", "fable-peer": "claude", "grok46pi-peer": "pi"}
+    kinds = {"astra-peer": "pi", "fable-peer": "claude", "grok46pi-peer": "pi"}
 
     def agent_payload(name: str) -> dict:
         role = name.removesuffix("-peer")
@@ -6371,8 +6374,8 @@ def test_place_grid_moves_new_peers_in_roster_order_and_restores_focus(
                 tab_id="w-chat:t-room",
                 workspace_id="w-chat",
             )
-        # Sol never left the room tab of a partial relaunch; it is not moved.
-        tab = "w-chat:t-room" if name == "sol-peer" else "w-old:t-room"
+        # Astra never left the room tab of a partial relaunch; it is not moved.
+        tab = "w-chat:t-room" if name == "astra-peer" else "w-old:t-room"
         return place_agent_record(
             name,
             kinds[name],
@@ -6408,12 +6411,12 @@ def test_place_grid_moves_new_peers_in_roster_order_and_restores_focus(
         "agents_cwd": PLACE_AGENTS_CWD,
         # Stale ids from the replaced room tab; the live reads must bypass them.
         "participant_pane_ids": {
-            "sol": "w-gone:p-sol",
+            "astra": "w-gone:p-astra",
             "fable": "w-gone:p-fable",
             "grok": "w-gone:p-grok",
         },
         "participant_tab_ids": {
-            "sol": "w-gone:t-sol",
+            "astra": "w-gone:t-astra",
             "fable": "w-gone:t-fable",
             "grok": "w-gone:t-grok",
         },
@@ -6460,7 +6463,9 @@ def test_place_grid_moves_new_peers_in_roster_order_and_restores_focus(
     for move in moves:
         name = move[2].rsplit(":p-", 1)[1] + "-peer"
         assert calls.index(["agent", "get", name]) < calls.index(move)
-    assert state["participant_tab_ids"] == dict.fromkeys(("sol", "fable", "grok"), "w-chat:t-room")
+    assert state["participant_tab_ids"] == dict.fromkeys(
+        ("astra", "fable", "grok"), "w-chat:t-room"
+    )
     assert state["layout"] == "grid"
     assert calls[-2:] == [["workspace", "focus", "w-caller"], ["tab", "focus", "w-caller:t9"]]
     # Focus is restored only after the last move, and no workspace is closed.
@@ -6496,7 +6501,7 @@ def test_place_grid_is_idempotent_on_an_immediate_rerun(
             "herdr",
             "grid",
             state,
-            module.resolve_profile("sol-fable"),
+            module.resolve_profile("astra-fable"),
             room_pane_id="w-chat:p-room",
             room_tab_id="w-chat:t-room",
             room_workspace_id="w-chat",
@@ -6516,7 +6521,7 @@ def test_place_grid_fails_closed_when_a_peer_lands_outside_the_room_tab(
             return {"result": {"workspaces": []}}
         if arguments[:2] == ["agent", "get"]:
             return place_agent_record(
-                "sol-peer",
+                "astra-peer",
                 "pi",
                 pane_id="w-x:p1",
                 tab_id="w-x:t1",
@@ -6531,7 +6536,7 @@ def test_place_grid_fails_closed_when_a_peer_lands_outside_the_room_tab(
             "herdr",
             "grid",
             state,
-            module.resolve_profile("sol-fable")[:1],
+            module.resolve_profile("astra-fable")[:1],
             room_pane_id="w-chat:p-room",
             room_tab_id="w-chat:t-room",
             room_workspace_id="w-chat",
@@ -6577,14 +6582,14 @@ def test_place_grid_reads_the_live_pane_id_not_the_recorded_one(
     monkeypatch.setattr(module, "run_json", fake_run_json)
     state: dict = {
         "agents_cwd": PLACE_AGENTS_CWD,
-        "participant_pane_ids": {"sol": "w-gone:p-sol", "fable": "w-gone:p-fable"},
-        "participant_tab_ids": {"sol": "w-gone:t-sol", "fable": "w-gone:t-fable"},
+        "participant_pane_ids": {"astra": "w-gone:p-astra", "fable": "w-gone:p-fable"},
+        "participant_tab_ids": {"astra": "w-gone:t-astra", "fable": "w-gone:t-fable"},
     }
     module.place(
         "herdr",
         "grid",
         state,
-        module.resolve_profile("sol-fable"),
+        module.resolve_profile("astra-fable"),
         room_pane_id="w-chat:p-room",
         room_tab_id="w-chat:t-room",
         room_workspace_id="w-chat",
@@ -6594,14 +6599,14 @@ def test_place_grid_reads_the_live_pane_id_not_the_recorded_one(
     # read through `agent get` immediately before it.
     assert all("w-gone" not in argument for call in calls for argument in call)
     moves = [call for call in calls if call[:2] == ["pane", "move"]]
-    assert [move[2] for move in moves] == ["w-old:p-sol-peer", "w-old:p-fable-peer"]
-    for name in ("sol-peer", "fable-peer"):
+    assert [move[2] for move in moves] == ["w-old:p-astra-peer", "w-old:p-fable-peer"]
+    for name in ("astra-peer", "fable-peer"):
         assert calls.index(["agent", "get", name]) < calls.index(
             next(move for move in moves if move[2] == f"w-old:p-{name}")
         )
     # The recorded ids are rewritten from the post-move reads.
     assert state["participant_pane_ids"] == {
-        "sol": "w-chat:p-sol-peer-moved",
+        "astra": "w-chat:p-astra-peer-moved",
         "fable": "w-chat:p-fable-peer-moved",
     }
 
@@ -6614,7 +6619,7 @@ def test_place_compact_moves_only_unplaced_peers_into_the_labelled_workspace(
 
     def agent_get(name: str) -> dict:
         kind = "claude" if name == "fable-peer" else "pi"
-        if name == "sol-peer" or name in placed:
+        if name == "astra-peer" or name in placed:
             # Already placed by an earlier run: never moved again.
             return place_agent_record(
                 name,
@@ -6668,7 +6673,7 @@ def test_place_compact_moves_only_unplaced_peers_into_the_labelled_workspace(
         "herdr",
         "compact",
         state,
-        module.resolve_profile("sol-fable-grok-pi"),
+        module.resolve_profile("astra-fable-grok-pi"),
         room_pane_id="w-chat:p-room",
         room_tab_id="w-chat:t-room",
         room_workspace_id="w-chat",
@@ -6746,12 +6751,12 @@ def test_place_compact_creates_the_labelled_workspace_on_demand(
         "herdr",
         "compact",
         state,
-        module.resolve_profile("sol-fable"),
+        module.resolve_profile("astra-fable"),
         room_pane_id="",
         room_tab_id="",
         room_workspace_id="",
     )
-    assert moved_roles == ["sol", "fable"]
+    assert moved_roles == ["astra", "fable"]
     create = next(call for call in calls if call[:2] == ["workspace", "create"])
     assert create[create.index("--cwd") + 1] == PLACE_AGENTS_CWD
     moves = [call for call in calls if call[:2] == ["pane", "move"]]
@@ -6764,7 +6769,7 @@ def test_place_compact_creates_the_labelled_workspace_on_demand(
             "herdr",
             "compact",
             state,
-            module.resolve_profile("sol-fable"),
+            module.resolve_profile("astra-fable"),
             room_pane_id="",
             room_tab_id="",
             room_workspace_id="",
@@ -6828,11 +6833,11 @@ def test_place_compact_recreates_a_workspace_that_vanished_mid_placement(
         "herdr",
         "compact",
         state,
-        module.resolve_profile("sol-fable")[:1],
+        module.resolve_profile("astra-fable")[:1],
         room_pane_id="",
         room_tab_id="",
         room_workspace_id="",
-    ) == ["sol"]
+    ) == ["astra"]
     assert [
         "workspace",
         "create",
@@ -6878,9 +6883,9 @@ def test_launch_passes_layout_env_and_opus_profile(tmp_path: Path, monkeypatch: 
         return {"result": {"type": "ok"}}
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
-    assert module.launch_room(open_existing=False, profile="sol-fable-grok-pi") == 0
+    assert module.launch_room(open_existing=False, profile="astra-fable-grok-pi") == 0
     opened = next(call for call in calls if call[:3] == ["plugin", "pane", "open"])
-    assert "HERDR_GROUP_CHAT_PROFILE=sol-fable-grok-opus-pi" in opened
+    assert "HERDR_GROUP_CHAT_PROFILE=astra-fable-grok-opus-pi" in opened
     assert "HERDR_GROUP_CHAT_LAYOUT=grid" in opened
 
 
@@ -6889,7 +6894,7 @@ def test_grid_relaunch_reuses_live_peers_in_any_workspace(
 ) -> None:
     """A relaunch reuses owned peers wherever they sit: workspace ids carry no authority."""
     calls: list[list[str]] = []
-    roles = (("sol", "pi", "sol-peer"), ("fable", "claude", "fable-peer"))
+    roles = (("astra", "pi", "astra-peer"), ("fable", "claude", "fable-peer"))
 
     def relaunch(live_workspace_id: str) -> list[str]:
         calls.clear()
@@ -6905,7 +6910,7 @@ def test_grid_relaunch_reuses_live_peers_in_any_workspace(
             for role, kind, name in roles
         ]
         screens = {
-            f"{live_workspace_id}:p-sol": SOL_SCREEN,
+            f"{live_workspace_id}:p-astra": ASTRA_SCREEN,
             f"{live_workspace_id}:p-fable": FABLE_SCREEN,
         }
         install_profile_host(
@@ -6920,8 +6925,8 @@ def test_grid_relaunch_reuses_live_peers_in_any_workspace(
             "schema_version": 1,
             "agents_workspace_id": "w-backstage",
             "participant_workspace_id": "w-room",
-            "participant_pane_ids": {"sol": live[0]["pane_id"], "fable": live[1]["pane_id"]},
-            "participant_tab_ids": {"sol": live[0]["tab_id"], "fable": live[1]["tab_id"]},
+            "participant_pane_ids": {"astra": live[0]["pane_id"], "fable": live[1]["pane_id"]},
+            "participant_tab_ids": {"astra": live[0]["tab_id"], "fable": live[1]["tab_id"]},
             "layout": "grid",
         }
         return module.start_participants(
@@ -6931,7 +6936,7 @@ def test_grid_relaunch_reuses_live_peers_in_any_workspace(
             tmp_path,
             launcher_state_path(tmp_path),
             state,
-            participants=module.resolve_profile("sol-fable"),
+            participants=module.resolve_profile("astra-fable"),
         )
 
     for workspace_id in ("w-room", "w-unrelated"):
@@ -6978,12 +6983,12 @@ def test_place_tolerates_a_vanished_caller_workspace_and_tab_on_restore(
         "herdr",
         "grid",
         state,
-        module.resolve_profile("sol-fable"),
+        module.resolve_profile("astra-fable"),
         room_pane_id="w-chat:p-room",
         room_tab_id="w-chat:t-room",
         room_workspace_id="w-chat",
     )
-    assert moved_roles == ["sol", "fable"]
+    assert moved_roles == ["astra", "fable"]
     assert ["workspace", "focus", "w-gone"] in calls
     assert ["tab", "focus", "w-gone:t-x"] in calls
 
@@ -7002,7 +7007,7 @@ def test_pending_tab_cleanup_tolerates_a_vanished_workspace(
         ),
     )
     module.close_pending_participant_tab(
-        "herdr", "w-vanished", {"label": "hgchat-sol-x"}, tmp_path, launcher_state_path(tmp_path)
+        "herdr", "w-vanished", {"label": "hgchat-astra-x"}, tmp_path, launcher_state_path(tmp_path)
     )
 
 
@@ -7067,17 +7072,17 @@ def test_grid_relaunch_reuses_live_peers_and_leaves_lifecycle_to_herdr(
     into the new room tab, and no workspace is ever closed by the launcher."""
     captured: dict[str, object] = {}
     profile_launch_env(tmp_path, monkeypatch, captured)
-    monkeypatch.setenv(module.PROFILE_ENV, "sol-fable-grok")
+    monkeypatch.setenv(module.PROFILE_ENV, "astra-fable-grok")
     monkeypatch.setenv(module.ROOM_ENV, "chat-sfg")
     monkeypatch.setenv(module.LAYOUT_ENV, "grid")
     live = [
         {
-            "name": "sol-peer",
+            "name": "astra-peer",
             "kind": "pi",
             "workspace_id": "w-room",
             "cwd": str(tmp_path),
-            "pane_id": "w-room:p-sol",
-            "tab_id": "w-room:t-sol",
+            "pane_id": "w-room:p-astra",
+            "tab_id": "w-room:t-astra",
         },
         {
             "name": "fable-peer",
@@ -7100,15 +7105,19 @@ def test_grid_relaunch_reuses_live_peers_and_leaves_lifecycle_to_herdr(
     install_profile_host(
         monkeypatch,
         calls,
-        {"w-room:p-sol": SOL_SCREEN, "w-room:p-fable": FABLE_SCREEN, "w-room:p-grok": GROK_SCREEN},
+        {
+            "w-room:p-astra": ASTRA_SCREEN,
+            "w-room:p-fable": FABLE_SCREEN,
+            "w-room:p-grok": GROK_SCREEN,
+        },
         live_agents=live,
         process_infos={"w-room:p-fable": CLAUDE_FABLE_PROCESS, "w-room:p-grok": GROK_PROCESS},
         tmp_path=tmp_path,
     )
     moved_names: set[str] = set()
     pane_to_name = {agent["pane_id"]: agent["name"] for agent in live}
-    sol_session = write_pi_session(
-        tmp_path, "sol-peer", pi_session_lines("openai-codex", "gpt-5.6-sol")
+    astra_session = write_pi_session(
+        tmp_path, "astra-peer", pi_session_lines("openai-codex", "gpt-6-astra")
     )
 
     def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
@@ -7134,16 +7143,16 @@ def test_grid_relaunch_reuses_live_peers_and_leaves_lifecycle_to_herdr(
                 }
             }
         if arguments[:2] == ["agent", "get"]:
-            kinds = {"sol-peer": "pi", "fable-peer": "claude", "grok46-peer": "grok"}
+            kinds = {"astra-peer": "pi", "fable-peer": "claude", "grok46-peer": "grok"}
 
             def name_for(name: str) -> str:
                 return name.removesuffix("-peer").replace("grok46", "grok")
 
             def with_session(record: dict) -> dict:
-                if record["name"] == "sol-peer":
+                if record["name"] == "astra-peer":
                     record = {
                         **record,
-                        "agent_session": {"kind": "path", "value": str(sol_session)},
+                        "agent_session": {"kind": "path", "value": str(astra_session)},
                     }
                 return record
 
@@ -7178,7 +7187,7 @@ def test_grid_relaunch_reuses_live_peers_and_leaves_lifecycle_to_herdr(
             }
         if arguments[:2] == ["pane", "process-info"]:
             pane_processes = {
-                "w-room:p-sol": PARTICIPANT_PROCESSES["sol-peer"],
+                "w-room:p-astra": PARTICIPANT_PROCESSES["astra-peer"],
                 "w-room:p-fable": CLAUDE_FABLE_PROCESS,
                 "w-room:p-grok": GROK_PROCESS,
             }
@@ -7198,12 +7207,12 @@ def test_grid_relaunch_reuses_live_peers_and_leaves_lifecycle_to_herdr(
     state["layout"] = "grid"
     state["participant_workspace_id"] = "w-room"
     state["participant_pane_ids"] = {
-        "sol": "w-room:p-sol",
+        "astra": "w-room:p-astra",
         "fable": "w-room:p-fable",
         "grok": "w-room:p-grok",
     }
     state["participant_tab_ids"] = {
-        "sol": "w-room:t-sol",
+        "astra": "w-room:t-astra",
         "fable": "w-room:t-fable",
         "grok": "w-room:t-grok",
     }
@@ -7214,7 +7223,7 @@ def test_grid_relaunch_reuses_live_peers_and_leaves_lifecycle_to_herdr(
     # The live peers were reused and rearranged, never restarted.
     assert not any(call[:2] in (["tab", "create"], ["agent", "start"]) for call in calls)
     moves = [call for call in calls if call[:2] == ["pane", "move"]]
-    assert [move[2] for move in moves] == ["w-room:p-sol", "w-room:p-fable", "w-room:p-grok"]
+    assert [move[2] for move in moves] == ["w-room:p-astra", "w-room:p-fable", "w-room:p-grok"]
     # The placeholder tab is closed, but the emptied backstage workspace is
     # Herdr's to close; the launcher never issues a workspace close.
     assert ["tab", "close", "w-backstage:t-ph"] in calls
@@ -7226,7 +7235,7 @@ def test_grid_relaunch_reuses_live_peers_and_leaves_lifecycle_to_herdr(
     assert final_state["layout"] == "grid"
     assert final_state["participant_workspace_id"] == "w-chat"
     assert final_state["participant_pane_ids"] == {
-        "sol": "w-chat:p-sol-peer",
+        "astra": "w-chat:p-astra-peer",
         "fable": "w-chat:p-fable-peer",
         "grok": "w-chat:p-grok46-peer",
     }

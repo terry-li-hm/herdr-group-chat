@@ -6,11 +6,11 @@ Date: 2026-09-02. Status: implemented in 0.11.0 on 2026-09-03 as the `layout` an
 
 Terry asked for one tab holding the room pane plus one pane per model, so the
 group chat and each participant's native session are visible together, with
-Opus 5 as a fourth participant beside Sol, Fable and Grok.
+Opus 5 as a fourth participant beside Astra, Fable and Grok.
 
 ## What the live proof showed
 
-On the v0.10.7 `sol-fable-grok-pi` room, `herdr pane move --tab <room tab>
+On the v0.10.7 `astra-fable-grok-pi` room, `herdr pane move --tab <room tab>
 --split right|down --target-pane <id>` placed the three peer panes beside the
 room pane as a right-hand stack. Pane ids changed, agent names did not, and the
 relay prompts by agent name, so an `@all` round returned exactly `GRID-OK` from
@@ -47,8 +47,8 @@ all three. Three costs surfaced:
   `--model opus --effort high`, pane proofs `(("opus",), ("5",))` and
   `(("high",), ("effort",))`. Verify the exact model line Claude Code 2.1.258
   renders before choosing the version token; the Fable proof broke on `5.1`.
-- Profile `sol-fable-grok-opus-pi` = Sol, Fable, Grok (Pi-xAI), Opus. This does
-  add an action (`new-sol-fable-grok-opus`), so the smoke contract, its assays
+- Profile `astra-fable-grok-opus-pi` = Astra, Fable, Grok (Pi-xAI), Opus. This does
+  add an action (`new-astra-fable-grok-opus`), so the smoke contract, its assays
   and `RELEASING.md` must list eight actions. Alternatively make Opus a config
   toggle on the default profile to keep seven actions; decide with Terry.
 

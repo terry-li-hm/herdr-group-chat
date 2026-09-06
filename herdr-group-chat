@@ -52,18 +52,18 @@ DEFAULT_AGENTS = {
 # Targets and matched evidence come only from the launcher's verified receipt
 # payload; no profile-derived target fallback and no duplicated model detail.
 PROFILE_ROLES = {
-    "sol-fable": ("sol", "fable"),
-    "sol-fable-grok": ("sol", "fable", "grok"),
-    "sol-fable-grok-pi": ("sol", "fable", "grok"),
-    "sol-fable-grok-opus-pi": ("sol", "fable", "grok", "opus"),
-    "sol-fable-glm": ("sol", "fable", "glm"),
+    "astra-fable": ("astra", "fable"),
+    "astra-fable-grok": ("astra", "fable", "grok"),
+    "astra-fable-grok-pi": ("astra", "fable", "grok"),
+    "astra-fable-grok-opus-pi": ("astra", "fable", "grok", "opus"),
+    "astra-fable-glm": ("astra", "fable", "glm"),
 }
 PROFILE_SYNTHESIZER = {
-    "sol-fable": "sol",
-    "sol-fable-grok": "sol",
-    "sol-fable-grok-pi": "sol",
-    "sol-fable-grok-opus-pi": "sol",
-    "sol-fable-glm": "sol",
+    "astra-fable": "astra",
+    "astra-fable-grok": "astra",
+    "astra-fable-grok-pi": "astra",
+    "astra-fable-grok-opus-pi": "astra",
+    "astra-fable-glm": "astra",
 }
 PROFILE_RECEIPT_KIND = "profile_receipt"
 PROFILE_RECEIPT_ENV = "HERDR_GROUP_CHAT_PROFILE_RECEIPT"

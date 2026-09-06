@@ -24,8 +24,8 @@ this TUI a thin Cumora client, with one backend owner and no dual writes. See
 Prerequisites are Herdr 0.8.0 or newer, [`uv`](https://docs.astral.sh/uv/), and
 installed, authenticated Pi, Claude Code, Codex, and Grok Build CLIs. The room
 executable uses `uv` to run Python 3.13 and installs `regex` plus `wcwidth` for
-grapheme-safe terminal-cell layout. The `sol-fable-glm` and
-`sol-fable-grok-pi` profiles additionally need Pi configured and authenticated
+grapheme-safe terminal-cell layout. The `astra-fable-glm` and
+`astra-fable-grok-pi` profiles additionally need Pi configured and authenticated
 for their `bigmodel-coding` (`glm-5.3`) and `xai` (`grok-4.6`) providers.
 
 Install the pinned release from GitHub:
@@ -66,7 +66,7 @@ verification checks that the entry carries exactly the requested plugin id
 and version, with the full action contracts (id, command, and contexts for
 all seven actions) and pane contracts (id, command, and placement for both
 panes), and, for candidates, exactly the exported copy as its plugin root.
-It runs the default `new` (sol/fable/grok) and
+It runs the default `new` (astra/fable/grok) and
 `new-classic` (pi/claude/codex/grok) actions with a synthetic `@all` round,
 and validates that every participant replies with exactly `SMOKE-OK`. The
 candidate export uses `git write-tree` plus `git archive` over the staged
@@ -125,7 +125,7 @@ run `herdr server reload-config`:
 key = "prefix+g"
 type = "plugin_action"
 command = "terry.herdr-group-chat.new"
-description = "new group chat (Sol + Fable + Grok)"
+description = "new group chat (Astra + Fable + Grok)"
 ```
 
 ## Use
@@ -170,7 +170,7 @@ while work continues.
 
 Typing `@` at the start of the recipient token — at the beginning of the line
 or right after `/review `, `/anneal `, `/consensus `, or a comma still inside that token —
-opens a compact mention picker on the status row (`Mentions: [@sol] @fable`).
+opens a compact mention picker on the status row (`Mentions: [@astra] @fable`).
 Typed characters filter it case-insensitively, Up/Down cycle the selection,
 Tab completes the selected handle without adding a trailing space (a comma
 continues the recipient list, a space begins the message), Esc closes it with
@@ -360,8 +360,8 @@ herdr plugin uninstall terry.herdr-group-chat
 ```
 
 The manifest declares seven actions and two managed pane entrypoints: **New group
-chat**, **New Sol + Fable chat**, **New Sol + Fable + Grok native chat**, **New
-Sol + Fable + GLM chat**, **New classic four-agent chat**, **Open group chat**,
+chat**, **New Astra + Fable chat**, **New Astra + Fable + Grok native chat**, **New
+Astra + Fable + GLM chat**, **New classic four-agent chat**, **Open group chat**,
 and **Adopt stale group-chat peers**, plus the visible setup pane and the room
 pane. Herdr
 supplies `HERDR_PLUGIN_STATE_DIR`, so transcripts and the plugin's exact
@@ -375,7 +375,7 @@ is `agents · group-chat` or `group-chat`. Standalone CLI use retains
 `~/.local/state/herdr-group-chat/`; an explicit `--state-dir` always wins.
 
 Invoking **New group chat** opens a visible setup tab for the verified atomic
-Sol/Fable/Pi-xAI Grok default, reuses any live named peers, creates tabs for
+Astra/Fable/Pi-xAI Grok default, reuses any live named peers, creates tabs for
 missing participants, and then becomes a fresh `group-chat` room. **New classic
 four-agent chat** separately opens the Pi/Claude/Codex/Grok composition. New
 launches replace the previous plugin-owned room pane but retain that room's
@@ -397,7 +397,7 @@ rather than silently offline.
 Compact mode keeps the room alone in the initiating workspace and places the
 participant tabs in a secondary `agents · group-chat` workspace, with each
 participant tab labeled `<role> · group-chat` (for example `pi · group-chat` or
-`sol · group-chat`). A participant is owned when `agent get` reports it live
+`astra · group-chat`). A participant is owned when `agent get` reports it live
 with the matching kind and the room's cwd, nothing else, so routing and reuse
 key on the agent's name and the recorded pane, tab and workspace ids are
 display caches that no decision branches on. Placement is one re-runnable
@@ -435,21 +435,21 @@ recovers only the token-bound reply from the active local Grok session history.
 The review protocol and remaining v0.3 boundaries are specified in
 [docs/v0.3-review.md](docs/v0.3-review.md).
 
-## Sol + Fable profile
+## Astra + Fable profile
 
-`New Sol + Fable chat` (or `./new-room --launch --profile sol-fable`) opens a
-bounded two-role room: `@sol` runs Pi as `sol-peer` with the native arguments
-`--provider openai-codex --model gpt-5.6-sol --thinking high`, and `@fable`
+`New Astra + Fable chat` (or `./new-room --launch --profile astra-fable`) opens a
+bounded two-role room: `@astra` runs Pi as `astra-peer` with the native arguments
+`--provider openai-codex --model gpt-6-astra --thinking high`, and `@fable`
 runs Claude Code as `fable-peer` with `--model fable --effort high` and no
 fallback. Before either participant becomes routable, the launcher verifies
-native host evidence: Sol requires an exact `openai-codex  gpt-5.6-sol` row
-from `pi --list-models gpt-5.6-sol`, with no competing provider for that exact
+native host evidence: Astra requires an exact `openai-codex  gpt-6-astra` row
+from `pi --list-models gpt-6-astra`, with no competing provider for that exact
 model id; after start, each participant's live pane is proven
 by process for Claude, Codex and Grok Build, and by Pi's session file for Pi.
 Reads retry briefly because startups are asynchronous, so a
 lookalike model string, reordered arguments, or an MCP child process with the
 right flags never verifies, and a model rename in a vendor UI can no longer
-break a launch because screen text is never evidence. A `sol-fable` room is
+break a launch because screen text is never evidence. An `astra-fable` room is
 atomic: if any required role fails, the launch
 or reopen fails closed and no room opens. A mismatching existing session is
 left open and excluded; a newly created tab that fails verification is closed
@@ -457,13 +457,13 @@ and never routed. The room records one non-secret verified system receipt per
 profile in the transcript, generated only after complete verification and
 deduplicated across reopens by its exact structured payload; this describes
 what the launcher observed on the host, not a cryptographic or model-service
-attestation. Sol synthesizes reviews by default, and the classic four-agent
+attestation. Astra synthesizes reviews by default, and the classic four-agent
 composition is unchanged.
 
-## Default Sol + Fable + Pi-xAI Grok profile
+## Default Astra + Fable + Pi-xAI Grok profile
 
-`New group chat` launches the bounded three-role `sol-fable-grok-pi` room via
-`./new-room --launch --profile sol-fable-grok-pi`. It retains `@sol` and
+`New group chat` launches the bounded three-role `astra-fable-grok-pi` room via
+`./new-room --launch --profile astra-fable-grok-pi`. It retains `@astra` and
 `@fable` unchanged, then adds `@grok` as Pi `grok46pi-peer` with the exact
 native arguments `--provider xai --model grok-4.6 --thinking high`. There is
 no fallback provider, model, effort, or native Grok Build invocation.
@@ -514,26 +514,26 @@ result as one system line in the transcript, and placement restores your
 workspace and tab when it finishes. `./new-room --place <compact|grid>` does
 the same from a terminal.
 
-With `opus = true`, `New group chat` launches the `sol-fable-grok-opus-pi`
-profile: `@sol`, `@fable` and `@grok` as before plus `@opus` running Claude
+With `opus = true`, `New group chat` launches the `astra-fable-grok-opus-pi`
+profile: `@astra`, `@fable` and `@grok` as before plus `@opus` running Claude
 Code as `opus-peer` with `--model opus --effort high`, proven by the exact
-foreground-process argv on its live pane. Sol synthesises reviews.
+foreground-process argv on its live pane. Astra synthesises reviews.
 
-## Retained native Sol + Fable + Grok profile
+## Retained native Astra + Fable + Grok profile
 
-`New Sol + Fable + Grok native chat` retains `sol-fable-grok` for stored rooms
+`New Astra + Fable + Grok native chat` retains `astra-fable-grok` for stored rooms
 and explicit new launches. Its `@grok` remains Grok Build `grok46-peer` with
 the existing exact native arguments, proven by its foreground process.
 Switching between native and Pi-xAI profiles replaces the single `@grok` role
 and closes the prior profile-owned Grok tab under the existing replacement semantics.
-Stored `sol-fable-grok`, `sol-fable`, and classic rooms keep their own profiles.
+Stored `astra-fable-grok`, `astra-fable`, and classic rooms keep their own profiles.
 `New classic four-agent chat` and direct no-profile `./new-room --launch` are
 unchanged.
 
-## Sol + Fable + GLM profile
+## Astra + Fable + GLM profile
 
-`New Sol + Fable + GLM chat` (or `./new-room --launch --profile sol-fable-glm`)
-opens the bounded three-role `sol-fable-glm` room: the existing `@sol` and
+`New Astra + Fable + GLM chat` (or `./new-room --launch --profile astra-fable-glm`)
+opens the bounded three-role `astra-fable-glm` room: the existing `@astra` and
 `@fable` participants unchanged, plus `@glm`, Pi as `glm-peer` with the exact
 native arguments `--provider bigmodel-coding --model glm-5.3 --thinking high`
 and no fallback. Before `@glm` becomes routable, the launcher requires the
@@ -545,7 +545,7 @@ high` contiguously on its live pane. Suffixed or split lookalikes such as
 if any of the three roles fails verification, the launch or reopen fails
 closed, no room opens, and the non-secret `native-ui verified` receipt —
 carrying harness `pi`, provider `bigmodel-coding`, model `glm-5.3`, effort
-`high` — is emitted only after all three verify. Sol synthesizes reviews by
+`high` — is emitted only after all three verify. Astra synthesizes reviews by
 default. Every GLM turn is an external BigModel API call, so the room's
 disclosure boundary applies to anything addressed to `@glm`.
 
@@ -555,8 +555,8 @@ disclosure boundary applies to anything addressed to `@glm`.
   blind passes are parallel; consensus votes are also parallel.
 - Every addressed agent must already be live in Herdr.
 - New-room setup starts the four classic participants, the two bounded
-  `sol-fable` participants, or one of the three-role `sol-fable-grok`,
-  `sol-fable-grok-pi`, and `sol-fable-glm` profiles. Only these five fixed
+  `astra-fable` participants, or one of the three-role `astra-fable-grok`,
+  `astra-fable-grok-pi`, and `astra-fable-glm` profiles. Only these five fixed
   compositions are selectable, and arbitrary participant selection is not
   configurable.
 - Retry state is kept in the running room process and does not survive a room

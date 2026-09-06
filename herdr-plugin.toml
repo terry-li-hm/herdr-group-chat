@@ -9,25 +9,25 @@ platforms = ["macos", "linux"]
 id = "new"
 title = "New group chat"
 contexts = ["workspace", "tab", "pane"]
-command = ["./new-room", "--launch", "--profile", "sol-fable-grok-pi"]
+command = ["./new-room", "--launch", "--profile", "astra-fable-grok-pi"]
 
 [[actions]]
-id = "new-sol-fable"
-title = "New Sol + Fable chat"
+id = "new-astra-fable"
+title = "New Astra + Fable chat"
 contexts = ["workspace", "tab", "pane"]
-command = ["./new-room", "--launch", "--profile", "sol-fable"]
+command = ["./new-room", "--launch", "--profile", "astra-fable"]
 
 [[actions]]
-id = "new-sol-fable-grok-native"
-title = "New Sol + Fable + Grok native chat"
+id = "new-astra-fable-grok-native"
+title = "New Astra + Fable + Grok native chat"
 contexts = ["workspace", "tab", "pane"]
-command = ["./new-room", "--launch", "--profile", "sol-fable-grok"]
+command = ["./new-room", "--launch", "--profile", "astra-fable-grok"]
 
 [[actions]]
-id = "new-sol-fable-glm"
-title = "New Sol + Fable + GLM chat"
+id = "new-astra-fable-glm"
+title = "New Astra + Fable + GLM chat"
 contexts = ["workspace", "tab", "pane"]
-command = ["./new-room", "--launch", "--profile", "sol-fable-glm"]
+command = ["./new-room", "--launch", "--profile", "astra-fable-glm"]
 
 [[actions]]
 id = "new-classic"

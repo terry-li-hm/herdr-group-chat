@@ -1826,7 +1826,7 @@ def test_layout_command_runs_the_launcher_from_the_plugin_root(
     def fake_run(arguments: list[str], **kwargs: object) -> Completed:
         calls.append((list(arguments), kwargs))
         mode = arguments[2]
-        moved = ["sol", "fable"] if mode == "grid" else []
+        moved = ["astra", "fable"] if mode == "grid" else []
         return Completed(json.dumps({"layout": mode, "moved": moved}) + "\n")
 
     line = handle_local_command("/layout grid", chat, None, fake_run)
@@ -5085,9 +5085,9 @@ def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:
     assert manifest["version"] == project["project"]["version"]
     assert [action["id"] for action in manifest["actions"]] == [
         "new",
-        "new-sol-fable",
-        "new-sol-fable-grok-native",
-        "new-sol-fable-glm",
+        "new-astra-fable",
+        "new-astra-fable-grok-native",
+        "new-astra-fable-glm",
         "new-classic",
         "open",
         "adopt-peers",
@@ -5098,20 +5098,20 @@ def test_plugin_manifest_is_minimal_and_targets_herdr_0_8() -> None:
         "./new-room",
         "--launch",
         "--profile",
-        "sol-fable-grok-pi",
+        "astra-fable-grok-pi",
     ]
-    sol_fable = manifest["actions"][1]
-    assert sol_fable["title"] == "New Sol + Fable chat"
-    assert sol_fable["command"] == ["./new-room", "--launch", "--profile", "sol-fable"]
-    assert sol_fable["contexts"] == ["workspace", "tab", "pane"]
+    astra_fable = manifest["actions"][1]
+    assert astra_fable["title"] == "New Astra + Fable chat"
+    assert astra_fable["command"] == ["./new-room", "--launch", "--profile", "astra-fable"]
+    assert astra_fable["contexts"] == ["workspace", "tab", "pane"]
     native_grok = manifest["actions"][2]
-    assert native_grok["title"] == "New Sol + Fable + Grok native chat"
-    assert native_grok["command"] == ["./new-room", "--launch", "--profile", "sol-fable-grok"]
+    assert native_grok["title"] == "New Astra + Fable + Grok native chat"
+    assert native_grok["command"] == ["./new-room", "--launch", "--profile", "astra-fable-grok"]
     assert native_grok["contexts"] == ["workspace", "tab", "pane"]
-    sol_fable_glm = manifest["actions"][3]
-    assert sol_fable_glm["title"] == "New Sol + Fable + GLM chat"
-    assert sol_fable_glm["command"] == ["./new-room", "--launch", "--profile", "sol-fable-glm"]
-    assert sol_fable_glm["contexts"] == ["workspace", "tab", "pane"]
+    astra_fable_glm = manifest["actions"][3]
+    assert astra_fable_glm["title"] == "New Astra + Fable + GLM chat"
+    assert astra_fable_glm["command"] == ["./new-room", "--launch", "--profile", "astra-fable-glm"]
+    assert astra_fable_glm["contexts"] == ["workspace", "tab", "pane"]
     new_classic = manifest["actions"][4]
     assert new_classic["title"] == "New classic four-agent chat"
     assert new_classic["command"] == ["./new-room", "--launch"]
@@ -7565,38 +7565,38 @@ def test_council_cross_process_lock_loser_appends_nothing(tmp_path: Path) -> Non
     assert council_attempt_records(transcript.read())
 
 
-# --- bounded sol-fable model profile -------------------------------------------------
+# --- bounded astra-fable model profile -------------------------------------------------
 
 
 class ProfileClient(FakeClient):
     def live_targets(self) -> set[str]:
-        return {"sol-peer", "fable-peer"}
+        return {"astra-peer", "fable-peer"}
 
     def states(self) -> dict[str, str]:
-        return {"sol-peer": "idle", "fable-peer": "idle"}
+        return {"astra-peer": "idle", "fable-peer": "idle"}
 
 
-def make_sol_fable_chat(tmp_path: Path) -> tuple[GroupChat, ProfileClient, Transcript]:
-    transcript = Transcript(tmp_path, "sol-fable-room")
+def make_astra_fable_chat(tmp_path: Path) -> tuple[GroupChat, ProfileClient, Transcript]:
+    transcript = Transcript(tmp_path, "astra-fable-room")
     client = ProfileClient()
     chat = GroupChat(
         transcript,
-        {"sol": "sol-peer", "fable": "fable-peer"},
+        {"astra": "astra-peer", "fable": "fable-peer"},
         client,
-        synthesizer="sol",
+        synthesizer="astra",
     )
     return chat, client, transcript
 
 
 VALID_RECEIPT = {
-    "profile": "sol-fable",
+    "profile": "astra-fable",
     "verified": [
         {
-            "role": "sol",
-            "target": "sol-peer",
+            "role": "astra",
+            "target": "astra-peer",
             "harness": "pi",
             "provider": "openai-codex",
-            "model": "gpt-5.6-sol",
+            "model": "gpt-6-astra",
             "effort": "high",
             "verification": "native-ui verified",
         },
@@ -7617,23 +7617,23 @@ def valid_receipt_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], valid_receipt_json)
 
 
-def test_profile_room_routes_only_sol_and_fable_and_composes_review_and_anneal(
+def test_profile_room_routes_only_astra_and_fable_and_composes_review_and_anneal(
     tmp_path: Path,
 ) -> None:
-    chat, client, transcript = make_sol_fable_chat(tmp_path)
+    chat, client, transcript = make_astra_fable_chat(tmp_path)
 
     created = chat.dispatch("@all hello")
     chat.review("challenge this plan")
-    chat.anneal("@sol,@fable harden this plan")
+    chat.anneal("@astra,@fable harden this plan")
 
-    assert [item["sender"] for item in created] == ["human", "sol", "fable"]
+    assert [item["sender"] for item in created] == ["human", "astra", "fable"]
     assert [target for target, _prompt in client.calls if "group chat" in _prompt][:2] == [
-        "sol-peer",
+        "astra-peer",
         "fable-peer",
     ]
     kinds = [(item["sender"], item["kind"]) for item in transcript.read()]
-    assert ("sol", "review_synthesis") in kinds
-    assert ("sol", "anneal_final") in kinds
+    assert ("astra", "review_synthesis") in kinds
+    assert ("astra", "anneal_final") in kinds
     assert ("fable", "anneal_challenge") in kinds
 
 
@@ -7642,7 +7642,7 @@ def test_default_overrides_stay_unchanged_and_closed() -> None:
     assert parse([]) == dict(namespace["DEFAULT_AGENTS"])
     assert parse(["pi=other-peer"])["pi"] == "other-peer"
     with pytest.raises(ChatError, match="invalid agent mapping"):
-        parse(["sol=sol-peer"])  # profile roles are not default-roster names
+        parse(["astra=astra-peer"])  # profile roles are not default-roster names
 
 
 def test_profile_requires_exactly_both_explicit_agent_roles_through_main(
@@ -7654,17 +7654,17 @@ def test_profile_requires_exactly_both_explicit_agent_roles_through_main(
 
     monkeypatch.setattr(module, "HerdrClient", StaticClient)
     valid_receipt_env(monkeypatch)
-    base = ["--state-dir", str(tmp_path), "--room", "strict-room", "--profile", "sol-fable"]
+    base = ["--state-dir", str(tmp_path), "--room", "strict-room", "--profile", "astra-fable"]
 
     # main() reports user-visible failures as exit code 2 without writing.
     assert main([*base, "--once", "hi"]) == 2  # zero mappings
-    assert main([*base, "--agent", "sol=sol-peer", "--once", "hi"]) == 2  # partial
+    assert main([*base, "--agent", "astra=astra-peer", "--once", "hi"]) == 2  # partial
     assert (
         main(
             [
                 *base,
                 "--agent",
-                "sol=sol-peer",
+                "astra=astra-peer",
                 "--agent",
                 "fable=fable-peer",
                 "--agent",
@@ -7728,9 +7728,9 @@ def test_exact_two_role_mapping_runs_and_receipt_is_recorded_once(
         "--room",
         "receipt-room",
         "--profile",
-        "sol-fable",
+        "astra-fable",
         "--agent",
-        "sol=sol-peer",
+        "astra=astra-peer",
         "--agent",
         "fable=fable-peer",
     ]
@@ -7743,23 +7743,23 @@ def test_exact_two_role_mapping_runs_and_receipt_is_recorded_once(
     receipts = [item for item in items if item["kind"] == namespace["PROFILE_RECEIPT_KIND"]]
     assert len(receipts) == 1
     receipt = receipts[0]
-    assert receipt["meta"]["profile"] == "sol-fable"
-    assert {entry["role"] for entry in receipt["meta"]["verified"]} == {"sol", "fable"}
+    assert receipt["meta"]["profile"] == "astra-fable"
+    assert {entry["role"] for entry in receipt["meta"]["verified"]} == {"astra", "fable"}
     body = receipt["body"]
     for needle in (
         "native-ui verified",
         "harness pi",
         "provider openai-codex",
-        "model gpt-5.6-sol",
+        "model gpt-6-astra",
         "effort high",
         "model fable",
-        "sol-peer",
+        "astra-peer",
         "fable-peer",
     ):
         assert needle in body, needle
     assert "attest" not in body.lower()
     senders = [item["sender"] for item in items]
-    assert senders.count("sol") == 2 and senders.count("fable") == 2  # both turns, one receipt
+    assert senders.count("astra") == 2 and senders.count("fable") == 2  # both turns, one receipt
 
 
 def test_missing_receipt_fails_the_profile_room_closed(
@@ -7780,9 +7780,9 @@ def test_missing_receipt_fails_the_profile_room_closed(
                 "--room",
                 "no-receipt-room",
                 "--profile",
-                "sol-fable",
+                "astra-fable",
                 "--agent",
-                "sol=sol-peer",
+                "astra=astra-peer",
                 "--agent",
                 "fable=fable-peer",
                 "--once",
@@ -7813,9 +7813,9 @@ def test_receipt_roster_mismatch_fails_the_profile_room_closed(
                 "--room",
                 "mismatch-room",
                 "--profile",
-                "sol-fable",
+                "astra-fable",
                 "--agent",
-                "sol=someone-else",
+                "astra=someone-else",
                 "--agent",
                 "fable=fable-peer",
                 "--once",
@@ -7842,9 +7842,9 @@ def test_invalid_receipt_payloads_fail_closed(
         "--room",
         "invalid-room",
         "--profile",
-        "sol-fable",
+        "astra-fable",
         "--agent",
-        "sol=sol-peer",
+        "astra=astra-peer",
         "--agent",
         "fable=fable-peer",
         "--once",
@@ -7853,16 +7853,16 @@ def test_invalid_receipt_payloads_fail_closed(
     for payload in (
         "not json",
         json.dumps({"profile": "other", "verified": []}),
-        json.dumps({"profile": "sol-fable", "verified": [{"role": "sol"}]}),
+        json.dumps({"profile": "astra-fable", "verified": [{"role": "astra"}]}),
         json.dumps(
             {
-                "profile": "sol-fable",
+                "profile": "astra-fable",
                 "verified": [
                     {
-                        "role": "sol",
-                        "target": "sol-peer",
+                        "role": "astra",
+                        "target": "astra-peer",
                         "harness": "pi",
-                        "model": "gpt-5.6-sol",
+                        "model": "gpt-6-astra",
                         "effort": "high",
                         "verification": "model-service attested",
                     },
@@ -7884,7 +7884,7 @@ def test_invalid_receipt_payloads_fail_closed(
     assert Transcript(tmp_path, "invalid-room").read() == []
 
 
-def test_main_profile_defaults_the_synthesizer_to_sol(
+def test_main_profile_defaults_the_synthesizer_to_astra(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     synthesizers: list[str] = []
@@ -7915,9 +7915,9 @@ def test_main_profile_defaults_the_synthesizer_to_sol(
                 "--room",
                 "synth-room",
                 "--profile",
-                "sol-fable",
+                "astra-fable",
                 "--agent",
-                "sol=sol-peer",
+                "astra=astra-peer",
                 "--agent",
                 "fable=fable-peer",
                 "--once",
@@ -7926,10 +7926,10 @@ def test_main_profile_defaults_the_synthesizer_to_sol(
         )
         == 0
     )
-    assert synthesizers == ["sol-peer"]
+    assert synthesizers == ["astra-peer"]
     transcript = Transcript(tmp_path, "synth-room")
     synthesis = [item for item in transcript.read() if item["kind"] == "review_synthesis"]
-    assert synthesis and synthesis[0]["sender"] == "sol"
+    assert synthesis and synthesis[0]["sender"] == "astra"
 
 
 def test_main_default_room_records_no_receipt(
@@ -8054,9 +8054,9 @@ def test_receipt_dedupe_uses_exact_structured_metadata_not_profile_alone(
         "--room",
         "dedupe-room",
         "--profile",
-        "sol-fable",
+        "astra-fable",
         "--agent",
-        "sol=sol-peer",
+        "astra=astra-peer",
         "--agent",
         "fable=fable-peer",
         "--once",
@@ -8064,7 +8064,7 @@ def test_receipt_dedupe_uses_exact_structured_metadata_not_profile_alone(
     ]
     receipt = json.loads(valid_receipt_json)
     changed_effort = {
-        "profile": "sol-fable",
+        "profile": "astra-fable",
         "verified": [dict(receipt["verified"][0], effort="low"), receipt["verified"][1]],
     }
 
@@ -8090,13 +8090,13 @@ def test_receipt_dedupe_uses_exact_structured_metadata_not_profile_alone(
 
 
 DEFAULT_ROSTER = ("pi", "claude", "codex", "grok")
-SOL_FABLE_ROSTER = ("sol", "fable")
+ASTRA_FABLE_ROSTER = ("astra", "fable")
 
 
 def test_picker_opens_at_start_of_line_and_filters_case_insensitively() -> None:
     assert mention_suggestions("@", DEFAULT_ROSTER) == (*DEFAULT_ROSTER, "all")
     assert mention_suggestions("@CO", DEFAULT_ROSTER) == ("codex",)
-    assert mention_suggestions("@sol", SOL_FABLE_ROSTER) == ("sol",)
+    assert mention_suggestions("@astra", ASTRA_FABLE_ROSTER) == ("astra",)
 
 
 def test_review_includes_all_but_anneal_hides_it() -> None:
@@ -8106,8 +8106,8 @@ def test_review_includes_all_but_anneal_hides_it() -> None:
 
 
 def test_anneal_second_mention_offers_only_the_remaining_role() -> None:
-    assert mention_suggestions("/anneal @sol,@", SOL_FABLE_ROSTER) == ("fable",)
-    assert mention_suggestions("/anneal @fable,@", SOL_FABLE_ROSTER) == ("sol",)
+    assert mention_suggestions("/anneal @astra,@", ASTRA_FABLE_ROSTER) == ("fable",)
+    assert mention_suggestions("/anneal @fable,@", ASTRA_FABLE_ROSTER) == ("astra",)
 
 
 def test_emails_and_mid_draft_mentions_never_open_the_picker() -> None:
@@ -8117,16 +8117,16 @@ def test_emails_and_mid_draft_mentions_never_open_the_picker() -> None:
 
 
 def test_a_comma_alone_does_not_open_the_picker() -> None:
-    assert mention_fragment("@sol,") is None
+    assert mention_fragment("@astra,") is None
     assert mention_suggestions("@pi,", DEFAULT_ROSTER) is None
 
 
 def test_tab_completion_replaces_only_the_active_fragment_without_a_space() -> None:
     assert complete_mention("@cl", "claude") == "@claude"
-    assert complete_mention("/anneal @sol,@fab", "fable") == "/anneal @sol,@fable"
+    assert complete_mention("/anneal @astra,@fab", "fable") == "/anneal @astra,@fable"
     assert not complete_mention("@co", "codex").endswith(" ")
     # An already-selected handle stays excluded from the next fragment's roster.
-    assert mention_suggestions("/anneal @sol,@", SOL_FABLE_ROSTER) == ("fable",)
+    assert mention_suggestions("/anneal @astra,@", ASTRA_FABLE_ROSTER) == ("fable",)
 
 
 def test_esc_and_enter_leave_the_buffer_untouched() -> None:
@@ -8139,41 +8139,41 @@ def test_esc_and_enter_leave_the_buffer_untouched() -> None:
 
 
 def test_up_down_selection_cycles_through_candidates() -> None:
-    suggestions = mention_suggestions("/anneal @", SOL_FABLE_ROSTER)
-    assert suggestions == ("sol", "fable")
+    suggestions = mention_suggestions("/anneal @", ASTRA_FABLE_ROSTER)
+    assert suggestions == ("astra", "fable")
     assert handle_picker_key("/anneal @", "DOWN", suggestions, 0) == ("/anneal @", 1)
     assert handle_picker_key("/anneal @", "UP", suggestions, 0) == ("/anneal @", 1)
-    assert mention_display(suggestions, 0) == "Mentions: [@sol] @fable"
-    assert mention_display(suggestions, 1) == "Mentions: @sol [@fable]"
+    assert mention_display(suggestions, 0) == "Mentions: [@astra] @fable"
+    assert mention_display(suggestions, 1) == "Mentions: @astra [@fable]"
 
 
 def test_parse_route_is_unchanged_for_picker_completed_inputs() -> None:
     assert parse_route("@claude hi there", DEFAULT_ROSTER) == Route(("claude",), "hi there")
     assert parse_route("@all hi", DEFAULT_ROSTER) == Route(DEFAULT_ROSTER, "hi")
     assert parse_route("@codex q", DEFAULT_ROSTER) == Route(("codex",), "q")
-    assert parse_anneal("@sol,@fable QUESTION", SOL_FABLE_ROSTER) == (
-        "sol",
+    assert parse_anneal("@astra,@fable QUESTION", ASTRA_FABLE_ROSTER) == (
+        "astra",
         "fable",
         "QUESTION",
     )
     with pytest.raises(ChatError):
-        parse_route("@nope q", SOL_FABLE_ROSTER)
+        parse_route("@nope q", ASTRA_FABLE_ROSTER)
 
 
 def test_candidate_rosters_come_from_actual_room_participants(tmp_path: Path) -> None:
     chat, _, _ = make_chat(tmp_path)
     assert mention_suggestions("@", tuple(chat.agents)) == (*DEFAULT_ROSTER, "all")
     profile_chat, _, _ = make_chat(tmp_path)
-    profile_chat.agents = {"sol": "sol-peer", "fable": "fable-peer"}
-    assert mention_suggestions("/anneal @", tuple(profile_chat.agents)) == ("sol", "fable")
+    profile_chat.agents = {"astra": "astra-peer", "fable": "fable-peer"}
+    assert mention_suggestions("/anneal @", tuple(profile_chat.agents)) == ("astra", "fable")
 
 
 def test_tab_closes_the_fragment_and_fresh_mention_after_comma_reopens() -> None:
-    completed = handle_picker_key("/anneal @so", "TAB", ("sol", "fable"), 0)
-    assert completed == ("/anneal @sol", 0)
+    completed = handle_picker_key("/anneal @so", "TAB", ("astra", "fable"), 0)
+    assert completed == ("/anneal @astra", 0)
     # The completed fragment is closed, but a later comma plus fresh @ reopens
     # with the remaining role only.
-    assert mention_suggestions("/anneal @sol,@", SOL_FABLE_ROSTER) == ("fable",)
+    assert mention_suggestions("/anneal @astra,@", ASTRA_FABLE_ROSTER) == ("fable",)
 
 
 def test_esc_closes_an_unmatched_query_without_changing_text() -> None:
@@ -8188,31 +8188,31 @@ def test_tab_on_an_unmatched_query_closes_without_changing_text() -> None:
     assert handle_picker_key("@zzz", "DOWN", (), 0) is None
 
 
-# --- default sol-fable-grok profile ---------------------------------------------------
+# --- default astra-fable-grok profile ---------------------------------------------------
 
 
 class TripleClient(ProfileClient):
     def live_targets(self) -> set[str]:
-        return {"sol-peer", "fable-peer", "grok46-peer"}
+        return {"astra-peer", "fable-peer", "grok46-peer"}
 
     def states(self) -> dict[str, str]:
-        return {"sol-peer": "idle", "fable-peer": "idle", "grok46-peer": "idle"}
+        return {"astra-peer": "idle", "fable-peer": "idle", "grok46-peer": "idle"}
 
 
-def make_sol_fable_grok_chat(tmp_path: Path) -> tuple[GroupChat, TripleClient, Transcript]:
+def make_astra_fable_grok_chat(tmp_path: Path) -> tuple[GroupChat, TripleClient, Transcript]:
     transcript = Transcript(tmp_path, "sfg-room")
     client = TripleClient()
     chat = GroupChat(
         transcript,
-        {"sol": "sol-peer", "fable": "fable-peer", "grok": "grok46-peer"},
+        {"astra": "astra-peer", "fable": "fable-peer", "grok": "grok46-peer"},
         client,
-        synthesizer="sol",
+        synthesizer="astra",
     )
     return chat, client, transcript
 
 
 VALID_SFG_RECEIPT = {
-    "profile": "sol-fable-grok",
+    "profile": "astra-fable-grok",
     "verified": [
         dict(entry)
         for entry in (
@@ -8230,32 +8230,32 @@ VALID_SFG_RECEIPT = {
 }
 
 
-def test_sol_fable_grok_profile_has_exact_ordered_roles_and_synthesizer() -> None:
-    assert namespace["PROFILE_ROLES"]["sol-fable-grok"] == ("sol", "fable", "grok")
-    assert namespace["PROFILE_SYNTHESIZER"]["sol-fable-grok"] == "sol"
-    assert namespace["PROFILE_ROLES"]["sol-fable"] == ("sol", "fable")
+def test_astra_fable_grok_profile_has_exact_ordered_roles_and_synthesizer() -> None:
+    assert namespace["PROFILE_ROLES"]["astra-fable-grok"] == ("astra", "fable", "grok")
+    assert namespace["PROFILE_SYNTHESIZER"]["astra-fable-grok"] == "astra"
+    assert namespace["PROFILE_ROLES"]["astra-fable"] == ("astra", "fable")
 
 
-def test_sol_fable_grok_room_routes_mention_review_and_anneal_over_all_three(
+def test_astra_fable_grok_room_routes_mention_review_and_anneal_over_all_three(
     tmp_path: Path,
 ) -> None:
-    chat, client, transcript = make_sol_fable_grok_chat(tmp_path)
+    chat, client, transcript = make_astra_fable_grok_chat(tmp_path)
 
     created = chat.dispatch("@grok summarize the launch flags")
     chat.review("challenge this plan")
-    chat.anneal("@sol,@grok harden this plan")
+    chat.anneal("@astra,@grok harden this plan")
 
     assert [item["sender"] for item in created] == ["human", "grok"]
     routed = [target for target, _prompt in client.calls if "group chat" in _prompt]
     assert routed[0] == "grok46-peer"  # the explicit mention
-    assert set(routed[1:4]) == {"sol-peer", "fable-peer", "grok46-peer"}  # review round
+    assert set(routed[1:4]) == {"astra-peer", "fable-peer", "grok46-peer"}  # review round
     kinds = [(item["sender"], item["kind"]) for item in transcript.read()]
-    assert ("sol", "review_synthesis") in kinds
-    assert ("sol", "anneal_final") in kinds
+    assert ("astra", "review_synthesis") in kinds
+    assert ("astra", "anneal_final") in kinds
     assert ("grok", "anneal_challenge") in kinds
 
 
-def test_sol_fable_grok_requires_exactly_three_explicit_roles_through_main(
+def test_astra_fable_grok_requires_exactly_three_explicit_roles_through_main(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class StaticClient(TripleClient):
@@ -8264,7 +8264,7 @@ def test_sol_fable_grok_requires_exactly_three_explicit_roles_through_main(
 
     monkeypatch.setattr(module, "HerdrClient", StaticClient)
     monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], json.dumps(VALID_SFG_RECEIPT))
-    base = ["--state-dir", str(tmp_path), "--room", "strict-sfg", "--profile", "sol-fable-grok"]
+    base = ["--state-dir", str(tmp_path), "--room", "strict-sfg", "--profile", "astra-fable-grok"]
 
     assert main([*base, "--once", "hi"]) == 2  # zero mappings
     assert main([*base, "--agent", "grok=grok46-peer", "--once", "hi"]) == 2  # partial
@@ -8274,13 +8274,13 @@ def test_sol_fable_grok_requires_exactly_three_explicit_roles_through_main(
             [
                 *base,
                 "--agent",
-                "sol=sol-peer",
+                "astra=astra-peer",
                 "--agent",
                 "fable=fable-peer",
                 "--agent",
                 "grok=grok46-peer",
                 "--agent",
-                "sol=dup-peer",  # duplicate role
+                "astra=dup-peer",  # duplicate role
                 "--once",
                 "hi",
             ]
@@ -8290,7 +8290,7 @@ def test_sol_fable_grok_requires_exactly_three_explicit_roles_through_main(
     assert Transcript(tmp_path, "strict-sfg").read() == []
 
 
-def test_sol_fable_grok_exact_roster_records_the_verified_receipt_once(
+def test_astra_fable_grok_exact_roster_records_the_verified_receipt_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class StaticClient(TripleClient):
@@ -8305,9 +8305,9 @@ def test_sol_fable_grok_exact_roster_records_the_verified_receipt_once(
         "--room",
         "receipt-sfg",
         "--profile",
-        "sol-fable-grok",
+        "astra-fable-grok",
         "--agent",
-        "sol=sol-peer",
+        "astra=astra-peer",
         "--agent",
         "fable=fable-peer",
         "--agent",
@@ -8323,8 +8323,8 @@ def test_sol_fable_grok_exact_roster_records_the_verified_receipt_once(
     ]
     assert len(receipts) == 1
     receipt = receipts[0]
-    assert receipt["meta"]["profile"] == "sol-fable-grok"
-    assert [entry["role"] for entry in receipt["meta"]["verified"]] == ["fable", "grok", "sol"]
+    assert receipt["meta"]["profile"] == "astra-fable-grok"
+    assert [entry["role"] for entry in receipt["meta"]["verified"]] == ["astra", "fable", "grok"]
     body = receipt["body"]
     for needle in (
         "harness grok",
@@ -8334,23 +8334,23 @@ def test_sol_fable_grok_exact_roster_records_the_verified_receipt_once(
         "native-ui verified",
     ):
         assert needle in body, needle
-    # The stored sol-fable room stays default-able: its profile is unchanged.
-    assert namespace["PROFILE_ROLES"]["sol-fable"] == ("sol", "fable")
+    # The stored astra-fable room stays default-able: its profile is unchanged.
+    assert namespace["PROFILE_ROLES"]["astra-fable"] == ("astra", "fable")
 
 
-# --- default sol-fable-grok-pi profile ------------------------------------------------
+# --- default astra-fable-grok-pi profile ------------------------------------------------
 
 
 class PiGrokClient(ProfileClient):
     def live_targets(self) -> set[str]:
-        return {"sol-peer", "fable-peer", "grok46pi-peer"}
+        return {"astra-peer", "fable-peer", "grok46pi-peer"}
 
     def states(self) -> dict[str, str]:
-        return {"sol-peer": "idle", "fable-peer": "idle", "grok46pi-peer": "idle"}
+        return {"astra-peer": "idle", "fable-peer": "idle", "grok46pi-peer": "idle"}
 
 
 VALID_SFGPI_RECEIPT = {
-    "profile": "sol-fable-grok-pi",
+    "profile": "astra-fable-grok-pi",
     "verified": [
         dict(entry)
         for entry in (
@@ -8369,19 +8369,24 @@ VALID_SFGPI_RECEIPT = {
 }
 
 
-def test_sol_fable_grok_pi_has_exact_roles_and_preserves_stored_native_profile() -> None:
-    assert namespace["PROFILE_ROLES"]["sol-fable-grok-pi"] == ("sol", "fable", "grok")
-    assert namespace["PROFILE_SYNTHESIZER"]["sol-fable-grok-pi"] == "sol"
-    assert namespace["PROFILE_ROLES"]["sol-fable-grok"] == ("sol", "fable", "grok")
-    assert namespace["PROFILE_ROLES"]["sol-fable"] == ("sol", "fable")
+def test_astra_fable_grok_pi_has_exact_roles_and_preserves_stored_native_profile() -> None:
+    assert namespace["PROFILE_ROLES"]["astra-fable-grok-pi"] == ("astra", "fable", "grok")
+    assert namespace["PROFILE_SYNTHESIZER"]["astra-fable-grok-pi"] == "astra"
+    assert namespace["PROFILE_ROLES"]["astra-fable-grok"] == ("astra", "fable", "grok")
+    assert namespace["PROFILE_ROLES"]["astra-fable"] == ("astra", "fable")
 
 
-def test_sol_fable_grok_opus_pi_adds_opus_as_fourth_role_with_sol_synthesizer() -> None:
-    assert namespace["PROFILE_ROLES"]["sol-fable-grok-opus-pi"] == ("sol", "fable", "grok", "opus")
-    assert namespace["PROFILE_SYNTHESIZER"]["sol-fable-grok-opus-pi"] == "sol"
+def test_astra_fable_grok_opus_pi_adds_opus_as_fourth_role_with_astra_synthesizer() -> None:
+    assert namespace["PROFILE_ROLES"]["astra-fable-grok-opus-pi"] == (
+        "astra",
+        "fable",
+        "grok",
+        "opus",
+    )
+    assert namespace["PROFILE_SYNTHESIZER"]["astra-fable-grok-opus-pi"] == "astra"
 
 
-def test_sol_fable_grok_pi_requires_the_exact_roster_and_records_xai_receipt(
+def test_astra_fable_grok_pi_requires_the_exact_roster_and_records_xai_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class StaticClient(PiGrokClient):
@@ -8396,9 +8401,9 @@ def test_sol_fable_grok_pi_requires_the_exact_roster_and_records_xai_receipt(
         "--room",
         "receipt-sfgpi",
         "--profile",
-        "sol-fable-grok-pi",
+        "astra-fable-grok-pi",
         "--agent",
-        "sol=sol-peer",
+        "astra=astra-peer",
         "--agent",
         "fable=fable-peer",
         "--agent",
@@ -8426,31 +8431,31 @@ def test_sol_fable_grok_pi_requires_the_exact_roster_and_records_xai_receipt(
     }
 
 
-# --- sol-fable-glm profile ------------------------------------------------------------
+# --- astra-fable-glm profile ------------------------------------------------------------
 
 
 class GlmClient(ProfileClient):
     def live_targets(self) -> set[str]:
-        return {"sol-peer", "fable-peer", "glm-peer"}
+        return {"astra-peer", "fable-peer", "glm-peer"}
 
     def states(self) -> dict[str, str]:
-        return {"sol-peer": "idle", "fable-peer": "idle", "glm-peer": "idle"}
+        return {"astra-peer": "idle", "fable-peer": "idle", "glm-peer": "idle"}
 
 
-def make_sol_fable_glm_chat(tmp_path: Path) -> tuple[GroupChat, GlmClient, Transcript]:
+def make_astra_fable_glm_chat(tmp_path: Path) -> tuple[GroupChat, GlmClient, Transcript]:
     transcript = Transcript(tmp_path, "sfglm-room")
     client = GlmClient()
     chat = GroupChat(
         transcript,
-        {"sol": "sol-peer", "fable": "fable-peer", "glm": "glm-peer"},
+        {"astra": "astra-peer", "fable": "fable-peer", "glm": "glm-peer"},
         client,
-        synthesizer="sol",
+        synthesizer="astra",
     )
     return chat, client, transcript
 
 
 VALID_SFGLM_RECEIPT = {
-    "profile": "sol-fable-glm",
+    "profile": "astra-fable-glm",
     "verified": [
         dict(entry)
         for entry in (
@@ -8469,42 +8474,42 @@ VALID_SFGLM_RECEIPT = {
 }
 
 
-def test_sol_fable_glm_profile_has_exact_ordered_roles_and_synthesizer() -> None:
-    assert namespace["PROFILE_ROLES"]["sol-fable-glm"] == ("sol", "fable", "glm")
-    assert namespace["PROFILE_SYNTHESIZER"]["sol-fable-glm"] == "sol"
-    assert namespace["PROFILE_ROLES"]["sol-fable-grok"] == ("sol", "fable", "grok")
-    assert namespace["PROFILE_ROLES"]["sol-fable"] == ("sol", "fable")
+def test_astra_fable_glm_profile_has_exact_ordered_roles_and_synthesizer() -> None:
+    assert namespace["PROFILE_ROLES"]["astra-fable-glm"] == ("astra", "fable", "glm")
+    assert namespace["PROFILE_SYNTHESIZER"]["astra-fable-glm"] == "astra"
+    assert namespace["PROFILE_ROLES"]["astra-fable-grok"] == ("astra", "fable", "grok")
+    assert namespace["PROFILE_ROLES"]["astra-fable"] == ("astra", "fable")
 
 
-def test_sol_fable_glm_room_routes_mention_review_anneal_and_consensus(
+def test_astra_fable_glm_room_routes_mention_review_anneal_and_consensus(
     tmp_path: Path,
 ) -> None:
-    chat, client, transcript = make_sol_fable_glm_chat(tmp_path)
+    chat, client, transcript = make_astra_fable_glm_chat(tmp_path)
 
     created = chat.dispatch("@glm summarize the launch flags")
     chat.review("challenge this plan")
-    chat.anneal("@sol,@glm harden this plan")
+    chat.anneal("@astra,@glm harden this plan")
     planned = chat.plan_consensus("@fable,@glm Decide whether this is ready")
 
     assert [item["sender"] for item in created] == ["human", "glm"]
     routed = [target for target, _prompt in client.calls if "group chat" in _prompt]
     assert routed[0] == "glm-peer"  # the explicit @glm mention
-    assert set(routed[1:4]) == {"sol-peer", "fable-peer", "glm-peer"}  # review round
+    assert set(routed[1:4]) == {"astra-peer", "fable-peer", "glm-peer"}  # review round
     kinds = [(item["sender"], item["kind"]) for item in transcript.read()]
-    assert ("sol", "review_synthesis") in kinds
-    assert ("sol", "anneal_final") in kinds
+    assert ("astra", "review_synthesis") in kinds
+    assert ("astra", "anneal_final") in kinds
     assert ("glm", "anneal_challenge") in kinds
     # Consensus selection honours @glm addressing in the bounded roster.
     assert planned.reviewers == ("fable", "glm")
-    assert planned.synthesizer == "sol"
+    assert planned.synthesizer == "astra"
     # The mention picker offers exactly the three bounded roles, @glm included.
     assert mention_suggestions("@", tuple(chat.agents)) == (*chat.agents, "all")
-    assert mention_suggestions("@sol,@", tuple(chat.agents)) == ("fable", "glm", "all")
-    assert mention_suggestions("/anneal @sol,@", tuple(chat.agents)) == ("fable", "glm")
+    assert mention_suggestions("@astra,@", tuple(chat.agents)) == ("fable", "glm", "all")
+    assert mention_suggestions("/anneal @astra,@", tuple(chat.agents)) == ("fable", "glm")
     assert mention_suggestions("@g", tuple(chat.agents)) == ("glm",)
 
 
-def test_sol_fable_glm_requires_exactly_three_explicit_roles_through_main(
+def test_astra_fable_glm_requires_exactly_three_explicit_roles_through_main(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class StaticClient(GlmClient):
@@ -8513,7 +8518,7 @@ def test_sol_fable_glm_requires_exactly_three_explicit_roles_through_main(
 
     monkeypatch.setattr(module, "HerdrClient", StaticClient)
     monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], json.dumps(VALID_SFGLM_RECEIPT))
-    base = ["--state-dir", str(tmp_path), "--room", "strict-sfglm", "--profile", "sol-fable-glm"]
+    base = ["--state-dir", str(tmp_path), "--room", "strict-sfglm", "--profile", "astra-fable-glm"]
 
     assert main([*base, "--once", "hi"]) == 2  # zero mappings
     assert main([*base, "--agent", "glm=glm-peer", "--once", "hi"]) == 2  # partial
@@ -8524,13 +8529,13 @@ def test_sol_fable_glm_requires_exactly_three_explicit_roles_through_main(
             [
                 *base,
                 "--agent",
-                "sol=sol-peer",
+                "astra=astra-peer",
                 "--agent",
                 "fable=fable-peer",
                 "--agent",
                 "glm=glm-peer",
                 "--agent",
-                "sol=dup-peer",  # duplicate role
+                "astra=dup-peer",  # duplicate role
                 "--once",
                 "hi",
             ]
@@ -8540,7 +8545,7 @@ def test_sol_fable_glm_requires_exactly_three_explicit_roles_through_main(
     assert Transcript(tmp_path, "strict-sfglm").read() == []
 
 
-def test_sol_fable_glm_exact_roster_records_the_verified_receipt_once(
+def test_astra_fable_glm_exact_roster_records_the_verified_receipt_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class StaticClient(GlmClient):
@@ -8555,9 +8560,9 @@ def test_sol_fable_glm_exact_roster_records_the_verified_receipt_once(
         "--room",
         "receipt-sfglm",
         "--profile",
-        "sol-fable-glm",
+        "astra-fable-glm",
         "--agent",
-        "sol=sol-peer",
+        "astra=astra-peer",
         "--agent",
         "fable=fable-peer",
         "--agent",
@@ -8573,8 +8578,8 @@ def test_sol_fable_glm_exact_roster_records_the_verified_receipt_once(
     ]
     assert len(receipts) == 1
     receipt = receipts[0]
-    assert receipt["meta"]["profile"] == "sol-fable-glm"
-    assert [entry["role"] for entry in receipt["meta"]["verified"]] == ["fable", "glm", "sol"]
+    assert receipt["meta"]["profile"] == "astra-fable-glm"
+    assert [entry["role"] for entry in receipt["meta"]["verified"]] == ["astra", "fable", "glm"]
     glm_entry = next(entry for entry in receipt["meta"]["verified"] if entry["role"] == "glm")
     assert glm_entry["harness"] == "pi"
     assert glm_entry["provider"] == "bigmodel-coding"
@@ -8588,9 +8593,9 @@ def test_sol_fable_glm_exact_roster_records_the_verified_receipt_once(
         "native-ui verified",
     ):
         assert needle in body, needle
-    # The stored sol-fable and sol-fable-grok rooms keep their own profiles.
-    assert namespace["PROFILE_ROLES"]["sol-fable"] == ("sol", "fable")
-    assert namespace["PROFILE_ROLES"]["sol-fable-grok"] == ("sol", "fable", "grok")
+    # The stored astra-fable and astra-fable-grok rooms keep their own profiles.
+    assert namespace["PROFILE_ROLES"]["astra-fable"] == ("astra", "fable")
+    assert namespace["PROFILE_ROLES"]["astra-fable-grok"] == ("astra", "fable", "grok")
 
 
 # --- wave-2 council resume: reconstruction, /council resume, CLI and controller -----
@@ -9374,12 +9379,12 @@ def test_council_resume_once_cli_success_and_refusal(
 # --- wave-3 append-free once-resume hardening ----------------------------------------
 
 
-class SolFableResumeClient(FakeClient):
+class AstraFableResumeClient(FakeClient):
     def live_targets(self) -> set[str]:
-        return {"sol-peer", "fable-peer"}
+        return {"astra-peer", "fable-peer"}
 
     def states(self) -> dict[str, str]:
-        return {"sol-peer": "idle", "fable-peer": "idle"}
+        return {"astra-peer": "idle", "fable-peer": "idle"}
 
     def turn(
         self,
@@ -9393,7 +9398,7 @@ class SolFableResumeClient(FakeClient):
         if cancel_event is not None and cancel_event.is_set():
             raise ChatError("review cancelled")
         if CONSENSUS_PROVISIONAL_MARKER in prompt:
-            return "done", "sol resumed provisional"
+            return "done", "astra resumed provisional"
         if CONSENSUS_VOTE_MARKER in prompt:
             return "done", "VERDICT: PASS\nRatified on resume."
         if CONSENSUS_FINAL_MARKER in prompt:
@@ -9402,14 +9407,14 @@ class SolFableResumeClient(FakeClient):
 
 
 def profile_resume_records(tmp_path: Path, room: str) -> list[dict[str, object]]:
-    """Build a resumable sol-fable checkpoint: question only, no attempts."""
+    """Build a resumable astra-fable checkpoint: question only, no attempts."""
     source_room = f"{room}-source"
     transcript = Transcript(tmp_path, source_room)
     chat = GroupChat(
         transcript,
-        {"sol": "sol-peer", "fable": "fable-peer"},
-        SolFableResumeClient(),
-        synthesizer="sol",
+        {"astra": "astra-peer", "fable": "fable-peer"},
+        AstraFableResumeClient(),
+        synthesizer="astra",
     )
     chat.consensus("@fable Profile council")
     records = transcript.read()
@@ -9422,7 +9427,7 @@ def test_once_resume_refusal_appends_nothing_despite_setup_failures(
     source = completed_council_records(tmp_path, "once-refuse-setup-source")
     client = ResumeClient()
     monkeypatch.setattr(module, "HerdrClient", lambda **kwargs: client)
-    monkeypatch.setenv("HERDR_GROUP_CHAT_SETUP_FAILURES", "sol setup exploded\nfable setup too")
+    monkeypatch.setenv("HERDR_GROUP_CHAT_SETUP_FAILURES", "astra setup exploded\nfable setup too")
     monkeypatch.delenv(namespace["PROFILE_RECEIPT_ENV"], raising=False)
 
     replayed = replay_records(tmp_path, "once-refuse-setup-room", source)  # a closed round
@@ -9451,7 +9456,7 @@ def test_once_resume_refusal_appends_nothing_despite_setup_failures(
 def test_once_profile_resume_refusal_records_neither_setup_nor_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    client = SolFableResumeClient()
+    client = AstraFableResumeClient()
     monkeypatch.setattr(module, "HerdrClient", lambda **kwargs: client)
     monkeypatch.setenv("HERDR_GROUP_CHAT_SETUP_FAILURES", "late setup failure")
     monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], valid_receipt_json)
@@ -9460,9 +9465,9 @@ def test_once_profile_resume_refusal_records_neither_setup_nor_receipt(
     closed_source = Transcript(tmp_path, "once-refuse-receipt-source")
     closed_chat = GroupChat(
         closed_source,
-        {"sol": "sol-peer", "fable": "fable-peer"},
-        SolFableResumeClient(),
-        synthesizer="sol",
+        {"astra": "astra-peer", "fable": "fable-peer"},
+        AstraFableResumeClient(),
+        synthesizer="astra",
     )
     closed_chat.consensus("@fable Profile council")
     closed_records = closed_source.read()
@@ -9474,9 +9479,9 @@ def test_once_profile_resume_refusal_records_neither_setup_nor_receipt(
             "--state-dir",
             str(tmp_path),
             "--profile",
-            "sol-fable",
+            "astra-fable",
             "--agent",
-            "sol=sol-peer",
+            "astra=astra-peer",
             "--agent",
             "fable=fable-peer",
             "--once",
@@ -9495,7 +9500,7 @@ def test_once_profile_resume_refusal_records_neither_setup_nor_receipt(
 def test_once_profile_resume_records_receipt_before_first_new_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    client = SolFableResumeClient()
+    client = AstraFableResumeClient()
     monkeypatch.setattr(module, "HerdrClient", lambda **kwargs: client)
     monkeypatch.setenv("HERDR_GROUP_CHAT_SETUP_FAILURES", "ignored on once-resume")
     monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], valid_receipt_json)
@@ -9514,9 +9519,9 @@ def test_once_profile_resume_records_receipt_before_first_new_attempt(
             "--state-dir",
             str(tmp_path),
             "--profile",
-            "sol-fable",
+            "astra-fable",
             "--agent",
-            "sol=sol-peer",
+            "astra=astra-peer",
             "--agent",
             "fable=fable-peer",
             "--once",
@@ -9524,7 +9529,7 @@ def test_once_profile_resume_records_receipt_before_first_new_attempt(
         ]
     )
     assert code == 0
-    assert "final from sol-peer" in capsys.readouterr().out
+    assert "final from astra-peer" in capsys.readouterr().out
 
     records = Transcript(tmp_path, "once-receipt-resume").read()
     receipt = [item for item in records if item["kind"] == namespace["PROFILE_RECEIPT_KIND"]]
@@ -9570,7 +9575,7 @@ def test_non_resume_once_paths_still_record_setup_failures_and_receipt(
 
     # A profile room's non-resume once path still records the startup receipt.
     monkeypatch.setenv(namespace["PROFILE_RECEIPT_ENV"], valid_receipt_json)
-    profile_client = SolFableResumeClient()
+    profile_client = AstraFableResumeClient()
     monkeypatch.setattr(module, "HerdrClient", lambda **kwargs: profile_client)
     code = main(
         [
@@ -9579,9 +9584,9 @@ def test_non_resume_once_paths_still_record_setup_failures_and_receipt(
             "--state-dir",
             str(tmp_path),
             "--profile",
-            "sol-fable",
+            "astra-fable",
             "--agent",
-            "sol=sol-peer",
+            "astra=astra-peer",
             "--agent",
             "fable=fable-peer",
             "--once",

@@ -47,8 +47,8 @@ LAYOUT_ENV = "HERDR_GROUP_CHAT_LAYOUT"
 SETTINGS_ENV = "HERDR_GROUP_CHAT_SETTINGS"
 SETTINGS_FILENAME = "settings.toml"
 LAYOUTS = ("compact", "grid")
-DEFAULT_PROFILE = "sol-fable-grok-pi"
-OPUS_DEFAULT_PROFILE = "sol-fable-grok-opus-pi"
+DEFAULT_PROFILE = "astra-fable-grok-pi"
+OPUS_DEFAULT_PROFILE = "astra-fable-grok-opus-pi"
 GRID_ROOM_RATIO = "0.55"
 # Probed live on herdr 0.8.2 in an isolated `hgc-probe-*` session: a
 # `pane move <pane> --split down --target-pane <target> --ratio r` keeps
@@ -97,21 +97,21 @@ class Participant:
     tab_path_prefix: str = ""
 
 
-SOL_PARTICIPANT = Participant(
-    role="sol",
+ASTRA_PARTICIPANT = Participant(
+    role="astra",
     kind="pi",
-    name="sol-peer",
+    name="astra-peer",
     start_args=(
         "--provider",
         "openai-codex",
         "--model",
-        "gpt-5.6-sol",
+        "gpt-6-astra",
         "--thinking",
         "high",
     ),
-    catalog_command=("pi", "--list-models", "gpt-5.6-sol"),
+    catalog_command=("pi", "--list-models", "gpt-6-astra"),
     provider="openai-codex",
-    model="gpt-5.6-sol",
+    model="gpt-6-astra",
     effort="high",
 )
 
@@ -182,16 +182,16 @@ GROK_PI_PARTICIPANT = Participant(
 # The single profile definition: participants, native launch argv, and the
 # canonical matched evidence the receipt carries. No other source exists.
 PROFILE_PARTICIPANTS: dict[str, tuple[Participant, ...]] = {
-    "sol-fable": (SOL_PARTICIPANT, FABLE_PARTICIPANT),
-    "sol-fable-grok": (SOL_PARTICIPANT, FABLE_PARTICIPANT, GROK_PARTICIPANT),
-    "sol-fable-grok-pi": (SOL_PARTICIPANT, FABLE_PARTICIPANT, GROK_PI_PARTICIPANT),
-    "sol-fable-grok-opus-pi": (
-        SOL_PARTICIPANT,
+    "astra-fable": (ASTRA_PARTICIPANT, FABLE_PARTICIPANT),
+    "astra-fable-grok": (ASTRA_PARTICIPANT, FABLE_PARTICIPANT, GROK_PARTICIPANT),
+    "astra-fable-grok-pi": (ASTRA_PARTICIPANT, FABLE_PARTICIPANT, GROK_PI_PARTICIPANT),
+    "astra-fable-grok-opus-pi": (
+        ASTRA_PARTICIPANT,
         FABLE_PARTICIPANT,
         GROK_PI_PARTICIPANT,
         OPUS_PARTICIPANT,
     ),
-    "sol-fable-glm": (SOL_PARTICIPANT, FABLE_PARTICIPANT, GLM_PARTICIPANT),
+    "astra-fable-glm": (ASTRA_PARTICIPANT, FABLE_PARTICIPANT, GLM_PARTICIPANT),
 }
 
 
