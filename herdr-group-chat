@@ -4955,6 +4955,9 @@ def handle_local_command(
 # Herdr's Ochre included). Every distinction uses the ANSI bold, dim, and
 # reverse attributes, which stay readable on both light and dark terminals,
 # and no background, 256-colour, or truecolour sequence is ever written.
+# For the same reason, run_tui adopts the terminal's default colours
+# (curses.use_default_colors) so colour pair 0 cannot repaint the background
+# against the operator's active theme.
 
 # SGR mouse mode: button-press reporting with SGR-encoded coordinates, so
 # wheel events survive every modern terminal without terminfo guesswork.
@@ -5175,6 +5178,12 @@ def draw_tui(
 
 
 def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
+    try:
+        # curses.wrapper's start_color() pins pair 0 to white on black unless
+        # the terminal's own colours are re-adopted here, before any drawing.
+        curses.use_default_colors()
+    except curses.error:
+        pass
     curses.curs_set(1)
     screen.keypad(True)
     screen.timeout(100)

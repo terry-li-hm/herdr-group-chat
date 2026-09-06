@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+- **Terminal default colours in the room.** The TUI now adopts the
+  terminal's own foreground and background via `curses.use_default_colors()`
+  at startup, so the room no longer repaints itself white-on-black and light
+  terminal themes such as Herdr's catppuccin-latte show through unchanged.
 - **Sticky addressee for plain messages.** A plain message now goes to the
   participant the human is currently talking to — the single recipient of the
   most recent human message when it named exactly one current participant —

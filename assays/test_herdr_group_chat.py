@@ -1336,6 +1336,50 @@ def test_tui_idle_status_row_names_the_sticky_addressee(
     assert draws == ["To: @pi · Ready. @pi ready · @claude working · @codex ready · @grok blocked"]
 
 
+def test_tui_adopts_terminal_default_colours_before_first_draw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, _, _ = make_chat(tmp_path)
+    events: list[str] = []
+
+    class ExitScreen:
+        def keypad(self, _enabled: bool) -> None:
+            pass
+
+        def timeout(self, _milliseconds: int) -> None:
+            pass
+
+        def get_wch(self) -> object:
+            return "\x11"
+
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    monkeypatch.setattr(
+        module.curses,
+        "use_default_colors",
+        lambda: events.append("use_default_colors"),
+    )
+    monkeypatch.setattr(
+        module,
+        "draw_tui",
+        lambda *_args, **_kwargs: events.append("draw_tui") or 0,
+    )
+
+    run_tui(ExitScreen(), chat, "default-colours-room")
+
+    assert events.count("use_default_colors") == 1
+    assert events.index("use_default_colors") < events.index("draw_tui")
+
+    def refusing_use_default_colors() -> None:
+        raise module.curses.error("use_default_colors")
+
+    monkeypatch.setattr(module.curses, "use_default_colors", refusing_use_default_colors)
+    events.clear()
+
+    run_tui(ExitScreen(), chat, "default-colours-room")
+
+    assert events == ["draw_tui"]
+
+
 def test_tui_ctrl_q_waits_for_ordinary_cancellation_outcome_before_returning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
