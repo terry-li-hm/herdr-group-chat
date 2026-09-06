@@ -81,6 +81,7 @@ LAYOUT_PLACE_TIMEOUT_S = 180
 ROOM_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
 MENTION_RE = re.compile(r"^@([a-z0-9_,@-]+)\s+(.*)$", re.DOTALL | re.IGNORECASE)
 REPLY_TOKEN_RE = re.compile(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})")
+TURN_TOKEN_RE = re.compile(r"[a-f0-9]{32}\Z")
 CODEX_SESSION_ID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
 )
@@ -167,7 +168,16 @@ class AgentClient(Protocol):
         prompt: str,
         timeout_ms: int | None = None,
         cancel_event: threading.Event | None = None,
+        agent_label: str | None = None,
     ) -> tuple[str, str]: ...
+
+
+class TurnStore(Protocol):
+    """Durable out-of-band storage for one delivered turn payload."""
+
+    def write_turn(self, token: str, text: str) -> Path: ...
+
+    def remove_turn(self, token: str) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -297,6 +307,7 @@ class Transcript:
             if not transferred:
                 os.close(directory_descriptor)
         self.path = self.state_dir / f"{room}.jsonl"
+        self.turns_dir = self.state_dir / f"{room}.turns"
         self.lock_path = self.state_dir / f"{room}.lock"
         self.council_lock_path = self.state_dir / f"{room}.council.lock"
         self._council_lock_depth = 0
@@ -482,6 +493,62 @@ class Transcript:
         """Serialize ordinary room delivery across independent room processes."""
         with self._delivery_lock, self._file_lock(self.delivery_lock_path):
             yield
+
+    def write_turn(self, token: str, text: str) -> Path:
+        """Write one turn payload for file-nudge delivery and return its path.
+
+        The payload never rides on terminal paste handling, so a startup
+        dialog can only swallow the short nudge, and a retry of the same token
+        is refused instead of silently replacing the peer's instructions.
+        """
+        if TURN_TOKEN_RE.fullmatch(token) is None:
+            raise ChatError("invalid turn token")
+        try:
+            self.turns_dir.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        else:
+            os.chmod(self.turns_dir, 0o700)
+        path = self.turns_dir / f"{token}.md"
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as error:
+            raise ChatError(f"turn {token} already has a payload file") from error
+        except OSError as error:
+            raise ChatError(f"invalid room state: {error}") from error
+        try:
+            os.fchmod(descriptor, 0o600)
+            os.write(descriptor, text.encode("utf-8"))
+        finally:
+            os.close(descriptor)
+        return path
+
+    def remove_turn(self, token: str) -> None:
+        """Delete one turn payload file if present."""
+        if TURN_TOKEN_RE.fullmatch(token) is None:
+            raise ChatError("invalid turn token")
+        try:
+            (self.turns_dir / f"{token}.md").unlink()
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise ChatError(f"invalid room state: {error}") from error
+
+    def prune_turns(self, max_age_s: float = 86400) -> None:
+        """Remove turn payload files older than max_age_s, leaving the rest."""
+        try:
+            entries = sorted(self.turns_dir.iterdir())
+        except FileNotFoundError:
+            return
+        cutoff = time.time() - max_age_s
+        for entry in entries:
+            if TURN_TOKEN_RE.fullmatch(entry.name.removesuffix(".md")) is None:
+                continue
+            try:
+                if entry.stat().st_mtime < cutoff:
+                    entry.unlink()
+            except FileNotFoundError:
+                continue
 
     def _fsync_state_dir(self) -> None:
         try:
@@ -680,10 +747,12 @@ class HerdrClient:
         timeout_ms: int = 600_000,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
+        turn_store: TurnStore | None = None,
     ) -> None:
         self.herdr_bin = herdr_bin
         self.timeout_ms = timeout_ms
         self.runner = runner
+        self.turn_store = turn_store
         self._agent_kinds: dict[str, str] = {}
         self._untrusted_agent_names: set[str] = set()
         self.popen_factory = (
@@ -838,6 +907,7 @@ class HerdrClient:
         prompt: str,
         timeout_ms: int | None = None,
         cancel_event: threading.Event | None = None,
+        agent_label: str | None = None,
     ) -> tuple[str, str]:
         effective_timeout_ms = timeout_ms if timeout_ms is not None else self.timeout_ms
         token_match = REPLY_TOKEN_RE.search(prompt)
@@ -846,6 +916,18 @@ class HerdrClient:
         reply_marker_id = token_match.group(1)
         if cancel_event is not None and cancel_event.is_set():
             raise ChatError("review cancelled")
+        submitted_prompt = prompt
+        if self.turn_store is not None:
+            # The payload goes to a file the peer reads with its own tools;
+            # only a short single-line nudge is typed into the peer's TUI, so
+            # terminal paste handling never carries the turn and a dialog can
+            # only eat the nudge, which a retry resends idempotently.
+            turn_path = self.turn_store.write_turn(reply_marker_id, prompt)
+            submitted_prompt = self._turn_nudge(
+                agent_label if agent_label is not None else target,
+                reply_marker_id,
+                turn_path,
+            )
 
         codex_target = self._codex_target(target)
         submitted_agent: dict[str, Any] | None = None
@@ -866,7 +948,7 @@ class HerdrClient:
                         "agent",
                         "prompt",
                         target,
-                        prompt,
+                        submitted_prompt,
                         "--wait",
                         "--timeout",
                         str(effective_timeout_ms),
@@ -894,10 +976,11 @@ class HerdrClient:
             if submitted_status in {"idle", "done"}:
                 reply = self._local_codex_reply(target, reply_marker_id, submitted_agent, None)
                 if reply is not None:
+                    self._complete_turn(reply_marker_id)
                     return submitted_status, reply
         else:
             self._run_interruptible(
-                ["agent", "prompt", target, prompt],
+                ["agent", "prompt", target, submitted_prompt],
                 cancel_event,
                 timeout=max(1, min(30, effective_timeout_ms / 1000)),
             )
@@ -949,6 +1032,7 @@ class HerdrClient:
                         target, reply_marker_id, submitted_agent, agent_info
                     )
                 if reply is not None:
+                    self._complete_turn(reply_marker_id)
                     return status, reply
                 terminal = self._read_terminal(target, timeout=remaining)
                 if terminal is None:
@@ -958,11 +1042,15 @@ class HerdrClient:
                     if "trust all" in terminal.lower():
                         return "blocked", ""
                     try:
-                        return status, extract_reply(terminal, reply_marker_id)
+                        reply = extract_reply(terminal, reply_marker_id)
                     except ChatError:
                         grok_reply = self._local_grok_reply(target, reply_marker_id)
                         if grok_reply is not None:
+                            self._complete_turn(reply_marker_id)
                             return status, grok_reply
+                    else:
+                        self._complete_turn(reply_marker_id)
+                        return status, reply
                     if saw_working and terminal == last_unmarked_read:
                         stable_unmarked += 1
                     else:
@@ -978,6 +1066,22 @@ class HerdrClient:
                 cancel_event.wait(pause)
             else:
                 time.sleep(pause)
+
+    @staticmethod
+    def _turn_nudge(agent: str, token: str, path: Path) -> str:
+        """Build the one-line nudge that points the peer at its turn file."""
+        nudge = (
+            f"@{agent}: your group-chat turn {token} is in the file {path}. "
+            "Read that file now and follow it exactly."
+        )
+        if "\n" in nudge or "\r" in nudge or len(nudge) >= 600:
+            raise ChatError("turn nudge too long")
+        return nudge
+
+    def _complete_turn(self, token: str) -> None:
+        """Drop the delivered turn payload once its reply is in hand."""
+        if self.turn_store is not None:
+            self.turn_store.remove_turn(token)
 
     def _codex_target(self, target: str) -> bool:
         """Identify Codex before changing its submission protocol.
@@ -2361,6 +2465,7 @@ class GroupChat:
         self.lead = synthesizer if lead is None else lead
         self.agent_timeouts = dict(agent_timeouts or {})
         self.host_label = host_label
+        self.transcript.prune_turns()
 
     def _ensure_live(self, names: Sequence[str]) -> None:
         targets = self.client.live_targets()
@@ -2494,11 +2599,15 @@ class GroupChat:
                 try:
                     if cancel_event is None:
                         status, reply = self.client.turn(
-                            self.agents[agent], prompt, self._timeout_for(agent)
+                            self.agents[agent], prompt, self._timeout_for(agent), agent_label=agent
                         )
                     else:
                         status, reply = self.client.turn(
-                            self.agents[agent], prompt, self._timeout_for(agent), cancel_event
+                            self.agents[agent],
+                            prompt,
+                            self._timeout_for(agent),
+                            cancel_event,
+                            agent_label=agent,
                         )
                     if cancel_event is not None and cancel_event.is_set():
                         set_state(agent, "cancelled")
@@ -2657,6 +2766,7 @@ class GroupChat:
             review.prompts[agent],
             self._timeout_for(agent),
             review.cancel_event,
+            agent_label=agent,
         )
 
     def _start_council_attempt(
@@ -2983,7 +3093,11 @@ class GroupChat:
             pending = self._start_council_attempt(review, COUNCIL_KIND_PHASES[kind], agent, prompt)
         try:
             status, reply = self.client.turn(
-                self.agents[agent], prompt, self._timeout_for(agent), review.cancel_event
+                self.agents[agent],
+                prompt,
+                self._timeout_for(agent),
+                review.cancel_event,
+                agent_label=agent,
             )
         except ChatError as error:
             failure = failure_state(error)
@@ -3162,7 +3276,11 @@ class GroupChat:
             raise ChatError("review cancelled")
         self._start_council_attempt(review, "vote", agent, prompt)
         return self.client.turn(
-            self.agents[agent], prompt, self._timeout_for(agent), review.cancel_event
+            self.agents[agent],
+            prompt,
+            self._timeout_for(agent),
+            review.cancel_event,
+            agent_label=agent,
         )
 
     def _record_consensus_vote(
@@ -5447,6 +5565,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="export the durable council ledger JSON to a new file and exit",
     )
+    parser.add_argument(
+        "--inline-prompts",
+        action="store_true",
+        help="type full turn prompts into the peer TUI instead of file nudge delivery;"
+        " use this only for a peer that cannot read local files",
+    )
     return parser
 
 
@@ -5490,6 +5614,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             HerdrClient(
                 herdr_bin=os.environ.get("HERDR_BIN_PATH", "herdr"),
                 timeout_ms=args.timeout_ms,
+                turn_store=None if args.inline_prompts else transcript,
             ),
             max_turns=args.max_turns,
             agents_workspace_id=args.agents_workspace,

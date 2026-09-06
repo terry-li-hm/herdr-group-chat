@@ -577,6 +577,13 @@ disclosure boundary applies to anything addressed to `@glm`.
   capture (Claude) still resolves from the clean transcript. A generic
   unmarked-reply extractor is deliberately not attempted: terminal output has
   no reliable reply boundaries.
+- Each turn's full prompt is written to
+  `<state-dir>/<room>.turns/<token>.md` and the peer receives only a one-line
+  nudge naming that file, so the payload never rides on terminal paste
+  handling; a startup dialog can swallow at most the nudge. The file is
+  deleted once the reply arrives and stale files are pruned after a day.
+  `--inline-prompts` restores the old typed delivery for a peer that cannot
+  read local files.
 - Grok session recovery depends on the local `~/.grok/sessions` history layout.
 - The preview release supports macOS and Linux.
 

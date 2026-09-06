@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+- **Room turns are delivered by nudge-and-pull.** The full turn prompt is now
+  written to `<state-dir>/<room>.turns/<token>.md` (0o700 directory, 0o600
+  file) and the peer receives a single-line nudge naming the file, so the
+  payload never sits in a TUI paste and a startup dialog can only eat the
+  nudge. Successful replies delete their turn file, and files older than a
+  day are pruned at room start. `--inline-prompts` restores typed delivery.
 - **Directory-trust dialogs never receive a room prompt.** Codex 0.153 draws
   its directory-trust dialog after `agent start` reports ready, so a launch
   could promote the peer and let the room's first prompt land in the dialog,

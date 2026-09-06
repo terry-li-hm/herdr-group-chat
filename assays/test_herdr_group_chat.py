@@ -138,6 +138,7 @@ class FakeClient:
         prompt: str,
         timeout_ms: int | None = None,
         cancel_event: threading.Event | None = None,
+        agent_label: str | None = None,
     ) -> tuple[str, str]:
         self.calls.append((target, prompt))
         self.timeouts.append(timeout_ms)
@@ -229,6 +230,7 @@ def concurrent_dispatch(
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             prompts.put(prompt)
             return "done", f"reply to {body}"
@@ -998,6 +1000,7 @@ class BlockingOrdinaryClient:
         prompt: str,
         timeout_ms: int | None = None,
         cancel_event: threading.Event | None = None,
+        agent_label: str | None = None,
     ) -> tuple[str, str]:
         self.calls.append((target, prompt))
         self.started.set()
@@ -1025,6 +1028,7 @@ class CancellationAwareOrdinaryClient(BlockingOrdinaryClient):
         prompt: str,
         timeout_ms: int | None = None,
         cancel_event: threading.Event | None = None,
+        agent_label: str | None = None,
     ) -> tuple[str, str]:
         self.calls.append((target, prompt))
         self.started.set()
@@ -2300,6 +2304,7 @@ def test_message_appended_by_another_process_during_turn_stays_eligible(
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             self.calls.append((target, prompt))
             self.timeouts.append(timeout_ms)
@@ -3043,6 +3048,220 @@ def test_turn_falls_back_to_terminal_when_pi_session_is_markerless(
     status, body = client.turn("pi-peer", prompt, timeout_ms=5_000)
 
     assert (status, body) == ("done", "terminal reply")
+
+
+def make_turn_store_room(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    token: str,
+    statuses: list[str],
+    terminal: str,
+) -> tuple[HerdrClient, Transcript, Path, list[list[str]], list[str]]:
+    """Build a store-backed client whose plain-path submission is captured."""
+    transcript = Transcript(tmp_path, "nudge-room")
+
+    class FakeCompleted:
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+            self.stderr = ""
+            self.returncode = 0
+
+    def fake_run(arguments: list[str], timeout: float = 30, **_kwargs: object) -> FakeCompleted:
+        if arguments[1:3] == ["agent", "get"]:
+            status = statuses.pop(0) if statuses else "working"
+            return FakeCompleted(json.dumps({"result": {"agent": {"agent_status": status}}}))
+        if arguments[1:3] == ["agent", "read"]:
+            return FakeCompleted(terminal)
+        raise AssertionError(f"unexpected herdr call: {arguments}")
+
+    submissions: list[list[str]] = []
+    payloads: list[str] = []
+    turn_file = transcript.turns_dir / f"{token}.md"
+
+    def fake_submit(
+        arguments: list[str], cancel_event: object, timeout: float, **_kwargs: object
+    ) -> object:
+        submissions.append(list(arguments))
+        payloads.append(turn_file.read_text(encoding="utf-8") if turn_file.exists() else "")
+        return None
+
+    client = HerdrClient(runner=fake_run, turn_store=transcript)
+    monkeypatch.setattr(client, "_run_interruptible", fake_submit)
+    monkeypatch.setitem(namespace, "POLL_INTERVAL_S", 0)
+    return (
+        client,
+        transcript,
+        tmp_path / "nudge-room.turns" / f"{token}.md",
+        submissions,
+        payloads,
+    )
+
+
+def test_write_turn_creates_private_store_and_refuses_rewrites(
+    tmp_path: Path,
+) -> None:
+    transcript = Transcript(tmp_path, "turn-store-room")
+    token = "b" * 32
+    text = f"HGCHAT_REPLY_BEGIN {token}\npayload body\nHGCHAT_REPLY_END {token}\n"
+
+    path = transcript.write_turn(token, text)
+
+    assert path == tmp_path / "turn-store-room.turns" / f"{token}.md"
+    assert path.read_text(encoding="utf-8") == text
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    with pytest.raises(ChatError):
+        transcript.write_turn(token, "replacement")
+    with pytest.raises(ChatError):
+        transcript.write_turn("not-a-token", text)
+    with pytest.raises(ChatError):
+        transcript.remove_turn("../escape")
+
+
+def test_turn_with_store_submits_one_line_nudge_and_writes_the_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "5" * 32
+    prompt = (
+        f"HGCHAT_REPLY_BEGIN {token}\n"
+        "You are @pi, a full participant in a local group chat.\n"
+        f"HGCHAT_REPLY_END {token}\n"
+    )
+    terminal = f"HGCHAT_REPLY_BEGIN {token}\nnudge reply\nHGCHAT_REPLY_END {token}\n"
+    client, _transcript, turn_path, submissions, payloads = make_turn_store_room(
+        tmp_path, monkeypatch, token, ["working", "idle"], terminal
+    )
+
+    status, body = client.turn("pi-peer", prompt, timeout_ms=5_000, agent_label="pi")
+
+    assert (status, body) == ("idle", "nudge reply")
+    assert len(submissions) == 1
+    nudge = submissions[0][3]
+    assert submissions[0][:3] == ["agent", "prompt", "pi-peer"]
+    assert nudge == (
+        f"@pi: your group-chat turn {token} is in the file {turn_path}. "
+        "Read that file now and follow it exactly."
+    )
+    assert "\n" not in nudge
+    assert len(nudge) < 600
+    assert prompt not in submissions[0]
+    assert payloads == [prompt]
+    assert not turn_path.exists()
+
+
+def test_successful_reply_removes_the_turn_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "6" * 32
+    prompt = f"HGCHAT_REPLY_BEGIN {token}\nbody\nHGCHAT_REPLY_END {token}\n"
+    terminal = f"HGCHAT_REPLY_BEGIN {token}\nreply\nHGCHAT_REPLY_END {token}\n"
+    client, _transcript, turn_path, _submissions, _payloads = make_turn_store_room(
+        tmp_path, monkeypatch, token, ["working", "idle"], terminal
+    )
+
+    status, _body = client.turn("pi-peer", prompt, timeout_ms=5_000)
+
+    assert status == "idle"
+    assert not turn_path.exists()
+
+
+def test_failed_turn_leaves_the_turn_file_for_inspection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "7" * 32
+    prompt = f"HGCHAT_REPLY_BEGIN {token}\nbody\nHGCHAT_REPLY_END {token}\n"
+    client, _transcript, turn_path, _submissions, _payloads = make_turn_store_room(
+        tmp_path, monkeypatch, token, ["working"], "(still working)"
+    )
+
+    with pytest.raises(ChatError, match="timed out"):
+        client.turn("pi-peer", prompt, timeout_ms=150)
+
+    assert turn_path.exists()
+    assert turn_path.read_text(encoding="utf-8") == prompt
+
+
+def test_blocked_turn_leaves_the_turn_file_for_inspection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "8" * 32
+    prompt = f"HGCHAT_REPLY_BEGIN {token}\nbody\nHGCHAT_REPLY_END {token}\n"
+    client, _transcript, turn_path, _submissions, _payloads = make_turn_store_room(
+        tmp_path, monkeypatch, token, ["blocked"], "(blocked pane)"
+    )
+
+    status, body = client.turn("pi-peer", prompt, timeout_ms=5_000)
+
+    assert (status, body) == ("blocked", "")
+    assert turn_path.exists()
+
+
+def test_turn_without_a_store_types_the_full_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "9" * 32
+    prompt = f"HGCHAT_REPLY_BEGIN {token}\nfull inline body\nHGCHAT_REPLY_END {token}\n"
+    terminal = f"HGCHAT_REPLY_BEGIN {token}\nreply\nHGCHAT_REPLY_END {token}\n"
+    client, _transcript, _turn_path, submissions, _payloads = make_turn_store_room(
+        tmp_path, monkeypatch, token, ["working", "idle"], terminal
+    )
+    client.turn_store = None
+
+    status, _body = client.turn("pi-peer", prompt, timeout_ms=5_000)
+
+    assert status == "idle"
+    assert submissions[0][3] == prompt
+    assert not (tmp_path / "nudge-room.turns").exists()
+
+
+def test_turn_nudge_over_600_characters_fails_before_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "a" * 32
+    prompt = f"HGCHAT_REPLY_BEGIN {token}\nbody\nHGCHAT_REPLY_END {token}\n"
+    client, transcript, _turn_path, submissions, _payloads = make_turn_store_room(
+        tmp_path, monkeypatch, token, ["working", "idle"], "(quiet)"
+    )
+    deep_state = tmp_path
+    for index in range(20):
+        deep_state = deep_state / f"very-long-state-component-{index}"
+    moved = deep_state / "nudge-room.turns"
+    moved.parent.mkdir(parents=True, exist_ok=True)
+    transcript.turns_dir = moved
+
+    with pytest.raises(ChatError, match="turn nudge too long"):
+        client.turn(
+            "pi-peer", prompt, timeout_ms=5_000, agent_label="an-extremely-long-handle-name"
+        )
+
+    assert submissions == []
+
+
+def test_prune_turns_removes_only_turn_files_older_than_the_age(tmp_path: Path) -> None:
+    transcript = Transcript(tmp_path, "prune-room")
+    old = transcript.write_turn("1" * 32, "old payload")
+    fresh = transcript.write_turn("2" * 32, "fresh payload")
+    bystander = tmp_path / "prune-room.turns" / "notes.txt"
+    bystander.write_text("not a turn", encoding="utf-8")
+    stale = time.time() - 7200
+    os.utime(old, (stale, stale))
+
+    transcript.prune_turns(max_age_s=3600)
+
+    assert not old.exists()
+    assert fresh.exists()
+    assert bystander.exists()
+
+
+def test_group_chat_constructor_prunes_stale_turn_files(tmp_path: Path) -> None:
+    transcript = Transcript(tmp_path, "prune-once-room")
+    stale = transcript.write_turn("3" * 32, "stale payload")
+    stale_mtime = time.time() - 90_000
+    os.utime(stale, (stale_mtime, stale_mtime))
+
+    GroupChat(transcript, {"pi": "pi-peer"}, FakeClient())
+
+    assert not stale.exists()
 
 
 def test_local_pi_reply_uses_exact_session_and_never_replays_prior_turns(
@@ -3902,13 +4121,19 @@ def test_failed_turn_does_not_drop_context_and_later_agents_continue(tmp_path: P
     chat, client, transcript = make_chat(tmp_path)
     original_turn = client.turn
 
-    def fail_pi_once(target: str, prompt: str, timeout_ms: int | None = None) -> tuple[str, str]:
+    def fail_pi_once(
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+        agent_label: str | None = None,
+    ) -> tuple[str, str]:
         if target == "pi-peer":
             client.calls.append((target, prompt))
             client.timeouts.append(timeout_ms)
             client.turn = original_turn
             raise ChatError("simulated delivery failure")
-        return original_turn(target, prompt, timeout_ms)
+        return original_turn(target, prompt, timeout_ms, cancel_event, agent_label)
 
     client.turn = fail_pi_once
     created = chat.dispatch("@all preserve this")
@@ -3946,6 +4171,7 @@ class ParallelReviewClient(FakeClient):
         prompt: str,
         timeout_ms: int | None = None,
         cancel_event: threading.Event | None = None,
+        agent_label: str | None = None,
     ) -> tuple[str, str]:
         with self.call_lock:
             self.calls.append((target, prompt))
@@ -4017,6 +4243,7 @@ def test_review_interleaving_cannot_hide_an_unrelated_ordinary_message(
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             if "Question for independent review" in prompt:
                 append_one_message(
@@ -4086,6 +4313,7 @@ def test_cancelled_terminal_phase_siblings_commit_no_late_artifact(
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             del target, prompt, timeout_ms
             assert cancel_event is not None
@@ -4132,6 +4360,7 @@ def test_review_timeout_is_visible_and_does_not_block_other_agents(tmp_path: Pat
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             if target == "claude-peer" and "Question for independent review" in prompt:
                 self.calls.append((target, prompt))
@@ -4165,6 +4394,7 @@ def test_unexpected_reviewer_error_still_drains_peers_and_synthesizes(tmp_path: 
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             if target == "claude-peer" and "Question for independent review" in prompt:
                 raise RuntimeError("relay exploded")
@@ -4208,6 +4438,7 @@ def test_review_controller_cancel_stops_only_local_orchestration(tmp_path: Path)
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             self.calls.append((target, prompt))
             self.timeouts.append(timeout_ms)
@@ -4251,6 +4482,7 @@ def test_review_completion_wins_and_cancel_rejects_after_terminal_commit(
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             self.started.set()
             assert self.release.wait(timeout=HARNESS_WAIT_S)
@@ -4287,6 +4519,7 @@ def test_review_cancellation_wins_and_discards_late_success(
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             self.started.set()
             assert self.release.wait(timeout=HARNESS_WAIT_S)
@@ -4325,6 +4558,7 @@ def test_cancelled_review_keeps_occupancy_until_worker_drains_before_retry(
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             self.calls.append((target, prompt))
             self.timeouts.append(timeout_ms)
@@ -4407,6 +4641,7 @@ def test_interrupted_synthesis_is_cancelled_without_failure_entry(tmp_path: Path
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             if "Independent reviews:" not in prompt:
                 return super().turn(target, prompt, timeout_ms, cancel_event)
@@ -4449,6 +4684,7 @@ def test_direct_group_chat_retry_waits_for_cancelled_attempt_to_drain(
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             self.calls.append((target, prompt))
             self.timeouts.append(timeout_ms)
@@ -4509,6 +4745,7 @@ def test_failed_review_can_retry_with_fresh_marker_and_resynthesize(tmp_path: Pa
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             if target == "claude-peer" and not self.failed:
                 self.failed = True
@@ -4564,6 +4801,7 @@ def test_immediate_cancel_before_retry_worker_start_targets_fresh_token(
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             if target == "claude-peer" and not self.failed_once:
                 self.failed_once = True
@@ -4621,6 +4859,7 @@ def test_cancel_during_retry_liveness_is_not_erased(tmp_path: Path) -> None:
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             if target == "claude-peer":
                 self.calls.append((target, prompt))
@@ -5287,6 +5526,7 @@ class AnnealClient(FakeClient):
         prompt: str,
         timeout_ms: int | None = None,
         cancel_event: threading.Event | None = None,
+        agent_label: str | None = None,
     ) -> tuple[str, str]:
         self._record(target, prompt, timeout_ms)
         if "Question for independent review" in prompt:
@@ -5406,6 +5646,7 @@ def test_anneal_missing_blind_reply_stops_without_synthesis_or_final(tmp_path: P
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             if target == "grok-peer" and "Question for independent review" in prompt:
                 self._record(target, prompt, timeout_ms)
@@ -5442,6 +5683,7 @@ def test_one_controller_prevents_review_and_anneal_overlap(tmp_path: Path) -> No
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             if "Question for independent review" in prompt:
                 self._record(target, prompt, timeout_ms)
@@ -5491,6 +5733,7 @@ def test_cancel_stops_anneal_at_each_phase(tmp_path: Path, phase: str, marker: s
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             if marker in prompt:
                 self._record(target, prompt, timeout_ms)
@@ -5655,6 +5898,7 @@ class ConsensusClient(FakeClient):
         prompt: str,
         timeout_ms: int | None = None,
         cancel_event: threading.Event | None = None,
+        agent_label: str | None = None,
     ) -> tuple[str, str]:
         with self.call_lock:
             self.calls.append((target, prompt))
@@ -5705,6 +5949,7 @@ def test_consensus_per_agent_status_carries_exact_agent_with_council_scope(
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             if CONSENSUS_BLIND_MARKER in prompt:
                 with self.call_lock:
@@ -7142,6 +7387,7 @@ def test_cancel_stops_consensus_at_each_phase(
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             if marker in prompt:
                 with self.call_lock:
@@ -7280,6 +7526,7 @@ def test_controller_exposes_consensus_phase_failure_outcome(
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             if marker in prompt:
                 with self.call_lock:
@@ -8034,6 +8281,7 @@ def test_main_profile_defaults_the_synthesizer_to_astra(
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             if "designated synthesizer" in prompt:
                 synthesizers.append(target)
@@ -8083,6 +8331,29 @@ def test_main_default_room_records_no_receipt(
         item.get("kind") != namespace["PROFILE_RECEIPT_KIND"]
         for item in Transcript(tmp_path, "plain-room").read()
     )
+
+
+def test_inline_prompts_flag_reaches_main_and_yields_inline_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    constructed_stores: list[object] = []
+
+    class StoreRecordingClient(FakeClient):
+        def __init__(self, *args: object, turn_store: object = "unset", **kwargs: object) -> None:
+            super().__init__()
+            constructed_stores.append(turn_store)
+
+    monkeypatch.setattr(module, "HerdrClient", StoreRecordingClient)
+    monkeypatch.delenv(namespace["PROFILE_RECEIPT_ENV"], raising=False)
+    monkeypatch.delenv("HERDR_GROUP_CHAT_SETUP_FAILURES", raising=False)
+    monkeypatch.delenv("HERDR_GROUP_CHAT_SYNTHESIZER", raising=False)
+    base = ["--state-dir", str(tmp_path), "--room", "inline-room", "--once", "hi"]
+
+    assert main([*base]) == 0
+    assert isinstance(constructed_stores[0], Transcript)
+
+    assert main(["--inline-prompts", *base]) == 0
+    assert constructed_stores[1] is None
 
 
 def test_once_plain_messages_follow_the_persisted_focus_like_tui_sends(
@@ -8754,6 +9025,7 @@ class ResumeClient(FakeClient):
         prompt: str,
         timeout_ms: int | None = None,
         cancel_event: threading.Event | None = None,
+        agent_label: str | None = None,
     ) -> tuple[str, str]:
         self.calls.append((target, prompt))
         self.timeouts.append(timeout_ms)
@@ -8783,6 +9055,7 @@ class GateResumeClient(ResumeClient):
         prompt: str,
         timeout_ms: int | None = None,
         cancel_event: threading.Event | None = None,
+        agent_label: str | None = None,
     ) -> tuple[str, str]:
         if CONSENSUS_BLIND_MARKER in prompt:
             self.calls.append((target, prompt))
@@ -9398,6 +9671,7 @@ def test_council_resume_unexpected_post_hydration_failure_closes_truthfully(
             prompt: str,
             timeout_ms: int | None = None,
             cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
         ) -> tuple[str, str]:
             if CONSENSUS_PROVISIONAL_MARKER in prompt:
                 self.calls.append((target, prompt))
@@ -9527,6 +9801,7 @@ class AstraFableResumeClient(FakeClient):
         prompt: str,
         timeout_ms: int | None = None,
         cancel_event: threading.Event | None = None,
+        agent_label: str | None = None,
     ) -> tuple[str, str]:
         self.calls.append((target, prompt))
         self.timeouts.append(timeout_ms)
