@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-### Unreleased
+## [0.13.0] - 2026-09-06
 
 - **Renamed the Sol role to Astra.** The OpenAI participant is now `@astra`,
   a Pi peer on `gpt-6-astra` (still provider `openai-codex`, thinking
