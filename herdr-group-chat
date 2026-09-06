@@ -84,6 +84,17 @@ REPLY_TOKEN_RE = re.compile(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})")
 CODEX_SESSION_ID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
 )
+# Codex draws its directory-trust dialog before any composer exists, so a
+# delivered prompt would answer the dialog with its own text: the trailing
+# Enter selects "Yes, continue" and the prompt is swallowed. The needle is
+# the dialog's question, matched over lowered text with arbitrary whitespace
+# between the words because the visible read wraps it. The launcher
+# (new-room) carries a copy of this wording; the executables do not import
+# each other, so keep the copies in sync.
+CODEX_TRUST_DIALOG_NEEDLE = "do you trust the contents of this directory"
+CODEX_TRUST_DIALOG_NEEDLE_RE = re.compile(
+    r"\s+".join(re.escape(word) for word in CODEX_TRUST_DIALOG_NEEDLE.split())
+)
 CONSENSUS_SHARE_REFUSED = "CONSENSUS_SHARE_REFUSED"
 CONSENSUS_VERDICT_RE = re.compile(r"\AVERDICT: (PASS|REVISE)(?:[ \t]+(\S.*))?\Z")
 CONSENSUS_EXPLANATION_CONNECTOR_RE = re.compile(
@@ -99,6 +110,7 @@ POLL_INTERVAL_S = 0.5
 SUBMIT_GRACE_S = 2.0
 TERMINAL_READ_TIMEOUT_S = 30.0
 CODEX_PROBE_TIMEOUT_S = 5.0
+CODEX_TRUST_READ_TIMEOUT_S = 5.0
 # An agent that went back to idle/done but keeps showing the same terminal text without
 # the reply markers has finished without honoring the marker protocol; after this many
 # consecutive stable unmarked reads the turn fails fast instead of stalling to timeout.
@@ -843,6 +855,10 @@ class HerdrClient:
         submitted_at = time.monotonic()
         deadline = submitted_at + (effective_timeout_ms / 1000)
         if codex_target:
+            if self._codex_shows_directory_trust_dialog(target):
+                # A room message must never be what trusts a directory: the
+                # prompt's trailing Enter would select "Yes, continue".
+                return "blocked", ""
             local_wait_timeout = codex_local_wait_timeout(effective_timeout_ms)
             try:
                 prompt_result = self._run_interruptible(
@@ -989,6 +1005,22 @@ class HerdrClient:
             return False
         except (ChatError, KeyError, TypeError, json.JSONDecodeError):
             return False
+
+    def _codex_shows_directory_trust_dialog(self, target: str) -> bool:
+        """Report whether the target's visible pane shows Codex's directory-trust dialog.
+
+        A refused or slow read is not evidence of a dialog, so it reports False
+        and delivery falls through to the normal prompt path; Herdr's own status
+        handling stays authoritative.
+        """
+        try:
+            visible = self._run(
+                ["agent", "read", target, "--source", "visible", "--lines", "80"],
+                timeout=CODEX_TRUST_READ_TIMEOUT_S,
+            ).stdout
+        except ChatError:
+            return False
+        return CODEX_TRUST_DIALOG_NEEDLE_RE.search(visible.lower()) is not None
 
     @staticmethod
     def _prompt_result_agent(

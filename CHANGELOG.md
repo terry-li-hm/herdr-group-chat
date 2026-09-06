@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+### Unreleased
+
+- **Directory-trust dialogs never receive a room prompt.** Codex 0.153 draws
+  its directory-trust dialog after `agent start` reports ready, so a launch
+  could promote the peer and let the room's first prompt land in the dialog,
+  where its trailing Enter selects **Yes, continue**. Setup now detects the
+  dialog (new boxed and old plain variants) and keeps the peer pending with
+  `pending @codex trust` for the operator to answer personally, and the room
+  reads the target pane before every Codex prompt, returning `blocked`
+  instead of delivering into the dialog.
+
 ## [0.13.0] - 2026-09-06
 
 - **Renamed the Sol role to Astra.** The OpenAI participant is now `@astra`,

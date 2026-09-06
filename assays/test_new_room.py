@@ -2154,6 +2154,129 @@ def test_agent_not_ready_preserves_the_pending_trust_prompt_tab(
     assert not any(call[:2] == ["tab", "close"] for call in calls)
 
 
+CODEX_TRUST_DIALOG_BOXED_SCREEN = (
+    ">─You are in /work/herdr-group-chat──────────────────────────────────╮\n"
+    "Do you trust the contents of this\n"
+    "directory? Working with untrusted contents comes with higher risk of\n"
+    "prompt injection. Trusting the directory allows project-local config,\n"
+    "hooks, and exec policies to load.\n"
+    "  1. Yes, continue\n"
+    "  2. No, quit\n"
+)
+
+CODEX_TRUST_DIALOG_PLAIN_SCREEN = (
+    "> You are in /work/herdr-group-chat\n"
+    "Do you trust the contents of this directory? Working with untrusted contents\n"
+    "comes with higher risk of prompt injection. Trusting the directory allows\n"
+    "project-local config, hooks, and exec policies to load.\n"
+    "1. Yes, continue\n"
+    "2. No, quit\n"
+)
+
+CODEX_BANNER_SCREEN = "codex  /work/herdr-group-chat  main\n\u257b Ask Codex to do anything\n"
+
+
+def install_codex_start_fake(
+    monkeypatch: pytest.MonkeyPatch, screen: str, calls: list[list[str]]
+) -> None:
+    """Serve one codex participant start; pane reads return the given screen."""
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["agent", "list"]:
+            return {"result": {"agents": []}}
+        if arguments[:2] == ["tab", "create"]:
+            return {
+                "result": {
+                    "tab": {"tab_id": "w-agents:t-codex"},
+                    "root_pane": {"pane_id": "w-agents:p-codex"},
+                }
+            }
+        if arguments[:2] == ["pane", "process-info"]:
+            return {"result": {"process_info": {"foreground_processes": [{"name": "zsh"}]}}}
+        return {"result": {"type": "ok"}}
+
+    def fake_run_text(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> str:
+        del timeout
+        calls.append(arguments)
+        assert arguments[:2] == ["pane", "read"], arguments
+        return screen
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    monkeypatch.setattr(module, "run_text", fake_run_text)
+
+
+@pytest.mark.parametrize(
+    ("variant", "screen"),
+    [("boxed", CODEX_TRUST_DIALOG_BOXED_SCREEN), ("plain", CODEX_TRUST_DIALOG_PLAIN_SCREEN)],
+)
+def test_codex_directory_trust_dialog_keeps_the_peer_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    variant: str,
+    screen: str,
+) -> None:
+    participant = module.Participant(role="codex", kind="codex", name="codex-peer")
+    calls: list[list[str]] = []
+    install_codex_start_fake(monkeypatch, screen, calls)
+    state: dict = {"schema_version": 1}
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=(participant,),
+    )
+
+    assert failures == [module.blocked_startup_prompt_guidance(participant)]
+    pending = state["pending_participant_tabs"]["codex"]
+    assert pending["pane_id"] == "w-agents:p-codex"
+    assert pending["tab_id"] == "w-agents:t-codex"
+    assert pending["blocked_startup"] is True
+    assert "codex" not in state.get("participant_pane_ids", {})
+    assert "codex" not in state.get("participant_tab_ids", {})
+    assert "pending @codex trust" in capsys.readouterr().out
+    # The launcher must never answer the dialog: no keys, no close, no rename.
+    assert not any(call[:2] == ["agent", "send-keys"] for call in calls)
+    assert not any(call[:2] == ["tab", "close"] for call in calls)
+    assert not any(call[:2] == ["tab", "rename"] for call in calls)
+    assert any(call[:2] == ["agent", "start"] for call in calls)
+
+
+def test_codex_peer_without_the_trust_dialog_is_promoted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(module, "HOOK_DISMISS_INTERVAL_S", 0)
+    calls: list[list[str]] = []
+    install_codex_start_fake(monkeypatch, CODEX_BANNER_SCREEN, calls)
+    state: dict = {"schema_version": 1}
+    participant = module.Participant(role="codex", kind="codex", name="codex-peer")
+
+    failures = module.start_participants(
+        "herdr",
+        str(tmp_path),
+        "w-agents",
+        tmp_path,
+        launcher_state_path(tmp_path),
+        state,
+        participants=(participant,),
+    )
+
+    assert failures == []
+    assert state["participant_pane_ids"]["codex"] == "w-agents:p-codex"
+    assert state["participant_tab_ids"]["codex"] == "w-agents:t-codex"
+    assert "codex" not in state.get("pending_participant_tabs", {})
+    assert "ready  @codex" in capsys.readouterr().out
+    assert not any(call[:2] == ["agent", "send-keys"] for call in calls)
+
+
 def test_stale_blocked_startup_tab_is_preserved_and_repeats_prompt_guidance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

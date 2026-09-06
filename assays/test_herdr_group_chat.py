@@ -98,6 +98,14 @@ LANE_MIN_COLUMN_WIDTH = namespace["LANE_MIN_COLUMN_WIDTH"]
 # genuine deadlock still fails instead of hanging the suite. This bounds only
 # test-side waits; product timeouts are never weakened.
 HARNESS_WAIT_S = 30
+# A normal idle Codex composer: no directory-trust dialog on screen, so the
+# relay's pre-prompt trust check falls through to ordinary delivery.
+CODEX_COMPOSER_SCREEN = (
+    "codex  /work/codex  main\n"
+    "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n"
+    "\u2502 \u203a                          \u2502\n"
+    "\u2541\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2544\n"
+)
 
 
 class FakeClient:
@@ -3337,6 +3345,8 @@ def test_turn_waits_for_codex_and_recovers_the_captured_exact_session(
 
     def fake_run(arguments: list[str], timeout: float = 30, **_kwargs: object) -> object:
         calls.append(arguments)
+        if arguments == ["agent", "read", "codex-peer", "--source", "visible", "--lines", "80"]:
+            return subprocess.CompletedProcess([], 0, stdout=CODEX_COMPOSER_SCREEN)
         if arguments[:2] == ["agent", "get"]:
             status = statuses.pop(0) if statuses else "done"
             return subprocess.CompletedProcess(
@@ -3382,7 +3392,8 @@ def test_turn_waits_for_codex_and_recovers_the_captured_exact_session(
             "4321",
         ]
     ]
-    assert not any(call[:2] == ["agent", "read"] for call in calls)
+    reads = [call for call in calls if call[:2] == ["agent", "read"]]
+    assert reads == [["agent", "read", "codex-peer", "--source", "visible", "--lines", "80"]]
 
 
 def test_group_chat_uses_cached_codex_identity_for_a_custom_target(
@@ -3415,6 +3426,8 @@ def test_group_chat_uses_cached_codex_identity_for_a_custom_target(
                 ),
                 stderr="",
             )
+        if argv[1:3] == ["agent", "read"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=CODEX_COMPOSER_SCREEN, stderr="")
         if argv[1:3] == ["agent", "prompt"]:
             prompt = argv[4]
             token = re.search(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})", prompt).group(1)
@@ -3453,6 +3466,111 @@ def test_group_chat_uses_cached_codex_identity_for_a_custom_target(
     assert not any(call[1:3] == ["agent", "get"] for call in calls)
 
 
+CODEX_TRUST_DIALOG_SCREEN = (
+    ">─You are in /work/herdr-group-chat──────────────────────────────────╮\n"
+    "Do you trust the contents of this\n"
+    "directory? Working with untrusted contents comes with higher risk of\n"
+    "prompt injection. Trusting the directory allows project-local config,\n"
+    "hooks, and exec policies to load.\n"
+    "  1. Yes, continue\n"
+    "  2. No, quit\n"
+)
+
+
+def test_codex_directory_trust_dialog_blocks_delivery_without_prompting(
+    tmp_path: Path,
+) -> None:
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1:3] == ["agent", "list"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    '{"result":{"agents":['
+                    '{"name":"codex-peer","kind":"codex","agent_status":"idle"}]}}'
+                ),
+                stderr="",
+            )
+        if argv[1:3] == ["agent", "read"]:
+            assert argv[3:] == ["codex-peer", "--source", "visible", "--lines", "80"]
+            return subprocess.CompletedProcess(argv, 0, stdout=CODEX_TRUST_DIALOG_SCREEN, stderr="")
+        raise AssertionError(f"no call may reach the dialog: {argv}")
+
+    transcript = Transcript(tmp_path, "codex-trust")
+    client = HerdrClient(runner=runner)
+    chat = GroupChat(transcript, {"codex": "codex-peer"}, client, synthesizer="codex")
+
+    chat.dispatch("@codex please review the plan")
+
+    assert transcript.read()[-1]["body"] == "@codex is blocked and needs attention in Herdr."
+    assert not any(call[1:3] == ["agent", "prompt"] for call in calls)
+    assert [call[1:3] for call in calls] == [["agent", "list"], ["agent", "read"]]
+
+
+def test_codex_read_failure_still_delivers_the_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cwd = "/work/codex"
+    session_id = "11111111-2222-3333-4444-555555555555"
+    calls: list[list[str]] = []
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1:3] == ["agent", "list"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    '{"result":{"agents":['
+                    '{"name":"codex-peer","kind":"codex","agent_status":"idle"}]}}'
+                ),
+                stderr="",
+            )
+        if argv[1:3] == ["agent", "read"]:
+            # A refused read is not evidence of a dialog; delivery must proceed.
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="herdr: read refused")
+        if argv[1:3] == ["agent", "prompt"]:
+            prompt = argv[4]
+            token = re.search(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})", prompt).group(1)
+            write_codex_session(
+                tmp_path,
+                session_id,
+                cwd,
+                [f"HGCHAT_REPLY_BEGIN {token}\nread-failure reply\nHGCHAT_REPLY_END {token}"],
+            )
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "result": {
+                            "agent": {
+                                "agent_status": "done",
+                                **codex_agent_meta(session_id, cwd),
+                            }
+                        }
+                    }
+                ),
+                stderr="",
+            )
+        raise AssertionError(f"unexpected Herdr call: {argv}")
+
+    transcript = Transcript(tmp_path, "codex-read-failure")
+    client = HerdrClient(runner=runner)
+    chat = GroupChat(transcript, {"codex": "codex-peer"}, client, synthesizer="codex")
+
+    chat.dispatch("@codex reply with a marker")
+
+    assert transcript.read()[-1]["body"] == "read-failure reply"
+    prompt_call = next(call for call in calls if call[1:3] == ["agent", "prompt"])
+    assert prompt_call[-3:] == ["--wait", "--timeout", "600000"]
+
+
 def test_completed_codex_wait_recovers_before_any_follow_up_poll(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3480,11 +3598,14 @@ def test_completed_codex_wait_recovers_before_any_follow_up_poll(
         )
 
     monkeypatch.setattr(client, "_run_interruptible", wait_prompt)
-    monkeypatch.setattr(
-        client,
-        "_run",
-        lambda *_args, **_kwargs: pytest.fail("completed wait must not poll before recovery"),
-    )
+
+    def strict_run(arguments: list[str], **_kwargs: object) -> object:
+        # The pre-prompt directory-trust read is the only permitted _run call;
+        # any status poll before recovery still fails the test.
+        assert arguments == ["agent", "read", "codex-peer", "--source", "visible", "--lines", "80"]
+        return subprocess.CompletedProcess([], 0, stdout=CODEX_COMPOSER_SCREEN)
+
+    monkeypatch.setattr(client, "_run", strict_run)
 
     assert client.turn("codex-peer", f"HGCHAT_REPLY_BEGIN {token}\nHGCHAT_REPLY_END {token}") == (
         "done",
@@ -3509,6 +3630,8 @@ def test_codex_local_wait_timeout_falls_through_once_to_a_blocked_poll(
         raise LocalInterruptibleWaitTimeout("local wait elapsed")
 
     def blocked_poll(arguments: list[str], **_kwargs: object) -> object:
+        if arguments == ["agent", "read", "codex-peer", "--source", "visible", "--lines", "80"]:
+            return subprocess.CompletedProcess([], 0, stdout=CODEX_COMPOSER_SCREEN)
         observed.append(arguments)
         assert arguments == ["agent", "get", "codex-peer"]
         return subprocess.CompletedProcess(
@@ -3552,6 +3675,8 @@ def test_completed_codex_wait_restores_stable_unmarked_fast_failure(
                 [], 0, stdout='{"result":{"agent":{"agent_status":"done"}}}'
             )
         if arguments[:2] == ["agent", "read"]:
+            if arguments[3:5] == ["--source", "visible"]:
+                return subprocess.CompletedProcess([], 0, stdout=CODEX_COMPOSER_SCREEN)
             terminals += 1
             return subprocess.CompletedProcess([], 0, stdout="completed without reply markers")
         raise AssertionError(f"unexpected Herdr call: {arguments}")
@@ -3587,6 +3712,8 @@ def test_codex_local_wait_timeout_restores_stable_unmarked_fast_failure(
                 [], 0, stdout='{"result":{"agent":{"agent_status":"done"}}}'
             )
         if arguments[:2] == ["agent", "read"]:
+            if arguments[3:5] == ["--source", "visible"]:
+                return subprocess.CompletedProcess([], 0, stdout=CODEX_COMPOSER_SCREEN)
             terminals += 1
             return subprocess.CompletedProcess([], 0, stdout="completed without reply markers")
         raise AssertionError(f"unexpected Herdr call: {arguments}")
@@ -3650,6 +3777,8 @@ def test_cold_codex_probe_does_not_consume_the_turn_deadline(
 
     def fake_run(arguments: list[str], timeout: float = 30, **_kwargs: object) -> object:
         calls.append(arguments)
+        if arguments == ["agent", "read", "codex-peer", "--source", "visible", "--lines", "80"]:
+            return subprocess.CompletedProcess([], 0, stdout=CODEX_COMPOSER_SCREEN)
         if len(calls) == 1:
             assert arguments == ["agent", "get", "codex-peer"]
             assert timeout == namespace["CODEX_PROBE_TIMEOUT_S"]
@@ -3732,6 +3861,8 @@ def test_codex_wait_cancellation_stops_local_wait_without_a_second_prompt(
     submissions: list[list[str]] = []
 
     def fake_run(arguments: list[str], timeout: float = 30) -> object:
+        if arguments == ["agent", "read", "codex-peer", "--source", "visible", "--lines", "80"]:
+            return subprocess.CompletedProcess([], 0, stdout=CODEX_COMPOSER_SCREEN)
         assert arguments == ["agent", "get", "codex-peer"]
         return subprocess.CompletedProcess(
             [],
@@ -4852,7 +4983,11 @@ def test_review_cancel_never_sends_keys_for_working_or_idle_status(
             cancel_event,
         )
 
-    assert [call[1:3] for call in calls] == [["agent", "prompt"], ["agent", "get"]]
+    assert [call[1:3] for call in calls] == [
+        ["agent", "read"],
+        ["agent", "prompt"],
+        ["agent", "get"],
+    ]
 
 
 def test_review_cancel_never_acts_on_a_stale_working_observation() -> None:

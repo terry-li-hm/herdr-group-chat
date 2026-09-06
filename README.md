@@ -414,7 +414,9 @@ If Codex reports unreviewed lifecycle hooks during startup, setup detects the
 dialog even when the pane read clips its text, retries briefly while it renders,
 and leaves those hooks inactive: it closes the summary notice or chooses
 **Continue without trusting** in the menu variant. It never selects **trust
-all** for you.
+all** for you. When Codex asks its directory-trust question instead, the
+launcher leaves the dialog for the operator and reports `pending @codex trust`;
+the room refuses to deliver to a peer showing that dialog.
 
 Like every Herdr plugin, this is ordinary local code running as your user and it
 can call the full Herdr CLI. Review the manifest and executable scripts before

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import select
 import stat
 import subprocess
@@ -725,6 +726,14 @@ HOOK_MENU_NEEDLE = "continue without trusting"
 HOOK_DISMISS_ATTEMPTS = 10
 HOOK_DISMISS_INTERVAL_S = 1.0
 HOOK_DISMISS_TIMEOUT_S = 5.0
+# Codex's directory-trust dialog asks this question in every known variant;
+# only the box drawing around it changed in Codex 0.153. The launcher and the
+# room (herdr-group-chat) each carry a copy of this wording: the two
+# executables do not import each other, so keep the copies in sync.
+TRUST_DIALOG_NEEDLE = "do you trust the contents of this directory"
+TRUST_DIALOG_NEEDLE_PATTERN = re.compile(
+    r"\s+".join(re.escape(word) for word in TRUST_DIALOG_NEEDLE.split())
+)
 
 
 def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> None:
@@ -767,6 +776,27 @@ def dismiss_inactive_hook_notice(herdr_bin: str, name: str, pane_id: str) -> Non
             run_json(herdr_bin, ["agent", "send-keys", name, key], timeout=remaining)
         print("notice @codex unreviewed hooks left inactive", flush=True)
         return
+
+
+def pane_shows_directory_trust_dialog(herdr_bin: str, pane_id: str) -> bool:
+    """Report whether a pane shows Codex's directory-trust dialog.
+
+    Codex 0.153 draws the dialog after `agent start` already reports ready,
+    so readiness alone cannot prove the composer exists. The visible read
+    wraps the question across lines, so the needle matches lowered text with
+    arbitrary whitespace between its words. A failed read reports no dialog:
+    the start path proceeds unchanged and the room's own pre-prompt read
+    remains the second net. The launcher never sends keys to this dialog —
+    trusting a directory is the operator's decision, never a room prompt's.
+    """
+    try:
+        text = run_text(
+            herdr_bin,
+            ["pane", "read", pane_id, "--source", "visible", "--lines", "80"],
+        )
+    except BootstrapError:
+        return False
+    return TRUST_DIALOG_NEEDLE_PATTERN.search(text.lower()) is not None
 
 
 AGENT_START_BUSY_ATTEMPTS = 5
@@ -2108,6 +2138,19 @@ def start_participants(
                     f"@{role}: {name} failed process verification; the new tab was closed"
                 )
                 print(f"unverified @{role}", flush=True)
+                continue
+            if participant.kind == "codex" and pane_shows_directory_trust_dialog(
+                herdr_bin, pane_id
+            ):
+                # Codex is asking its directory-trust question in the new tab.
+                # Treat it exactly like an agent_not_ready start: preserve the
+                # pending tab for the operator to answer personally, and never
+                # promote a peer whose first room prompt would land in the
+                # dialog and trust the directory with its trailing Enter.
+                pending_tabs[role]["blocked_startup"] = True
+                save_launcher_state(state_dir, state, state_path)
+                failures.append(blocked_startup_prompt_guidance(participant))
+                print(f"pending @{role} trust", flush=True)
                 continue
             participant_panes[role] = pane_id
             participant_tabs[role] = participant_tab_id
