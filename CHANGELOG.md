@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+- **The relay refuses credential-shaped payloads.** Every transcript append
+  and every turn payload file now passes `credential_kind` before it is
+  written; AWS access keys, private-key blocks, JWTs, GitHub, OpenAI-style,
+  Anthropic, Slack and Google keys, bearer tokens and `op://` references raise
+  `CredentialRefused` and nothing reaches disk. A participant reply that
+  trips the gate is replaced by a `credential_refused` system line naming the
+  agent and the kind; a human message that trips it is refused before any
+  peer is prompted. The room channel can therefore not carry secrets between
+  agents, the first thing the improvised agent message board in the July
+  2026 OpenAI incident was used for.
+- **Turn truncation and failures are visible signals.** A message addressed
+  to more recipients than `--max-turns` allows now records a `turn_capped`
+  system line naming the dropped handles instead of dropping them silently;
+  blocked and failed turns carry `turn_blocked` and `turn_failed` kinds.
+  These lines are never forwarded into a peer prompt. The room status line
+  appends `signals: N blocked · M failed · K capped · R refused` for the
+  delivery in flight, so a circling round is seen rather than quietly cut.
 - **Mouse reports never leak into the input line on keypad-aware hosts.**
   Hosts whose terminfo defines `kmous=\E[<` make curses consume `\x1b[<`
   itself under `keypad(True)`, so `MouseAwareKeyReader` received

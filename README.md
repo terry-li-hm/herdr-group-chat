@@ -9,7 +9,10 @@ local relay provides `@pi`, `@claude`, `@codex`, `@grok`, and `@all` addressing.
 Ordinary messages are delivered serially and capped at four agent turns by
 default. Review rounds run their independent first-pass calls concurrently,
 then ask one configured agent to synthesize the collected answers. All messages
-are recorded as append-only JSONL in the resolved state directory.
+are recorded as append-only JSONL in the resolved state directory. The relay
+refuses to record or deliver any payload that looks like a credential (cloud
+and API keys, private keys, JWTs, bearer tokens, `op://` references), and it
+journals every capped, blocked, failed or refused turn as a visible system line.
 
 ## Architecture boundary
 

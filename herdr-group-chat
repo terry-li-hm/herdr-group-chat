@@ -143,6 +143,35 @@ class ChatError(RuntimeError):
     """A user-visible relay failure."""
 
 
+class CredentialRefused(ChatError):
+    """A payload carried a credential-shaped token, so the write was refused."""
+
+
+# Credential shapes in match order: anthropic_key must be tested before the
+# broader openai_style_key, and the first matching pattern names the kind.
+# The google_api_key tail runs long because observed keys pad past 35 chars.
+CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("private_key", re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
+    ("github_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36}\b")),
+    ("anthropic_key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}")),
+    ("openai_style_key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")),
+    ("slack_token", re.compile(r"\bxox[bapr]-[A-Za-z0-9-]{20,}")),
+    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_-]{35,}\b")),
+    ("bearer_token", re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{20,}")),
+    ("onepassword_ref", re.compile(r"\bop://[^\s]+")),
+)
+
+
+def credential_kind(text: str) -> str | None:
+    """Return the first credential shape found in text, or None when benign."""
+    for kind, pattern in CREDENTIAL_PATTERNS:
+        if pattern.search(text) is not None:
+            return kind
+    return None
+
+
 class CommandLaunchError(ChatError):
     """The Herdr command could not start, so no agent turn was submitted."""
 
@@ -503,6 +532,11 @@ class Transcript:
         """
         if TURN_TOKEN_RE.fullmatch(token) is None:
             raise ChatError("invalid turn token")
+        refused_kind = credential_kind(text)
+        if refused_kind is not None:
+            raise CredentialRefused(
+                f"payload contains a credential-shaped token ({refused_kind}); refused"
+            )
         try:
             self.turns_dir.mkdir(mode=0o700)
         except FileExistsError:
@@ -594,6 +628,11 @@ class Transcript:
         provisional: bool = False,
         meta: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        refused_kind = credential_kind(body)
+        if refused_kind is not None:
+            raise CredentialRefused(
+                f"payload contains a credential-shaped token ({refused_kind}); refused"
+            )
         messages = self._read_unlocked()
         item = {
             "seq": (messages[-1]["seq"] + 1) if messages else 1,
@@ -1458,13 +1497,42 @@ def format_context(messages: Sequence[dict[str, Any]]) -> str:
     return "\n\n".join(f"[{item['sender']}] {item['body']}" for item in messages)
 
 
+# Room-signal system lines are journal events for the human, never prompt
+# material for an agent; the value is each signal kind's summary name.
+SIGNAL_KIND_NAMES: Mapping[str, str] = {
+    "turn_blocked": "blocked",
+    "turn_failed": "failed",
+    "turn_capped": "capped",
+    "credential_refused": "refused",
+}
+
+
 def message_visible_to_agent(item: Mapping[str, Any], agent: str) -> bool:
-    """Hide council-scoped transcript items only from routes outside that council."""
+    """Hide room-signal lines and council-scoped items from outside audiences."""
+    if item.get("kind") in SIGNAL_KIND_NAMES:
+        return False
     meta = item.get("meta")
     if not isinstance(meta, dict) or "council_participants" not in meta:
         return True
     scope = meta["council_participants"]
     return isinstance(scope, list) and agent in scope
+
+
+def room_signal_counts(messages: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    """Count signal system lines, always returning all four names as keys."""
+    counts = dict.fromkeys(SIGNAL_KIND_NAMES.values(), 0)
+    for item in messages:
+        name = SIGNAL_KIND_NAMES.get(item.get("kind"))
+        if name is not None:
+            counts[name] += 1
+    return counts
+
+
+def room_signal_summary(messages: Sequence[Mapping[str, Any]]) -> str:
+    """Render the non-zero signal counts as one terse status fragment."""
+    counts = room_signal_counts(messages)
+    parts = [f"{count} {name}" for name, count in counts.items() if count]
+    return f"signals: {' · '.join(parts)}" if parts else ""
 
 
 def build_prompt(
@@ -2580,6 +2648,28 @@ class GroupChat:
                 cancel_remaining(0)
                 return created
             created.append(self.transcript.append("human", selected, route.body))
+            if len(route.recipients) > self.max_turns:
+                delivered = list(selected)
+                dropped = list(route.recipients[self.max_turns :])
+                cap_body = (
+                    f"Turn cap: delivered to "
+                    f"{', '.join(f'@{name}' for name in delivered)}; "
+                    f"{', '.join(f'@{name}' for name in dropped)} not delivered "
+                    f"(max {self.max_turns} per message)."
+                )
+                created.append(
+                    self.transcript.append(
+                        "system",
+                        ("human",),
+                        cap_body,
+                        kind="turn_capped",
+                        meta={
+                            "delivered": delivered,
+                            "dropped": dropped,
+                            "max_turns": self.max_turns,
+                        },
+                    )
+                )
             cursors = self.transcript.cursors()
             for index, agent in enumerate(selected):
                 if cancel_event is not None and cancel_event.is_set():
@@ -2618,17 +2708,36 @@ class GroupChat:
                             "system",
                             ("human",),
                             f"@{agent} is blocked and needs attention in {self.host_label}.",
+                            kind="turn_blocked",
                         )
                         set_state(agent, "blocked")
                     else:
-                        item = self.transcript.append(agent, ("human", "all"), reply)
-                        set_state(agent, "ready")
+                        try:
+                            item = self.transcript.append(agent, ("human", "all"), reply)
+                        except CredentialRefused:
+                            refused_kind = credential_kind(reply)
+                            item = self.transcript.append(
+                                "system",
+                                ("human",),
+                                f"@{agent}'s reply contained a credential-shaped token "
+                                f"({refused_kind}); refused and not recorded.",
+                                kind="credential_refused",
+                                meta={"agent": agent, "credential_kind": refused_kind},
+                            )
+                            set_state(agent, "failed")
+                        else:
+                            set_state(agent, "ready")
                 except ChatError as error:
                     if cancel_event is not None and cancel_event.is_set():
                         set_state(agent, "cancelled")
                         cancel_remaining(index + 1)
                         break
-                    item = self.transcript.append("system", ("human",), f"@{agent}: {error}")
+                    item = self.transcript.append(
+                        "system",
+                        ("human",),
+                        f"@{agent}: {error}",
+                        kind="turn_failed",
+                    )
                     set_state(agent, "failed")
                 created.append(item)
                 if item["sender"] == agent:
@@ -4941,6 +5050,19 @@ def participant_status(chat: GroupChat, prefix: str = "") -> str:
             state = "ready"
         labels.append(f"@{name} {state}")
     summary = " · ".join(labels)
+    try:
+        messages = chat.transcript.read()
+    except ChatError:
+        messages = []
+    # Signals describe the delivery now in flight, so count only the items
+    # after the most recent human message (the whole room before any).
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("sender") == "human":
+            messages = messages[index + 1 :]
+            break
+    signals = room_signal_summary(messages)
+    if signals:
+        summary = f"{summary} · {signals}"
     return f"{prefix} {summary}".strip()
 
 
