@@ -126,6 +126,8 @@ LEADING_PARTICIPANT_RE = re.compile(r"\A@([a-z0-9_-]+)(?=$|[\s:])", re.IGNORECAS
 # trailing word character or hyphen (so @fable never matches inside @fabler).
 MENTION_SCAN_RE = re.compile(r"(?<![\w@.-])@([a-z0-9_-]+)(?![\w-])", re.IGNORECASE)
 REPLY_WORD_BUDGET = 150
+MINUTES_WORD_BUDGET = 400
+TASK_REPORT_WORD_BUDGET = 150
 ROUTE_RECEIPT_LINE_PREFIX = "ROUTE_RECEIPT:"
 ROUTE_RECEIPT_AGAIN_LINE = "ROUTE_RECEIPT: (as before)"
 COMMAND_HINT_LINE = (
@@ -349,6 +351,41 @@ def parse_route(
     return Route(tuple(recipients), body.strip())
 
 
+TASK_USAGE = "Usage: /task @agent[,@agent] INSTRUCTION"
+
+
+def parse_task(text: str, known_agents: Sequence[str]) -> Route:
+    """Parse "/task @seat[,@seat] INSTRUCTION" with at least one mention.
+
+    Unlike a plain message, a task requires an explicit leading mention
+    (`@all` allowed); anything else is a usage error, never a focus fallthrough.
+    """
+    stripped = text.strip()
+    if stripped == "/task" or stripped.startswith("/task "):
+        stripped = stripped.removeprefix("/task").strip()
+    else:
+        raise ChatError(TASK_USAGE)
+    match = MENTION_RE.match(stripped)
+    if match is None:
+        raise ChatError(TASK_USAGE)
+    raw_recipients, body = match.groups()
+    requested = [item.removeprefix("@").strip().lower() for item in raw_recipients.split(",")]
+    if "all" in requested:
+        recipients = list(known_agents)
+    else:
+        recipients = []
+        for name in requested:
+            if name not in known_agents:
+                raise ChatError(f"unknown participant: @{name}")
+            if name not in recipients:
+                recipients.append(name)
+    if not recipients:
+        raise ChatError("no recipients selected")
+    if not body.strip():
+        raise ChatError(TASK_USAGE)
+    return Route(tuple(recipients), body.strip())
+
+
 def parse_anneal(text: str, known_agents: Sequence[str]) -> tuple[str, str, str]:
     """Parse "/anneal @author,@critic QUESTION" into (author, critic, question)."""
     stripped = text.strip()
@@ -373,6 +410,7 @@ class Transcript:
     def __init__(self, state_dir: Path, room: str) -> None:
         if not ROOM_RE.fullmatch(room):
             raise ChatError("room must match [a-z0-9][a-z0-9_-]{0,31}")
+        self.room = room
         self.state_dir = state_dir.expanduser()
         self._state_directory_descriptor: int | None = None
         self._lock = threading.RLock()
@@ -1584,17 +1622,24 @@ SIGNAL_KIND_NAMES: Mapping[str, str] = {
     "credential_refused": "refused",
 }
 
-# Kinds an agent must never see in a prompt. Signal lines stay counted by
-# room_signal_counts; the command hint is human-facing only and adds no count.
-AGENT_HIDDEN_KINDS: frozenset[str] = frozenset({*SIGNAL_KIND_NAMES, "hint"})
+# Kinds an agent must never see in a prompt. Signal lines, human-only
+# hints, and minutes notes stay journal events for the human; the command
+# hint is human-facing only, minutes notes are addressed to the human, and
+# signal kinds keep their own counts in room_signal_counts.
+AGENT_HIDDEN_KINDS: frozenset[str] = frozenset({*SIGNAL_KIND_NAMES, "hint", "minutes"})
 
 
 def message_visible_to_agent(item: Mapping[str, Any], agent: str) -> bool:
-    """Hide room-signal lines, human-only hints, and council-scoped items."""
+    """Hide room-signal lines, hints, minutes, and scoped items."""
     if item.get("kind") in AGENT_HIDDEN_KINDS:
         return False
     meta = item.get("meta")
-    if not isinstance(meta, dict) or "council_participants" not in meta:
+    if not isinstance(meta, dict):
+        return True
+    if "task_recipients" in meta:
+        scope = meta["task_recipients"]
+        return isinstance(scope, list) and agent in scope
+    if "council_participants" not in meta:
         return True
     scope = meta["council_participants"]
     return isinstance(scope, list) and agent in scope
@@ -1662,6 +1707,38 @@ def build_prompt(
     )
 
 
+def build_task_prompt(
+    agent: str,
+    instruction: str,
+    token: str,
+    participants: Sequence[str],
+    host: str = "Herdr",
+) -> str:
+    """Prompt one seat to carry out a human task now and report the result."""
+    roster = ", ".join(["a human", *(f"@{name}" for name in participants)])
+    return (
+        f"You are @{agent}, a full participant in a local group chat with {roster}. "
+        "Keep your normal capabilities and instructions. "
+        "The human has asked you to carry out one task using your ordinary tools. "
+        "Do the work now rather than describe it, and do not merely plan or propose it. "
+        f"Apply your own data-handling rules independently, and do not use {host} to relay "
+        "anything through the host or through another participant because the group-chat "
+        "relay handles delivery. If the task invokes a bounded disclosure, verify your "
+        "active provider, model, account-surface eligibility, exact payload, and purpose "
+        "before reading. If eligible, begin the message with a non-secret ROUTE_RECEIPT "
+        "naming that route; if ineligible, refuse before reading and name the missing "
+        "condition.\n\n"
+        "Task from the human:\n\n"
+        f"{instruction}\n\n"
+        f"Then report in at most about {TASK_REPORT_WORD_BUDGET} words: what was done, "
+        "where the result is (path, commit, or page), and anything not done with the "
+        "reason. Return one direct report message. Wrap only that message between these "
+        "marker lines:\n"
+        f"HGCHAT_REPLY_BEGIN {token}\n"
+        f"HGCHAT_REPLY_END {token}\n"
+    )
+
+
 def build_review_prompt(
     agent: str,
     question: str,
@@ -1710,6 +1787,68 @@ def build_synthesis_prompt(
         "Independent reviews:\n\n"
         f"{review_text}\n\n"
         "Return one direct synthesis message. Wrap only that message between these marker lines:\n"
+        f"HGCHAT_REPLY_BEGIN {token}\n"
+        f"HGCHAT_REPLY_END {token}\n"
+    )
+
+
+def minutes_items(items: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Project transcript items for minutes: no receipts, no signal lines.
+
+    A reply that opens with a ROUTE_RECEIPT keeps only its remaining text, so
+    a receipt-only reply drops out entirely; room-signal system lines never
+    reach the synthesizer. Everything else is passed through unchanged.
+    """
+    projected: list[dict[str, Any]] = []
+    for item in items:
+        if item.get("kind") in SIGNAL_KIND_NAMES:
+            continue
+        body = _message_body(item)
+        receipt = route_receipt_first_line(body)
+        if receipt is not None:
+            remainder = body.split("\n", 1)
+            body = remainder[1] if len(remainder) == 2 else ""
+            if not body.strip():
+                continue
+            trimmed = dict(item)
+            trimmed["body"] = body
+            projected.append(trimmed)
+            continue
+        projected.append(dict(item))
+    return projected
+
+
+def build_minutes_prompt(
+    synthesizer: str,
+    items: Sequence[Mapping[str, Any]],
+    token: str,
+    host: str = "Herdr",
+) -> str:
+    """Ask the synthesizer for a decisions-and-actions note over room items."""
+    material = minutes_items(items)
+    context = (
+        "(No transcript items in this range.)"
+        if not material
+        else "\n\n".join(
+            f"[seq {item['seq']}] [{item['sender']}] {_message_body(item)}" for item in material
+        )
+    )
+    return (
+        f"You are @{synthesizer}, the designated synthesizer in a local {host} group chat. "
+        "Keep your normal capabilities, instructions, and data-handling rules. The human "
+        "asked for minutes of the room transcript below. Return a Markdown note with "
+        "exactly these headings in this order: `# Minutes`, `## Decisions`, `## Actions`, "
+        "`## Open questions`, `## Not agreed`. Under `## Actions` use a Markdown table with "
+        "exactly the columns Action, Owner, Evidence, where Evidence cites the transcript "
+        "item seq numbers it rests on (for example `seq 4`). Attribute every position to a "
+        "seat by handle (@name) or to the human; record disagreement as disagreement and "
+        "never fold it into agreement; invent nothing the transcript does not show; leave a "
+        "section with no content empty rather than fill it. Keep the whole note under about "
+        f"{MINUTES_WORD_BUDGET} words. Do not use {host} to relay this reply because the "
+        "group-chat relay handles delivery.\n\n"
+        "Transcript items since the last minutes note:\n\n"
+        f"{context}\n\n"
+        "Return only the note. Wrap only that note between these marker lines:\n"
         f"HGCHAT_REPLY_BEGIN {token}\n"
         f"HGCHAT_REPLY_END {token}\n"
     )
@@ -2378,30 +2517,32 @@ def council_status_message(records: Sequence[Mapping[str, Any]]) -> str:
     return line
 
 
-def export_council_ledger(
-    records: Sequence[Mapping[str, Any]], target: str | os.PathLike[str]
+def write_private_leaf(
+    payload: bytes,
+    target: str | os.PathLike[str],
+    *,
+    subject: str,
+    label: str,
 ) -> Path:
-    """Write the canonical durable council ledger JSON to a new leaf only.
+    """Write payload bytes to a new leaf only, with export-grade safety.
 
     Refuses to overwrite anything (including symlinks), requires an existing
-    directory parent, creates the leaf exclusively with mode 0600, and removes
-    the partial leaf on any write error.
+    directory parent, creates the leaf exclusively with mode 0600, fsyncs the
+    complete write, and removes the partial leaf on any write error.
     """
-    ledger = derive_council_ledger(records)
-    payload = (council_canonical_json(ledger) + "\n").encode("utf-8")
     path = Path(target).expanduser()
     try:
         os.lstat(path)
     except FileNotFoundError:
         pass
     except OSError as error:
-        raise ChatError(f"cannot inspect export path {path}: {error}") from error
+        raise ChatError(f"cannot inspect {subject} path {path}: {error}") from error
     else:
         raise ChatError(f"refusing to overwrite existing path: {path}")
     parent = path.parent if str(path.parent) else Path(".")
     leaf = path.name
     if not leaf or leaf in {".", ".."}:
-        raise ChatError(f"export path has no file name: {path}")
+        raise ChatError(f"{subject} path has no file name: {path}")
     parent_flags = (
         os.O_RDONLY
         | getattr(os, "O_DIRECTORY", 0)
@@ -2411,7 +2552,7 @@ def export_council_ledger(
     try:
         parent_fd = os.open(parent, parent_flags)
     except OSError as error:
-        raise ChatError(f"invalid export parent directory {parent}: {error}") from error
+        raise ChatError(f"invalid {subject} parent directory {parent}: {error}") from error
     leaf_flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -2423,20 +2564,20 @@ def export_council_ledger(
         try:
             descriptor = os.open(leaf, leaf_flags, 0o600, dir_fd=parent_fd)
         except OSError as error:
-            raise ChatError(f"cannot create export file {path}: {error}") from error
+            raise ChatError(f"cannot create {subject} file {path}: {error}") from error
         try:
             os.fchmod(descriptor, 0o600)
             view = memoryview(payload)
             while view:
                 written = os.write(descriptor, view)
                 if written <= 0:
-                    raise OSError("incomplete council ledger write")
+                    raise OSError(f"incomplete {label} write")
                 view = view[written:]
             os.fsync(descriptor)
         except OSError as error:
             with suppress(OSError):
                 os.unlink(leaf, dir_fd=parent_fd)
-            raise ChatError(f"failed to write council ledger {path}: {error}") from error
+            raise ChatError(f"failed to write {label} {path}: {error}") from error
         finally:
             # A close failure must never replace the primary wrapped write error.
             with suppress(OSError):
@@ -2444,6 +2585,15 @@ def export_council_ledger(
     finally:
         os.close(parent_fd)
     return path
+
+
+def export_council_ledger(
+    records: Sequence[Mapping[str, Any]], target: str | os.PathLike[str]
+) -> Path:
+    """Write the canonical durable council ledger JSON to a new leaf only."""
+    ledger = derive_council_ledger(records)
+    payload = (council_canonical_json(ledger) + "\n").encode("utf-8")
+    return write_private_leaf(payload, target, subject="export", label="council ledger")
 
 
 def build_consensus_blind_prompt(
@@ -2672,6 +2822,10 @@ class GroupChat:
         """Parse one ordinary send so plain text follows the current focus."""
         return parse_route(text, tuple(self.agents), default=self.focus())
 
+    def task_route(self, text: str) -> Route:
+        """Parse one /task command, which requires an explicit mention."""
+        return parse_task(text, tuple(self.agents))
+
     @staticmethod
     def _set_review_state(
         review: ReviewRound,
@@ -2783,23 +2937,28 @@ class GroupChat:
         text: str,
         cancel_event: threading.Event | None = None,
         on_state: Callable[[str, str], None] | None = None,
+        *,
+        task: bool = False,
     ) -> list[dict[str, Any]]:
-        """Deliver one ordinary message, with optional local cancellation.
+        """Deliver one ordinary message or /task command, with cancellation.
 
         A plain message selecting several participants fans out to all of
         them concurrently from one transcript snapshot, so no recipient sees
         another's reply to this message; a single-recipient message keeps the
-        original serial delivery. Cancellation is local to this relay: it
-        stops waiting and leaves participant tabs untouched.
+        original serial delivery. A task rides the same delivery path, but its
+        human item is recorded as `kind="task"` scoped to the addressed seats
+        and each seat is prompted by `build_task_prompt` with the instruction
+        alone. Cancellation is local to this relay: it stops waiting and leaves
+        participant tabs untouched.
         """
-        route = self.plain_route(text)
+        route = self.task_route(text) if task else self.plain_route(text)
         selected = route.recipients[: self.max_turns]
         created: list[dict[str, Any]] = []
         cancellation_recorded = False
 
         def finish(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             """Close one delivered ordinary send with its human-only hint."""
-            hint_body = command_hint(route.body)
+            hint_body = None if task else command_hint(route.body)
             if hint_body is not None:
                 items.append(
                     self.transcript.append("system", ("human",), hint_body, kind="hint")
@@ -2837,7 +2996,18 @@ class GroupChat:
             if cancel_event is not None and cancel_event.is_set():
                 cancel_remaining(0)
                 return created
-            created.append(self.transcript.append("human", selected, route.body))
+            if task:
+                created.append(
+                    self.transcript.append(
+                        "human",
+                        selected,
+                        route.body,
+                        kind="task",
+                        meta={"task_recipients": list(selected)},
+                    )
+                )
+            else:
+                created.append(self.transcript.append("human", selected, route.body))
             if len(route.recipients) > self.max_turns:
                 delivered = list(selected)
                 dropped = list(route.recipients[self.max_turns :])
@@ -2876,13 +3046,19 @@ class GroupChat:
                     ]
                     delivered_through = max(item["seq"] for item in messages)
                     token = uuid.uuid4().hex
-                    prompt = build_prompt(
-                        agent,
-                        messages,
-                        token,
-                        tuple(self.agents),
-                        self.host_label,
-                        receipt_expected=self.receipt_expected(agent),
+                    prompt = (
+                        build_task_prompt(
+                            agent, route.body, token, tuple(self.agents), self.host_label
+                        )
+                        if task
+                        else build_prompt(
+                            agent,
+                            messages,
+                            token,
+                            tuple(self.agents),
+                            self.host_label,
+                            receipt_expected=self.receipt_expected(agent),
+                        )
                     )
                     item = self._plain_turn(
                         agent, prompt, delivered_through, cancel_event, set_state
@@ -2905,13 +3081,19 @@ class GroupChat:
                     and item["sender"] != agent
                     and message_visible_to_agent(item, agent)
                 ]
-                prompts[agent] = build_prompt(
-                    agent,
-                    messages,
-                    uuid.uuid4().hex,
-                    tuple(self.agents),
-                    self.host_label,
-                    receipt_expected=self.receipt_expected(agent),
+                prompts[agent] = (
+                    build_task_prompt(
+                        agent, route.body, uuid.uuid4().hex, tuple(self.agents), self.host_label
+                    )
+                    if task
+                    else build_prompt(
+                        agent,
+                        messages,
+                        uuid.uuid4().hex,
+                        tuple(self.agents),
+                        self.host_label,
+                        receipt_expected=self.receipt_expected(agent),
+                    )
                 )
                 delivered_through[agent] = max(item["seq"] for item in messages)
             with ThreadPoolExecutor(
@@ -3046,6 +3228,107 @@ class GroupChat:
         # fails before any transcript authority is touched.
         with self.transcript.council_execution_lock():
             return self.execute_review(self.plan_consensus(text), on_state)
+
+    def plan_minutes(self) -> ReviewRound:
+        """Build the single-participant minutes round for the synthesizer."""
+        return ReviewRound(
+            id=uuid.uuid4().hex,
+            question="",
+            reviewers=(),
+            synthesizer=self.synthesizer,
+            prompts={},
+            question_seq=None,
+            states={self.synthesizer: "queued"},
+            mode="minutes",
+        )
+
+    def minutes(
+        self,
+        target: str | None,
+        on_state: Callable[[str, str], None] | None = None,
+    ) -> ReviewRound:
+        """Run one minutes round synchronously; the controller wraps it."""
+        review = self.plan_minutes()
+        return self.run_minutes(review, target, on_state)
+
+    def run_minutes(
+        self,
+        review: ReviewRound,
+        target: str | None,
+        on_state: Callable[[str, str], None] | None = None,
+    ) -> ReviewRound:
+        """Turn the transcript since the last minutes note into a written file."""
+        if review.mode != "minutes":
+            raise ChatError(f"run_minutes cannot run a {review.mode} round")
+        synthesizer = review.synthesizer
+        self._ensure_live((synthesizer,))
+        snapshot = self.transcript.read()
+        boundary = next(
+            (item["seq"] for item in reversed(snapshot) if item.get("kind") == "minutes"), 0
+        )
+        covered = [item for item in snapshot if item["seq"] > boundary]
+        start = boundary + 1
+        end = max((item["seq"] for item in covered), default=0)
+        if end < start:
+            raise ChatError("the room has no transcript items to minute yet")
+        token = uuid.uuid4().hex
+        prompt = build_minutes_prompt(
+            synthesizer,
+            covered,
+            token,
+            self.host_label,
+        )
+        if not self._begin_review_call(review, synthesizer, "working", on_state):
+            return review
+        try:
+            status, reply = self.client.turn(
+                self.agents[synthesizer],
+                prompt,
+                self._timeout_for(synthesizer),
+                review.cancel_event,
+                agent_label=synthesizer,
+            )
+        except ChatError as error:
+            if review.cancel_event.is_set():
+                self._set_review_state(review, synthesizer, "cancelled", on_state)
+            else:
+                self._set_review_state(review, synthesizer, failure_state(error), on_state)
+            raise
+        if review.cancel_event.is_set():
+            self._set_review_state(review, synthesizer, "cancelled", on_state)
+            raise ChatError("minutes cancelled")
+        if status == "blocked":
+            self._set_review_state(review, synthesizer, "blocked", on_state)
+            raise ChatError(
+                f"@{synthesizer} is blocked and needs attention in {self.host_label}."
+            )
+        if not reply.strip():
+            self._set_review_state(review, synthesizer, "failed", on_state)
+            raise ChatError(f"@{synthesizer} minutes failed: empty response")
+        if target:
+            path = Path(target).expanduser()
+        else:
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            path = self.transcript.state_dir / f"{self.transcript.room}-minutes-{stamp}.md"
+        try:
+            written = write_private_leaf(
+                reply.encode("utf-8"), path, subject="minutes", label="minutes file"
+            )
+        except ChatError:
+            self._set_review_state(review, synthesizer, "failed", on_state)
+            raise
+        line = f"Minutes written to {written} (seq {start}-{end})."
+        self.transcript.append(
+            "system",
+            ("human",),
+            line,
+            kind="minutes",
+            meta={"path": str(written), "seq_start": start, "seq_end": end},
+        )
+        self._set_review_state(review, synthesizer, "done", on_state)
+        with review.lock:
+            review.synthesis = line
+        return review
 
     def prepare_review(self, text: str) -> ReviewRound:
         review = self.plan_review(text)
@@ -4841,7 +5124,7 @@ def visible_wrapped_lines(
     return lines[start:end], max_offset
 
 
-MENTION_COMMAND_PREFIXES = ("/review ", "/anneal ", "/consensus ")
+MENTION_COMMAND_PREFIXES = ("/review ", "/anneal ", "/consensus ", "/task ")
 MENTION_NAME_RE = re.compile(r"@([a-z0-9_-]+)", re.IGNORECASE)
 
 
@@ -4948,12 +5231,13 @@ class DeliveryController:
                 return
             self._states[agent] = state
 
-    def _run(self, text: str, delivery_event: threading.Event) -> None:
+    def _run(self, text: str, delivery_event: threading.Event, task: bool = False) -> None:
         try:
             self.chat.dispatch(
                 text,
                 delivery_event,
                 lambda agent, state: self._on_state(delivery_event, agent, state),
+                task=task,
             )
         except ChatError as error:
             with self._lock:
@@ -4996,8 +5280,8 @@ class DeliveryController:
         thread.join(timeout)
         return not thread.is_alive()
 
-    def start(self, text: str) -> None:
-        route = self.chat.plain_route(text)
+    def start(self, text: str, *, task: bool = False) -> None:
+        route = self.chat.task_route(text) if task else self.chat.plain_route(text)
         order = route.recipients[: self.chat.max_turns]
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
@@ -5009,7 +5293,7 @@ class DeliveryController:
             self._notice = ""
             self._thread = threading.Thread(
                 target=self._run,
-                args=(text, delivery_event),
+                args=(text, delivery_event, task),
                 name="hgchat-ordinary-delivery",
                 daemon=True,
             )
@@ -5082,6 +5366,10 @@ class ReviewController:
                 notice = f"{label} cancelled locally; participants may continue working."
             elif failure_notice is not None:
                 notice = failure_notice
+            elif review.mode == "minutes" and review.synthesis:
+                # The minutes line naming the written path and covered seq
+                # range is the outcome the human needs; repeat it verbatim.
+                notice = review.synthesis
             else:
                 notice = f"{label} complete."
             self._last = review
@@ -5128,6 +5416,16 @@ class ReviewController:
             self._launch(lambda: self.chat.execute_review(review, self._on_state), review)
         reviewers = ", @".join(review.reviewers)
         return f"Consensus started with @{reviewers}; @{review.synthesizer} synthesizes."
+
+    def start_minutes(self, target: str | None) -> str:
+        with self._lock:
+            if self._active is not None:
+                raise ChatError("a review is already running")
+            review = self.chat.plan_minutes()
+            self._launch(
+                lambda: self.chat.run_minutes(review, target, self._on_state), review
+            )
+        return f"Minutes started; @{review.synthesizer} synthesizes."
 
     def start_resume(self) -> str:
         with self._lock:
@@ -5364,9 +5662,10 @@ def handle_local_command(
         return "Usage: /council status · /council export PATH · /council resume"
     if stripped == "/help":
         return (
-            "Commands: /review [@agents] QUESTION · /anneal @author,@critic QUESTION · "
-            "/consensus [@agents] QUESTION · /retry <agent|synthesis> · /cancel · /agents · "
-            "/council status · /council export PATH · /council resume · "
+            "Commands: /task @agent[,@agent] INSTRUCTION · /review [@agents] QUESTION · "
+            "/anneal @author,@critic QUESTION · /consensus [@agents] QUESTION · "
+            "/retry <agent|synthesis> · /cancel · /agents · "
+            "/council status · /council export PATH · /council resume · /minutes [PATH] · "
             "/show <agent> · /layout compact|grid|grid2 · /inbox · /lanes · /room · "
             "PgUp/PgDn · mouse wheel scrolls "
             "· Home/End jump · @ opens a mention picker "
@@ -5384,6 +5683,13 @@ def handle_local_command(
             line = str(error)
         chat.transcript.append("system", ("human",), line)
         return line
+    if stripped == "/minutes" or stripped.startswith("/minutes "):
+        if reviews is None:
+            return "Review control is unavailable."
+        if reviews.is_active():
+            return "A council round is running; use /cancel or wait before sending."
+        target = stripped.removeprefix("/minutes").strip()
+        return reviews.start_minutes(target or None)
     if stripped == "/review" or stripped.startswith("/review "):
         if reviews is None:
             return "Review control is unavailable."
@@ -5422,6 +5728,11 @@ def handle_local_command(
             return f"Unknown participant: {name}"
         chat.client.focus(chat.agents[name])
         return f"Focused @{name}."
+    if stripped == "/task" or stripped.startswith("/task "):
+        # A task is delivered to seats, not handled locally: return None so the
+        # caller routes it through the ordinary delivery controller, whose
+        # usage and council-round refusals match the other sends.
+        return None
     return "Unknown command. Use /help."
 
 
@@ -5937,8 +6248,10 @@ def _run_tui_loop(
                 status_override = "independent"
                 buffer = ""
                 continue
+            task_text = buffer.strip()
+            is_task = task_text == "/task" or task_text.startswith("/task ")
             try:
-                deliveries.start(buffer)
+                deliveries.start(buffer, task=is_task)
                 status = deliveries.status()
                 status_override = None
             except ChatError as error:
@@ -6099,6 +6412,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ),
                     profile_receipt=receipt,
                 )
+                created = transcript.read()[before:]
+            elif args.once.strip() == "/task" or args.once.strip().startswith("/task "):
+                created = chat.dispatch(args.once, task=True)
+            elif args.once.strip() == "/minutes" or args.once.strip().startswith("/minutes "):
+                target = args.once.strip().removeprefix("/minutes").strip()
+                chat.minutes(target or None)
                 created = transcript.read()[before:]
             else:
                 created = chat.dispatch(args.once)

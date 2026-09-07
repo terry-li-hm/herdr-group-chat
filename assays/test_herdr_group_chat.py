@@ -45,6 +45,11 @@ extract_codex_session_reply = namespace.get("extract_codex_session_reply")
 codex_rollout_file = namespace.get("codex_rollout_file")
 claude_project_dir_name = namespace.get("claude_project_dir_name")
 build_prompt = namespace["build_prompt"]
+build_task_prompt = namespace.get("build_task_prompt")
+parse_task = namespace.get("parse_task")
+build_minutes_prompt = namespace.get("build_minutes_prompt")
+minutes_items = namespace.get("minutes_items")
+TASK_USAGE = namespace.get("TASK_USAGE")
 build_review_prompt = namespace["build_review_prompt"]
 build_synthesis_prompt = namespace["build_synthesis_prompt"]
 format_context = namespace["format_context"]
@@ -10655,3 +10660,407 @@ def test_council_settlement_unknown_phase_fails_closed_before_pop(
     # attempt was journalled and the cancelled commit discards the message.
     assert transcript.read() == before
     assert not council_attempt_records(transcript.read())
+
+
+MINUTES_MARKER = "Transcript items since the last minutes note:"
+
+
+class MinutesClient(FakeClient):
+    """FakeClient whose synthesizer turns return one canned minutes note."""
+
+    def __init__(self, note: str) -> None:
+        super().__init__()
+        self.note = note
+        self.minutes_prompts: list[str] = []
+
+    def turn(
+        self,
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+        agent_label: str | None = None,
+    ) -> tuple[str, str]:
+        if MINUTES_MARKER in prompt:
+            self.minutes_prompts.append(prompt)
+            return "done", self.note
+        return super().turn(target, prompt, timeout_ms, cancel_event)
+
+
+def make_minutes_chat(
+    tmp_path: Path, note: str = ""
+) -> tuple[GroupChat, MinutesClient, Transcript]:
+    transcript = Transcript(tmp_path, "minutes-room")
+    client = MinutesClient(note)
+    chat = GroupChat(
+        transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client, synthesizer="pi"
+    )
+    return chat, client, transcript
+
+
+def reply_token(prompt: str) -> str:
+    match = re.search(r"HGCHAT_REPLY_BEGIN ([a-f0-9]{32})", prompt)
+    assert match
+    return match.group(1)
+
+
+def test_task_parse_requires_explicit_mentions_and_allows_all() -> None:
+    agents = ("pi", "claude", "codex", "grok")
+    assert parse_task("/task @pi do X", agents) == Route(("pi",), "do X")
+    assert parse_task("/task @pi,@grok do X", agents) == Route(("pi", "grok"), "do X")
+    assert parse_task("/task @all do X", agents) == Route(agents, "do X")
+    assert parse_task("  /task   @pi   trim me  ", agents) == Route(("pi",), "trim me")
+    for bad in ("/task", "/task do X", "/task @pi", "/task    "):
+        with pytest.raises(ChatError, match=r"^Usage: /task @agent\[,@agent\] INSTRUCTION$"):
+            parse_task(bad, agents)
+    with pytest.raises(ChatError, match="unknown participant: @nobody"):
+        parse_task("/task @nobody do X", agents)
+
+
+def test_task_prompt_directs_work_now_and_report_only() -> None:
+    token = "a" * 32
+    prompt = build_task_prompt("pi", "Fix the leak in utils.py", token, ("pi", "claude"))
+    assert "Fix the leak in utils.py" in prompt
+    assert "carry out one task using your ordinary tools" in prompt
+    assert "Do the work now rather than describe it" in prompt
+    assert "at most about 150 words" in prompt
+    assert "what was done, where the result is (path, commit, or page)" in prompt
+    assert "anything not done with the reason" in prompt
+    assert "do not use Herdr to relay" in prompt
+    assert f"HGCHAT_REPLY_BEGIN {token}" in prompt
+    assert f"HGCHAT_REPLY_END {token}" in prompt
+    assert "New room messages since your last delivered turn" not in prompt
+
+
+def test_task_dispatch_scopes_the_item_and_prompts_from_build_task_prompt(
+    tmp_path: Path,
+) -> None:
+    chat, client, _transcript = make_chat(tmp_path)
+
+    created = chat.dispatch("/task @pi do X now", task=True)
+
+    human = created[0]
+    assert human["sender"] == "human"
+    assert human["kind"] == "task"
+    assert human["recipients"] == ["pi"]
+    assert human["meta"]["task_recipients"] == ["pi"]
+    assert message_visible_to_agent(human, "pi")
+    assert not message_visible_to_agent(human, "claude")
+    assert not message_visible_to_agent(human, "grok")
+
+    target, prompt = client.calls[0]
+    assert target == "pi-peer"
+    assert prompt == build_task_prompt(
+        "pi", "do X now", reply_token(prompt), ("pi", "claude", "codex", "grok")
+    )
+
+    reply = next(item for item in created if item["sender"] == "pi")
+    assert reply["kind"] == "message"
+    assert reply["recipients"] == ["human", "all"]
+
+    chat.dispatch("@claude status check")
+    claude_target, claude_prompt = client.calls[-1]
+    assert claude_target == "claude-peer"
+    assert "do X now" not in claude_prompt
+    assert "reply from pi-peer" in claude_prompt
+
+
+def test_task_usage_errors_raise_from_dispatch_and_stay_nonlocal(tmp_path: Path) -> None:
+    chat, _, transcript = make_chat(tmp_path)
+    for bad in ("/task", "/task do things", "/task @pi"):
+        with pytest.raises(ChatError, match=r"^Usage: /task @agent\[,@agent\] INSTRUCTION$"):
+            chat.dispatch(bad, task=True)
+    assert handle_local_command("/task", chat, None) is None
+    assert handle_local_command("/task @pi do X", chat, None) is None
+    assert transcript.read() == []
+
+
+def test_task_to_several_seats_uses_the_parallel_task_prompt_path(tmp_path: Path) -> None:
+    transcript = Transcript(tmp_path, "task-multi-room")
+    client = BarrierPlainClient(2)
+    chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client)
+
+    created = chat.dispatch("/task @pi,@claude do Y", task=True)
+
+    human = created[0]
+    assert human["kind"] == "task"
+    assert human["meta"]["task_recipients"] == ["pi", "claude"]
+    assert len(client.calls) == 2
+    for target, prompt in client.calls:
+        name = "pi" if target == "pi-peer" else "claude"
+        assert prompt == build_task_prompt(name, "do Y", reply_token(prompt), ("pi", "claude"))
+
+
+def test_tui_delivers_task_commands_through_the_delivery_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, client, transcript = make_blocking_ordinary_chat(tmp_path)
+    deliveries: list[DeliveryController] = []
+
+    class TrackingDeliveryController(DeliveryController):
+        def __init__(self, tracked_chat: object) -> None:
+            super().__init__(tracked_chat)
+            deliveries.append(self)
+
+    keys = [
+        *list("/task @pi do the thing\n"),
+        "RELEASE_WORKER",
+        "\x11",
+    ]
+    screen = ScriptedTuiScreen(
+        keys,
+        client,
+        release_wait=lambda: _wait_until(lambda: not deliveries[0].is_active(), HARNESS_WAIT_S),
+    )
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    monkeypatch.setattr(module, "draw_tui", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(module, "DeliveryController", TrackingDeliveryController)
+
+    run_tui(screen, chat, "task-delivery-room")
+
+    assert [target for target, _ in client.calls] == ["pi-peer"]
+    _, prompt = client.calls[0]
+    assert "Task from the human" in prompt
+    assert "do the thing" in prompt
+    items = transcript.read()
+    assert items[0]["kind"] == "task"
+    assert items[0]["meta"] == {"task_recipients": ["pi"]}
+    assert items[1]["sender"] == "pi"
+    assert items[1]["kind"] == "message"
+
+
+def test_tui_refuses_task_commands_while_a_council_round_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, client, transcript = make_blocking_ordinary_chat(tmp_path)
+    reviews: list[ReviewController] = []
+
+    class TrackingReviewController(ReviewController):
+        def __init__(self, tracked_chat: object) -> None:
+            super().__init__(tracked_chat)
+            reviews.append(self)
+
+    draws: list[str] = []
+    keys = [
+        *list("/review @pi Hold a position\n"),
+        "WAIT_FOR_TURN",
+        *list("/task @pi do the thing\n"),
+        "RELEASE_WORKER",
+        "\x11",
+    ]
+    screen = ScriptedTuiScreen(
+        keys, client, release_wait=lambda: reviews[0].wait(HARNESS_WAIT_S)
+    )
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    monkeypatch.setattr(
+        module,
+        "draw_tui",
+        lambda _screen, _transcript, _room, _buffer, status, _participants, _scroll=0, **_kw: (
+            draws.append(status) or 0
+        ),
+    )
+    monkeypatch.setattr(module, "ReviewController", TrackingReviewController)
+
+    run_tui(screen, chat, "task-refused-room")
+
+    assert "A council round is running; use /cancel or wait before sending." in draws
+    assert all("do the thing" not in prompt for _, prompt in client.calls)
+    assert not [item for item in transcript.read() if item.get("kind") == "task"]
+
+
+def test_help_and_mention_picker_list_task_and_minutes(tmp_path: Path) -> None:
+    chat, _, _ = make_chat(tmp_path)
+    line = handle_local_command("/help", chat, None)
+    assert "/task @agent[,@agent] INSTRUCTION" in line
+    assert "/minutes [PATH]" in line
+    assert mention_fragment("/task @p") == (6, "p")
+    assert "all" in (mention_suggestions("/task @", ("pi", "claude")) or ())
+    assert mention_fragment("/tasks @p") is None
+
+
+def test_once_routes_task_and_minutes_commands_to_their_handlers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class CommandOnceChat:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def dispatch(
+            self,
+            text: str,
+            cancel_event: object = None,
+            on_state: object = None,
+            *,
+            task: bool = False,
+        ) -> list[dict[str, str]]:
+            calls.append(("dispatch", text, task))
+            return [{"sender": "human", "body": text}]
+
+        def minutes(self, target: str | None, on_state: object = None) -> None:
+            calls.append(("minutes", target))
+
+    monkeypatch.setattr(module, "GroupChat", CommandOnceChat)
+    assert main(["--state-dir", str(tmp_path), "--room", "once-cmd", "--once", "/task @pi x"]) == 0
+    assert main(["--state-dir", str(tmp_path), "--room", "once-cmd", "--once", "/minutes"]) == 0
+    assert calls == [("dispatch", "/task @pi x", True), ("minutes", None)]
+    assert capsys.readouterr().out == "human> /task @pi x\n"
+
+
+def test_minutes_prompt_excludes_receipt_only_lines_and_signal_items() -> None:
+    items = [
+        {
+            "seq": 1,
+            "sender": "human",
+            "recipients": ["pi"],
+            "body": "Decide the release date",
+            "kind": "message",
+        },
+        {
+            "seq": 2,
+            "sender": "pi",
+            "recipients": ["human", "all"],
+            "body": "ROUTE_RECEIPT: provider openai-codex · purpose the current task",
+            "kind": "message",
+        },
+        {
+            "seq": 3,
+            "sender": "claude",
+            "recipients": ["human", "all"],
+            "body": "ROUTE_RECEIPT: provider x\nWe ship Friday.",
+            "kind": "message",
+        },
+        {
+            "seq": 4,
+            "sender": "system",
+            "recipients": ["human"],
+            "body": "@grok is blocked and needs attention in Herdr.",
+            "kind": "turn_blocked",
+        },
+        {
+            "seq": 5,
+            "sender": "grok",
+            "recipients": ["human", "all"],
+            "body": "I disagree with Friday.",
+            "kind": "message",
+        },
+    ]
+    prompt = build_minutes_prompt("pi", items, "0" * 32)
+    assert "[seq 1] [human] Decide the release date" in prompt
+    assert "[seq 3] [claude] We ship Friday." in prompt
+    assert "[seq 5] [grok] I disagree with Friday." in prompt
+    assert "ROUTE_RECEIPT" not in prompt
+    assert "[seq 2]" not in prompt
+    assert "is blocked" not in prompt
+    assert "[seq 4]" not in prompt
+    headings = ("# Minutes", "## Decisions", "## Actions", "## Open questions", "## Not agreed")
+    for heading in headings:
+        assert heading in prompt
+    assert "Action, Owner, Evidence" in prompt
+    assert "under about 400 words" in prompt
+    assert len(minutes_items(items)) == 3
+
+
+def test_minutes_command_writes_a_private_note_and_records_the_range(tmp_path: Path) -> None:
+    note = (
+        "# Minutes\n\n## Decisions\n\nShip Friday.\n\n## Actions\n\n"
+        "| Action | Owner | Evidence |\n| --- | --- | --- |\n"
+        "| Draft notes | @pi | seq 1 |\n\n## Open questions\n\n## Not agreed\n\n"
+    )
+    chat, client, transcript = make_minutes_chat(tmp_path, note)
+    transcript.append("human", ("pi", "claude"), "Draft the release notes")
+    transcript.append("claude", ("human", "all"), "We ship Friday")
+    reviews = ReviewController(chat)
+
+    target = tmp_path / "minutes-a.md"
+    assert handle_local_command(f"/minutes {target}", chat, reviews) == (
+        "Minutes started; @pi synthesizes."
+    )
+    assert reviews.wait(HARNESS_WAIT_S)
+
+    assert target.read_text() == note
+    assert target.stat().st_mode & 0o777 == 0o600
+    marker = transcript.read()[-1]
+    assert marker["kind"] == "minutes"
+    assert marker["sender"] == "system"
+    assert marker["recipients"] == ["human"]
+    assert marker["meta"] == {"path": str(target), "seq_start": 1, "seq_end": 2}
+    assert marker["body"] == f"Minutes written to {target} (seq 1-2)."
+    assert reviews.status() == marker["body"]
+    assert not message_visible_to_agent(marker, "pi")
+    assert not message_visible_to_agent(marker, "claude")
+
+    prompt = client.minutes_prompts[0]
+    assert "[seq 1] [human] Draft the release notes" in prompt
+    assert "[seq 2] [claude] We ship Friday" in prompt
+
+    transcript.append("human", ("pi", "claude"), "Second item")
+    second = tmp_path / "minutes-b.md"
+    handle_local_command(f"/minutes {second}", chat, reviews)
+    assert reviews.wait(HARNESS_WAIT_S)
+    prompt_two = client.minutes_prompts[1]
+    assert "Second item" in prompt_two
+    assert "Draft the release notes" not in prompt_two
+    assert "We ship Friday" not in prompt_two
+    marker_two = transcript.read()[-1]
+    assert marker_two["meta"]["seq_start"] == 4
+    assert marker_two["meta"]["seq_end"] == 4
+
+
+def test_minutes_refuses_an_existing_path_without_writing(tmp_path: Path) -> None:
+    chat, _, transcript = make_minutes_chat(tmp_path, "new note")
+    transcript.append("human", ("pi",), "One item")
+    existing = tmp_path / "exists.md"
+    existing.write_text("keep me")
+    with pytest.raises(ChatError, match="refusing to overwrite existing path"):
+        chat.minutes(str(existing))
+    assert existing.read_text() == "keep me"
+
+    reviews = ReviewController(chat)
+    handle_local_command(f"/minutes {existing}", chat, reviews)
+    assert reviews.wait(HARNESS_WAIT_S)
+    assert existing.read_text() == "keep me"
+    assert "refusing to overwrite existing path" in reviews.status()
+    assert not [item for item in transcript.read() if item.get("kind") == "minutes"]
+
+
+def test_minutes_default_path_and_empty_room_refusal(tmp_path: Path) -> None:
+    chat, _, transcript = make_minutes_chat(tmp_path, "note body")
+    with pytest.raises(ChatError, match="no transcript items to minute"):
+        chat.minutes(str(tmp_path / "never.md"))
+    transcript.append("human", ("pi",), "only item")
+    review = chat.minutes(None)
+    assert review.synthesis is not None
+    assert review.synthesis.startswith("Minutes written to ")
+    written = next(tmp_path.glob("minutes-room-minutes-*.md"))
+    assert written.read_text() == "note body"
+    assert written.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(ChatError, match="no transcript items to minute"):
+        chat.minutes(str(tmp_path / "never.md"))
+    assert not (tmp_path / "never.md").exists()
+
+
+def test_minutes_cancel_works_through_the_review_controller(tmp_path: Path) -> None:
+    chat, client, transcript = make_cancellation_aware_ordinary_chat(tmp_path)
+    transcript.append("human", ("pi",), "item")
+    target = tmp_path / "note.md"
+    reviews = ReviewController(chat)
+    assert handle_local_command(f"/minutes {target}", chat, reviews).startswith("Minutes started")
+    assert client.started.wait(HARNESS_WAIT_S)
+    assert reviews.is_active()
+    assert reviews.cancel() == "Local cancellation requested; participants may continue working."
+    assert reviews.wait(HARNESS_WAIT_S)
+    assert not target.exists()
+    assert not [item for item in transcript.read() if item.get("kind") == "minutes"]
+    assert reviews.status() == "Minutes cancelled locally; participants may continue working."
+
+
+def test_minutes_refused_while_a_council_round_runs(tmp_path: Path) -> None:
+    chat, _, transcript = make_chat(tmp_path)
+    assert handle_local_command("/minutes /tmp/never.md", chat, ActiveReviewStub()) == (
+        "A council round is running; use /cancel or wait before sending."
+    )
+    assert transcript.read() == []

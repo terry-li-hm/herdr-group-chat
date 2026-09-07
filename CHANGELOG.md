@@ -10,6 +10,37 @@ All notable changes to this project are documented here.
   newest line restores it, editing a recalled line starts a new draft, and a
   reopened room seeds the history from the transcript's human items (capacity
   200, blank and immediately repeated lines dropped).
+- **New `/task` and `/minutes` room commands.** `/task @seat[,@seat]
+  INSTRUCTION` asks the addressed seats to act rather than discuss: at least
+  one explicit mention is required (`@all` allowed, anything else returns
+  `Usage: /task @agent[,@agent] INSTRUCTION`), delivery rides the ordinary
+  dispatch path with parallel fan-out for several seats so `/cancel` and the
+  turn cap behave as for a plain message, and the command is refused while a
+  council round is running with the same message `/layout` uses. The human
+  turn is recorded as a `kind="task"` item scoped by
+  `meta={"task_recipients": [...]}` so only the addressed seats ever see it
+  in later prompts, while replies stay ordinary and public. Each addressed
+  seat is prompted through the new `build_task_prompt` to keep its normal
+  capabilities and data-handling rules, do the work now with its ordinary
+  tools, never relay anything through the host, and report in about 150 words
+  what was done, where the result is (path, commit, or page), and anything
+  not done with the reason. `/minutes [PATH]` has the configured synthesizer
+  turn the transcript since the last `kind="minutes"` system item (or from
+  the start) into a note with exactly `# Minutes`, `## Decisions`,
+  `## Actions` (an Action/Owner/Evidence table whose Evidence cites
+  transcript seq numbers), `## Open questions`, and `## Not agreed`, under
+  about 400 words, attributing positions by handle, recording disagreement as
+  disagreement, inventing nothing, and excluding route-receipt lines and
+  room-signal lines. The note is written by the same refuse-to-overwrite,
+  exclusive-create, mode 0600, remove-partial-leaf writer as the council
+  export (now the shared `write_private_leaf` helper), to the named path or
+  `<state dir>/<room>-minutes-<UTC timestamp>.md`; the room appends one
+  human-only `kind="minutes"` system item naming the written path and seq
+  range covered, and that same line is the completion status. `/minutes`
+  runs through the review controller so `/cancel` works and ordinary sends
+  wait, and it is refused while a council round is active. Both commands
+  appear in `/help`, the mention picker opens after `/task `, and `--once`
+  accepts both.
 - **Launch failures and readiness now surface as Herdr notifications.** When a
   launch-facing mode (`--launch`, `--open`, `--place`, `--room-entrypoint`)
   fails, `new-room` shows one top-right notification `Group chat: launch

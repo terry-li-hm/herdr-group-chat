@@ -164,6 +164,21 @@ with a ratified vote and `/review QUESTION` runs a blind round with synthesis.
 Seats are asked to keep replies under about 150 words unless you asked for
 detail or the task is a document review, and to lead with the answer.
 
+Use `/task @seat[,@seat] INSTRUCTION` when a seat should act rather than
+discuss. At least one explicit mention is required and `@all` is allowed;
+anything else returns `Usage: /task @agent[,@agent] INSTRUCTION`. Delivery
+rides the ordinary dispatch path, in parallel when more than one seat is
+addressed, so `/cancel`, the status row, and the turn cap behave exactly as
+for a plain message, and `/task` is refused while a council round is running
+with the same message `/layout` uses. The human turn is recorded as a task
+item that only the addressed seats ever see in later prompts — unaddressed
+seats never receive it — while the seats' replies are ordinary public replies.
+Each addressed seat is prompted to do the work now with its ordinary tools,
+keeping its normal capabilities and data-handling rules, and to report in at
+most about 150 words: what was done, where the result is (path, commit, or
+page), and anything not done with the reason. The prompt never asks a seat to
+relay anything through the host.
+
 Use `/review` when the agents should reach their views independently before any
 answer can influence another. Mentions select reviewers; without mentions, all
 participants review. Pi synthesizes by default.
@@ -190,14 +205,14 @@ Use Page Up and Page Down to scroll the active room, inbox, or lane presentation
 while work continues.
 
 Typing `@` at the start of the recipient token — at the beginning of the line
-or right after `/review `, `/anneal `, `/consensus `, or a comma still inside that token —
+or right after `/review `, `/anneal `, `/consensus `, `/task `, or a comma still inside that token —
 opens a compact mention picker on the status row (`Mentions: [@astra] @fable`).
 Typed characters filter it case-insensitively, Up/Down cycle the selection,
 Tab completes the selected handle without adding a trailing space (a comma
 continues the recipient list, a space begins the message), Esc closes it with
 the text unchanged, and Enter still submits exactly what is shown. Already
 selected handles are excluded from later suggestions; `@all` is offered for
-plain messages, `/review`, and `/consensus` but never for `/anneal`.
+plain messages, `/review`, `/consensus`, and `/task` but never for `/anneal`.
 
 Use `/anneal @author,@critic QUESTION` for a two-participant adversarial pass
 over one question. Both answer blind and concurrently (a missing blind reply
@@ -250,6 +265,23 @@ overwrite anything (including symlinks), requires an existing directory
 parent, creates the leaf exclusively with mode 0600, fsyncs the complete
 write, and removes a partial leaf on any write error. With no council round
 recorded, status prints a clear message while export fails.
+
+Use `/minutes [PATH]` to have the configured synthesizer turn the room's
+transcript since the last minutes note — or from the start of the room — into
+a decisions-and-actions note. Without a path the note is written to the room
+state directory as `<room>-minutes-<UTC timestamp>.md`; with a path, to that
+file. Writing uses the same refuse-to-overwrite, exclusive-create, mode 0600,
+remove-partial-leaf semantics as a council export. The note carries exactly
+the headings `# Minutes`, `## Decisions`, `## Actions` (a table with columns
+Action, Owner, Evidence, where Evidence cites the transcript seq numbers),
+`## Open questions`, and `## Not agreed`; positions are attributed to seats by
+handle, disagreement is recorded as disagreement, nothing is invented, and
+the note stays under about 400 words. Route-receipt lines and room-signal
+lines are excluded from what the synthesizer sees. The room appends one
+human-only minutes system line naming the written path and the seq range
+covered, hidden from every seat, and that same line is the completion status.
+`/minutes` runs through the review controller, so `/cancel` works and
+ordinary sends wait, and it is refused while a council round is active.
 
 ### Resumable councils
 
