@@ -2596,17 +2596,93 @@ class GroupChat:
             on_state(agent, effective_state)
         return should_start
 
+    def _plain_turn(
+        self,
+        agent: str,
+        prompt: str,
+        delivered_through: int,
+        cancel_event: threading.Event | None,
+        set_state: Callable[[str, str], None],
+    ) -> dict[str, Any] | None:
+        """Run one ordinary recipient's turn and record its outcome.
+
+        Returns the appended transcript item, or None when local cancellation
+        wins for this recipient and none of its reply may be recorded. The
+        per-recipient handling is identical whether the caller delivers the
+        selected recipients serially or concurrently.
+        """
+        if cancel_event is not None and cancel_event.is_set():
+            set_state(agent, "cancelled")
+            return None
+        set_state(agent, "working")
+        try:
+            if cancel_event is None:
+                status, reply = self.client.turn(
+                    self.agents[agent], prompt, self._timeout_for(agent), agent_label=agent
+                )
+            else:
+                status, reply = self.client.turn(
+                    self.agents[agent],
+                    prompt,
+                    self._timeout_for(agent),
+                    cancel_event,
+                    agent_label=agent,
+                )
+            if cancel_event is not None and cancel_event.is_set():
+                set_state(agent, "cancelled")
+                return None
+            if status == "blocked":
+                item = self.transcript.append(
+                    "system",
+                    ("human",),
+                    f"@{agent} is blocked and needs attention in {self.host_label}.",
+                    kind="turn_blocked",
+                )
+                set_state(agent, "blocked")
+            else:
+                try:
+                    item = self.transcript.append(agent, ("human", "all"), reply)
+                except CredentialRefused:
+                    refused_kind = credential_kind(reply)
+                    item = self.transcript.append(
+                        "system",
+                        ("human",),
+                        f"@{agent}'s reply contained a credential-shaped token "
+                        f"({refused_kind}); refused and not recorded.",
+                        kind="credential_refused",
+                        meta={"agent": agent, "credential_kind": refused_kind},
+                    )
+                    set_state(agent, "failed")
+                else:
+                    set_state(agent, "ready")
+        except ChatError as error:
+            if cancel_event is not None and cancel_event.is_set():
+                set_state(agent, "cancelled")
+                return None
+            item = self.transcript.append(
+                "system",
+                ("human",),
+                f"@{agent}: {error}",
+                kind="turn_failed",
+            )
+            set_state(agent, "failed")
+        if item["sender"] == agent:
+            self.transcript.advance_cursor(agent, delivered_through)
+        return item
+
     def dispatch(
         self,
         text: str,
         cancel_event: threading.Event | None = None,
         on_state: Callable[[str, str], None] | None = None,
     ) -> list[dict[str, Any]]:
-        """Deliver one ordinary message serially, with optional local cancellation.
+        """Deliver one ordinary message, with optional local cancellation.
 
-        Callers that omit the optional hooks retain the original synchronous
-        dispatch contract.  Cancellation is local to this relay: it stops
-        waiting and leaves participant tabs untouched.
+        A plain message selecting several participants fans out to all of
+        them concurrently from one transcript snapshot, so no recipient sees
+        another's reply to this message; a single-recipient message keeps the
+        original serial delivery. Cancellation is local to this relay: it
+        stops waiting and leaves participant tabs untouched.
         """
         route = self.plain_route(text)
         selected = route.recipients[: self.max_turns]
@@ -2617,10 +2693,8 @@ class GroupChat:
             if on_state is not None:
                 on_state(agent, state)
 
-        def cancel_remaining(start: int) -> None:
+        def record_cancellation() -> None:
             nonlocal cancellation_recorded
-            for agent in selected[start:]:
-                set_state(agent, "cancelled")
             if not cancellation_recorded:
                 created.append(
                     self.transcript.append(
@@ -2630,6 +2704,11 @@ class GroupChat:
                     )
                 )
                 cancellation_recorded = True
+
+        def cancel_remaining(start: int) -> None:
+            for agent in selected[start:]:
+                set_state(agent, "cancelled")
+            record_cancellation()
 
         for agent in selected:
             set_state(agent, "queued")
@@ -2665,77 +2744,67 @@ class GroupChat:
                     )
                 )
             cursors = self.transcript.cursors()
-            for index, agent in enumerate(selected):
-                if cancel_event is not None and cancel_event.is_set():
-                    cancel_remaining(index)
-                    break
+            if len(selected) == 1:
+                # A single-recipient message keeps the serial delivery path.
+                for index, agent in enumerate(selected):
+                    if cancel_event is not None and cancel_event.is_set():
+                        cancel_remaining(index)
+                        break
+                    messages = [
+                        item
+                        for item in self.transcript.read()
+                        if item["seq"] > cursors.get(agent, 0)
+                        and item["sender"] != agent
+                        and message_visible_to_agent(item, agent)
+                    ]
+                    delivered_through = max(item["seq"] for item in messages)
+                    token = uuid.uuid4().hex
+                    prompt = build_prompt(agent, messages, token, tuple(self.agents), self.host_label)
+                    item = self._plain_turn(
+                        agent, prompt, delivered_through, cancel_event, set_state
+                    )
+                    if item is None:
+                        cancel_remaining(index + 1)
+                        break
+                    created.append(item)
+                return created
+            # Every recipient is prompted from this one snapshot, so none of
+            # them can see another recipient's reply to this message.
+            snapshot = self.transcript.read()
+            prompts: dict[str, str] = {}
+            delivered_through: dict[str, int] = {}
+            for agent in selected:
                 messages = [
                     item
-                    for item in self.transcript.read()
+                    for item in snapshot
                     if item["seq"] > cursors.get(agent, 0)
                     and item["sender"] != agent
                     and message_visible_to_agent(item, agent)
                 ]
-                delivered_through = max(item["seq"] for item in messages)
-                token = uuid.uuid4().hex
-                prompt = build_prompt(agent, messages, token, tuple(self.agents), self.host_label)
-                set_state(agent, "working")
-                try:
-                    if cancel_event is None:
-                        status, reply = self.client.turn(
-                            self.agents[agent], prompt, self._timeout_for(agent), agent_label=agent
-                        )
+                prompts[agent] = build_prompt(
+                    agent, messages, uuid.uuid4().hex, tuple(self.agents), self.host_label
+                )
+                delivered_through[agent] = max(item["seq"] for item in messages)
+            with ThreadPoolExecutor(
+                max_workers=len(selected), thread_name_prefix="hgchat-plain"
+            ) as pool:
+                futures = {
+                    pool.submit(
+                        self._plain_turn,
+                        agent,
+                        prompts[agent],
+                        delivered_through[agent],
+                        cancel_event,
+                        set_state,
+                    ): agent
+                    for agent in selected
+                }
+                for future in as_completed(futures):
+                    item = future.result()
+                    if item is None:
+                        record_cancellation()
                     else:
-                        status, reply = self.client.turn(
-                            self.agents[agent],
-                            prompt,
-                            self._timeout_for(agent),
-                            cancel_event,
-                            agent_label=agent,
-                        )
-                    if cancel_event is not None and cancel_event.is_set():
-                        set_state(agent, "cancelled")
-                        cancel_remaining(index + 1)
-                        break
-                    if status == "blocked":
-                        item = self.transcript.append(
-                            "system",
-                            ("human",),
-                            f"@{agent} is blocked and needs attention in {self.host_label}.",
-                            kind="turn_blocked",
-                        )
-                        set_state(agent, "blocked")
-                    else:
-                        try:
-                            item = self.transcript.append(agent, ("human", "all"), reply)
-                        except CredentialRefused:
-                            refused_kind = credential_kind(reply)
-                            item = self.transcript.append(
-                                "system",
-                                ("human",),
-                                f"@{agent}'s reply contained a credential-shaped token "
-                                f"({refused_kind}); refused and not recorded.",
-                                kind="credential_refused",
-                                meta={"agent": agent, "credential_kind": refused_kind},
-                            )
-                            set_state(agent, "failed")
-                        else:
-                            set_state(agent, "ready")
-                except ChatError as error:
-                    if cancel_event is not None and cancel_event.is_set():
-                        set_state(agent, "cancelled")
-                        cancel_remaining(index + 1)
-                        break
-                    item = self.transcript.append(
-                        "system",
-                        ("human",),
-                        f"@{agent}: {error}",
-                        kind="turn_failed",
-                    )
-                    set_state(agent, "failed")
-                created.append(item)
-                if item["sender"] == agent:
-                    self.transcript.advance_cursor(agent, delivered_through)
+                        created.append(item)
             return created
 
     def plan_review(self, text: str) -> ReviewRound:

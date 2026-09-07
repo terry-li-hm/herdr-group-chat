@@ -1047,10 +1047,89 @@ def make_cancellation_aware_ordinary_chat(
     return chat, client, transcript
 
 
-def test_ordinary_dispatch_cancellation_skips_late_reply_and_unstarted_recipients(
-    tmp_path: Path,
-) -> None:
+class BarrierPlainClient(FakeClient):
+    """Prove ordinary turns for several recipients run concurrently.
+
+    Every turn waits on a barrier sized to the recipient count, so dispatch
+    only completes when all the turns are in flight at once; a serial
+    delivery trips the bounded barrier wait and fails loudly.
+    """
+
+    def __init__(self, parties: int) -> None:
+        super().__init__()
+        self.in_flight = threading.Barrier(parties)
+
+    def turn(
+        self,
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+        agent_label: str | None = None,
+    ) -> tuple[str, str]:
+        self.calls.append((target, prompt))
+        self.timeouts.append(timeout_ms)
+        self.in_flight.wait(timeout=HARNESS_WAIT_S)
+        return "done", f"reply from {target}"
+
+
+class InFlightCancellationClient(FakeClient):
+    """Hold every ordinary turn in flight until the test cancels and releases."""
+
+    def __init__(self, parties: int) -> None:
+        super().__init__()
+        self.all_in_flight = threading.Event()
+        self.release = threading.Event()
+        self.in_flight = threading.Barrier(parties, action=self.all_in_flight.set)
+
+    def turn(
+        self,
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+        agent_label: str | None = None,
+    ) -> tuple[str, str]:
+        self.calls.append((target, prompt))
+        self.timeouts.append(timeout_ms)
+        self.in_flight.wait(timeout=HARNESS_WAIT_S)
+        assert self.release.wait(HARNESS_WAIT_S)
+        return "done", f"late reply from {target}"
+
+
+def test_precancelled_ordinary_dispatch_prompts_no_recipient(tmp_path: Path) -> None:
     chat, client, transcript = make_blocking_ordinary_chat(tmp_path)
+    cancellation = threading.Event()
+    cancellation.set()
+    states: list[tuple[str, str]] = []
+
+    created = chat.dispatch(
+        "@pi,@claude slow delivery",
+        cancellation,
+        lambda agent, state: states.append((agent, state)),
+    )
+
+    # A recipient that would block forever is never prompted: the delivery
+    # is cancelled before any turn starts, so the test would hang loudly on
+    # a regression instead of recording a reply.
+    assert client.calls == []
+    assert [item["sender"] for item in created] == ["system"]
+    assert transcript.cursors() == {}
+    assert states == [
+        ("pi", "queued"),
+        ("claude", "queued"),
+        ("pi", "cancelled"),
+        ("claude", "cancelled"),
+    ]
+    assert transcript.read()[-1]["body"] == (
+        "Ordinary delivery cancelled locally; participants may continue working."
+    )
+
+
+def test_parallel_delivery_cancelled_in_flight_records_no_reply(tmp_path: Path) -> None:
+    transcript = Transcript(tmp_path, "parallel-cancel-room")
+    client = InFlightCancellationClient(parties=2)
+    chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client)
     cancellation = threading.Event()
     states: list[tuple[str, str]] = []
     created: list[dict[str, object]] = []
@@ -1065,22 +1144,52 @@ def test_ordinary_dispatch_cancellation_skips_late_reply_and_unstarted_recipient
         )
     )
     worker.start()
-    assert client.started.wait(HARNESS_WAIT_S)
+    assert client.all_in_flight.wait(HARNESS_WAIT_S)
     cancellation.set()
     client.release.set()
     worker.join(HARNESS_WAIT_S)
 
     assert not worker.is_alive()
-    assert [target for target, _ in client.calls] == ["pi-peer"]
+    assert {target for target, _ in client.calls} == {"pi-peer", "claude-peer"}
     assert [item["sender"] for item in created] == ["human", "system"]
     assert transcript.cursors() == {}
-    assert states[-2:] == [("pi", "cancelled"), ("claude", "cancelled")]
-    assert transcript.read()[-1]["body"] == (
+    assert set(states[-2:]) == {("pi", "cancelled"), ("claude", "cancelled")}
+    assert ("pi", "ready") not in states
+    assert ("claude", "ready") not in states
+    cancellation_lines = [item for item in transcript.read() if item["sender"] == "system"]
+    assert len(cancellation_lines) == 1
+    assert cancellation_lines[0]["body"] == (
         "Ordinary delivery cancelled locally; participants may continue working."
     )
 
 
-def test_ordinary_dispatch_callbacks_preserve_serial_transcript_and_cursors(tmp_path: Path) -> None:
+def test_parallel_ordinary_delivery_prompts_both_recipients_concurrently(
+    tmp_path: Path,
+) -> None:
+    transcript = Transcript(tmp_path, "parallel-plain-room")
+    client = BarrierPlainClient(parties=2)
+    chat = GroupChat(transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client)
+
+    created = chat.dispatch("@pi,@claude concurrent proof")
+
+    assert {target for target, _ in client.calls} == {"pi-peer", "claude-peer"}
+    assert created[0]["sender"] == "human"
+    assert {item["sender"] for item in created[1:]} == {"pi", "claude"}
+    assert transcript.cursors() == {"pi": created[0]["seq"], "claude": created[0]["seq"]}
+
+
+def test_single_recipient_ordinary_dispatch_keeps_one_serial_turn(tmp_path: Path) -> None:
+    chat, client, transcript = make_chat(tmp_path)
+
+    created = chat.dispatch("@pi one recipient only")
+
+    assert [target for target, _ in client.calls] == ["pi-peer"]
+    assert [item["sender"] for item in created] == ["human", "pi"]
+    assert created[1]["body"] == "reply from pi-peer"
+    assert transcript.cursors() == {"pi": created[0]["seq"]}
+
+
+def test_ordinary_dispatch_callbacks_preserve_parallel_blind_delivery(tmp_path: Path) -> None:
     chat, _, transcript = make_chat(tmp_path)
     states: list[tuple[str, str]] = []
 
@@ -1089,16 +1198,13 @@ def test_ordinary_dispatch_callbacks_preserve_serial_transcript_and_cursors(tmp_
         on_state=lambda agent, state: states.append((agent, state)),
     )
 
-    assert [item["sender"] for item in created] == ["human", "pi", "claude"]
-    assert transcript.cursors() == {"pi": created[0]["seq"], "claude": created[1]["seq"]}
-    assert states == [
-        ("pi", "queued"),
-        ("claude", "queued"),
-        ("pi", "working"),
-        ("pi", "ready"),
-        ("claude", "working"),
-        ("claude", "ready"),
-    ]
+    assert states[:2] == [("pi", "queued"), ("claude", "queued")]
+    for agent in ("pi", "claude"):
+        assert states.index((agent, "working")) < states.index((agent, "ready"))
+    assert created[0]["sender"] == "human"
+    assert {item["sender"] for item in created} == {"human", "pi", "claude"}
+    assert len(created) == 3
+    assert transcript.cursors() == {"pi": created[0]["seq"], "claude": created[0]["seq"]}
 
 
 def test_delivery_controller_rejects_second_work_until_its_worker_drains(tmp_path: Path) -> None:
@@ -2353,33 +2459,34 @@ def test_cursor_replace_fsyncs_file_and_parent_directory(
     assert synced_types == ["file", "directory"]
 
 
-def test_all_dispatch_is_serial_and_incremental(tmp_path: Path) -> None:
+def test_all_dispatch_is_parallel_and_blind(tmp_path: Path) -> None:
     chat, client, transcript = make_chat(tmp_path)
     created = chat.dispatch("@all choose a design")
 
-    assert [target for target, _ in client.calls] == [
+    assert {target for target, _ in client.calls} == {
         "pi-peer",
         "claude-peer",
         "codex-peer",
         "grok-peer",
-    ]
-    assert [item["sender"] for item in created] == [
-        "human",
-        "pi",
-        "claude",
-        "codex",
-        "grok",
-    ]
-    assert "[pi] reply from pi-peer" in client.calls[1][1]
-    assert "[claude] reply from claude-peer" in client.calls[2][1]
-    assert "[codex] reply from codex-peer" in client.calls[3][1]
-    assert "[pi] reply from pi-peer" not in client.calls[0][1]
+    }
+    assert created[0]["sender"] == "human"
+    assert {item["sender"] for item in created[1:]} == {"pi", "claude", "codex", "grok"}
+    assert len(created) == 5
+    turn_one_replies = (
+        "[pi] reply from pi-peer",
+        "[claude] reply from claude-peer",
+        "[codex] reply from codex-peer",
+        "[grok] reply from grok-peer",
+    )
+    assert all(reply not in prompt for _, prompt in client.calls for reply in turn_one_replies)
     assert len(transcript.read()) == 5
 
     chat.dispatch("@pi second question")
     second_pi_prompt = client.calls[-1][1]
     assert "[human] second question" in second_pi_prompt
     assert "[human] choose a design" not in second_pi_prompt
+    assert "[pi] reply from pi-peer" not in second_pi_prompt
+    assert "[claude] reply from claude-peer" in second_pi_prompt
 
 
 def test_message_appended_by_another_process_during_turn_stays_eligible(
@@ -2474,7 +2581,7 @@ def test_independent_same_agent_dispatches_do_not_duplicate_delivery(tmp_path: P
 def test_max_turns_caps_an_all_round(tmp_path: Path) -> None:
     chat, client, _ = make_chat(tmp_path, max_turns=2)
     chat.dispatch("@all bounded")
-    assert [target for target, _ in client.calls] == ["pi-peer", "claude-peer"]
+    assert {target for target, _ in client.calls} == {"pi-peer", "claude-peer"}
 
 
 def test_direct_message_calls_only_one_agent(tmp_path: Path) -> None:
@@ -2488,13 +2595,14 @@ def test_plain_message_goes_to_every_participant_on_a_fresh_room(tmp_path: Path)
 
     created = chat.dispatch("hello")
 
-    assert [item["sender"] for item in created] == ["human", "pi", "claude", "codex", "grok"]
-    assert [target for target, _ in client.calls] == [
+    assert created[0]["sender"] == "human"
+    assert {item["sender"] for item in created} == {"human", "pi", "claude", "codex", "grok"}
+    assert {target for target, _ in client.calls} == {
         "pi-peer",
         "claude-peer",
         "codex-peer",
         "grok-peer",
-    ]
+    }
     assert transcript.read()[0]["recipients"] == ["pi", "claude", "codex", "grok"]
 
 
@@ -2516,17 +2624,17 @@ def test_multi_recipient_and_all_sends_widen_the_focus_to_that_set(tmp_path: Pat
     chat.dispatch("@claude,@codex x")
     client.calls.clear()
     chat.dispatch("next")
-    assert [target for target, _ in client.calls] == ["claude-peer", "codex-peer"]
+    assert {target for target, _ in client.calls} == {"claude-peer", "codex-peer"}
 
     chat.dispatch("@all x")
     client.calls.clear()
     chat.dispatch("next")
-    assert [target for target, _ in client.calls] == [
+    assert {target for target, _ in client.calls} == {
         "pi-peer",
         "claude-peer",
         "codex-peer",
         "grok-peer",
-    ]
+    }
 
 
 def test_finished_review_round_leaves_the_focus_on_the_reviewers(tmp_path: Path) -> None:
@@ -2536,8 +2644,9 @@ def test_finished_review_round_leaves_the_focus_on_the_reviewers(tmp_path: Path)
     client.calls.clear()
     created = chat.dispatch("next")
 
-    assert [item["sender"] for item in created] == ["human", "claude", "codex"]
-    assert [target for target, _ in client.calls] == ["claude-peer", "codex-peer"]
+    assert created[0]["sender"] == "human"
+    assert {item["sender"] for item in created} == {"human", "claude", "codex"}
+    assert {target for target, _ in client.calls} == {"claude-peer", "codex-peer"}
 
 
 def test_unmentioned_review_and_consensus_still_select_every_participant(
@@ -2577,7 +2686,8 @@ def test_a_fully_departed_focus_falls_back_to_everyone(tmp_path: Path) -> None:
     assert chat.focus() == ("pi", "claude")
     created = chat.dispatch("next")
 
-    assert [item["sender"] for item in created] == ["human", "pi", "claude"]
+    assert created[0]["sender"] == "human"
+    assert {item["sender"] for item in created} == {"human", "pi", "claude"}
 
 
 def test_focus_label_names_the_current_focus(tmp_path: Path) -> None:
@@ -4211,19 +4321,15 @@ def test_failed_turn_does_not_drop_context_and_later_agents_continue(tmp_path: P
     client.turn = fail_pi_once
     created = chat.dispatch("@all preserve this")
 
-    assert [item["sender"] for item in created] == [
-        "human",
-        "system",
-        "claude",
-        "codex",
-        "grok",
-    ]
-    assert [target for target, _ in client.calls] == [
+    assert created[0]["sender"] == "human"
+    assert {item["sender"] for item in created} == {"human", "system", "claude", "codex", "grok"}
+    assert len([item for item in created if item["kind"] == "turn_failed"]) == 1
+    assert {target for target, _ in client.calls} == {
         "pi-peer",
         "claude-peer",
         "codex-peer",
         "grok-peer",
-    ]
+    }
 
     chat.dispatch("@pi retry")
     retry_prompt = client.calls[-1][1]
@@ -8081,11 +8187,10 @@ def test_profile_room_routes_only_astra_and_fable_and_composes_review_and_anneal
     chat.review("challenge this plan")
     chat.anneal("@astra,@fable harden this plan")
 
-    assert [item["sender"] for item in created] == ["human", "astra", "fable"]
-    assert [target for target, _prompt in client.calls if "group chat" in _prompt][:2] == [
-        "astra-peer",
-        "fable-peer",
-    ]
+    assert created[0]["sender"] == "human"
+    assert {item["sender"] for item in created} == {"human", "astra", "fable"}
+    plain_routes = [target for target, _prompt in client.calls if "group chat" in _prompt][:2]
+    assert set(plain_routes) == {"astra-peer", "fable-peer"}
     kinds = [(item["sender"], item["kind"]) for item in transcript.read()]
     assert ("astra", "review_synthesis") in kinds
     assert ("astra", "anneal_final") in kinds

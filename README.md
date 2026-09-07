@@ -555,8 +555,10 @@ disclosure boundary applies to anything addressed to `@glm`.
 
 ## Limitations
 
-- Ordinary group turns remain serial. `/review`, `/anneal`, and `/consensus`
-  blind passes are parallel; consensus votes are also parallel.
+- Ordinary messages to several participants are delivered concurrently and
+  blind for that turn: every recipient is prompted from the same snapshot,
+  so none sees another's reply to the same message. `/review` remains the
+  mode for a synthesised round.
 - Every addressed agent must already be live in Herdr.
 - New-room setup starts the four classic participants, the two bounded
   `astra-fable` participants, or one of the three-role `astra-fable-grok`,

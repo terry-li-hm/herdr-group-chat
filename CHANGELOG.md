@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+- **Plain messages to several participants are now delivered in parallel and
+  blind for that turn.** `GroupChat.dispatch` fans a multi-recipient ordinary
+  message out through a `hgchat-plain` thread pool, prompting every recipient
+  concurrently from one transcript snapshot so no recipient sees another's
+  reply to the same message; replies are recorded in completion order, the
+  turn cap and route/focus logic are unchanged, and a single-recipient
+  message keeps the original serial delivery. `/review` remains the mode for
+  a synthesised round.
 - **A long-running Pi peer no longer fails re-verification once its session
   file passes 64 KiB.** `pi_session_proves` reads only the first 64 KiB of
   the session JSONL, so a peer that had done enough work grew a file whose
