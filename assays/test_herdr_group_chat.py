@@ -11165,6 +11165,8 @@ def test_goal_prompt_is_blind_and_bounded_in_round_one() -> None:
     assert "unattended round 1 of 4" in prompt
     assert "using your ordinary tools where that helps" in prompt
     assert "create or edit files inside your own session's working tree" in prompt
+    assert "One writer per file" in prompt
+    assert "never edit a path another participant named in an earlier round" in prompt
     assert (
         "must not send messages, push, publish, delete, "
         "or take any action outside your session" in prompt

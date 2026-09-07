@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+- **`/goal` prompt: one writer per file.** Each seat must name every path it edits and never edit a path another participant named in an earlier round of the goal, so two seats cannot edit the same note at once.
+
 ## [0.14.0] - 2026-09-07
 
 - **New `/goal` room command: unattended collaboration rounds with a
