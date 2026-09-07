@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+- **Mouse reports never leak into the input line on keypad-aware hosts.**
+  Hosts whose terminfo defines `kmous=\E[<` make curses consume `\x1b[<`
+  itself under `keypad(True)`, so `MouseAwareKeyReader` received
+  `curses.KEY_MOUSE` followed by the bare report body and typed the digits
+  into the buffer (`0;13;40M0;13;40` on a click). The reader now folds the
+  `KEY_MOUSE` prefix exactly like a leading ESC whose `[<` was already eaten:
+  wheel bodies become scroll events, every other complete report is ignored,
+  and an incomplete body is pushed back with the bare `KEY_MOUSE` dropped.
+  Wheel scrolling now also works on such hosts.
 - **Room turns are delivered by nudge-and-pull.** The full turn prompt is now
   written to `<state-dir>/<room>.turns/<token>.md` (0o700 directory, 0o600
   file) and the peer receives a single-line nudge naming the file, so the

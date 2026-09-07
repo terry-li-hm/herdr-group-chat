@@ -1544,6 +1544,97 @@ def test_raw_sgr_wheel_bytes_scroll_by_three_and_non_wheel_reports_are_ignored(
     assert "\x1b" not in prompt and "[<" not in prompt
 
 
+class ReportBodyScreen:
+    """Fake screen yielding keys one at a time for MouseAwareKeyReader."""
+
+    def __init__(self, keys: list[object]) -> None:
+        self.keys = list(keys)
+
+    def get_wch(self) -> object:
+        return self.keys.pop(0)
+
+
+def test_key_mouse_click_press_body_folds_to_ignored_and_keeps_the_next_key() -> None:
+    reader = module.MouseAwareKeyReader(
+        ReportBodyScreen([module.curses.KEY_MOUSE, *list("0;13;40M"), "x"])
+    )
+    assert reader.read() is module.WheelEvent.IGNORED
+    assert reader.read() == "x"
+
+
+def test_key_mouse_bodies_classify_wheel_presses_and_releases() -> None:
+    def read_body(body: str) -> object:
+        keys: list[object] = [module.curses.KEY_MOUSE, *list(body)]
+        reader = module.MouseAwareKeyReader(ReportBodyScreen(keys))
+        return reader.read()
+
+    assert read_body("64;13;40M") is module.WheelEvent.UP
+    assert read_body("65;13;40M") is module.WheelEvent.DOWN
+    assert read_body("0;13;40m") is module.WheelEvent.IGNORED
+
+
+def test_key_mouse_without_a_report_body_returns_none_then_the_next_key() -> None:
+    reader = module.MouseAwareKeyReader(ReportBodyScreen([module.curses.KEY_MOUSE, "a", "b"]))
+    assert reader.read() is None
+    assert reader.read() == "a"
+    assert reader.read() == "b"
+
+
+def test_key_mouse_reports_scroll_and_never_leak_digits_into_the_typed_buffer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, client, transcript = make_chat(tmp_path)
+    scrolls: list[int] = []
+
+    class KeyScreen:
+        def __init__(self, keys: list[object]) -> None:
+            self.keys = keys
+
+        def keypad(self, _enabled: bool) -> None:
+            pass
+
+        def timeout(self, _milliseconds: int) -> None:
+            pass
+
+        def get_wch(self) -> object:
+            key = self.keys.pop(0)
+            if key == "WAIT_DELIVERY":
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and len(transcript.read()) < 2:
+                    time.sleep(0.005)
+                return self.keys.pop(0)
+            return key
+
+    def track_draw(*args: object, **_kwargs: object) -> int:
+        scrolls.append(int(args[6]) if len(args) > 6 else 0)
+        return 100
+
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    monkeypatch.setattr(module, "draw_tui", track_draw)
+    screen = KeyScreen(
+        [
+            module.curses.KEY_MOUSE,
+            *list("64;23;1M"),
+            module.curses.KEY_MOUSE,
+            *list("0;13;40M"),
+            module.curses.KEY_MOUSE,
+            *list("65;23;1M"),
+            *list("@pi typed only\n"),
+            "WAIT_DELIVERY",
+            "\x11",
+        ]
+    )
+
+    run_tui(screen, chat, "key-mouse-room")
+
+    assert scrolls[:4] == [0, 3, 3, 0]
+    assert all(scroll == 0 for scroll in scrolls[4:])
+    assert [target for target, _ in client.calls] == ["pi-peer"]
+    prompt = client.calls[0][1]
+    assert "typed only" in prompt
+    assert "64;23;1" not in prompt and "0;13;40" not in prompt
+
+
 def test_home_and_end_jump_to_oldest_and_newest_lines(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

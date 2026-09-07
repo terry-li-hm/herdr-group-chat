@@ -5160,9 +5160,13 @@ def parse_sgr_mouse_report(report: str) -> WheelEvent | None:
 class MouseAwareKeyReader:
     """Read one key at a time, folding SGR wheel reports into wheel events.
 
-    Bytes that do not form an SGR mouse report are pushed back unchanged, so a
-    lone ESC, printable text, and translated function keys keep their exact
-    old meanings and no mouse bytes ever reach the input buffer.
+    Both report prefixes fold the same way: a literal ESC from hosts whose
+    curses passes mouse bytes through untouched, and curses.KEY_MOUSE from
+    hosts whose terminfo kmous entry lets curses consume the "\x1b[<" prefix
+    itself and return the bare body. Bytes that do not form an SGR mouse
+    report are pushed back unchanged, so a lone ESC, printable text, and
+    translated function keys keep their exact old meanings and no mouse bytes
+    ever reach the input buffer.
     """
 
     def __init__(self, screen: Any) -> None:
@@ -5174,14 +5178,8 @@ class MouseAwareKeyReader:
             return self._pushback.popleft()
         return self._screen.get_wch()
 
-    def read(self) -> object | None:
-        """Return the next key, a WheelEvent, or None on a read timeout."""
-        try:
-            key = self._next()
-        except curses.error:
-            return None
-        if not isinstance(key, str) or key != "\x1b":
-            return key
+    def _collect_report_body(self) -> list[str]:
+        """Collect the keys of one SGR mouse report body after its prefix."""
         collected: list[str] = []
         while len(collected) < MOUSE_REPORT_MAX_CHARS:
             try:
@@ -5194,6 +5192,30 @@ class MouseAwareKeyReader:
             collected.append(following)
             if following in "Mm":
                 break
+        return collected
+
+    def read(self) -> object | None:
+        """Return the next key, a WheelEvent, or None on a read timeout."""
+        try:
+            key = self._next()
+        except curses.error:
+            return None
+        if key == curses.KEY_MOUSE:
+            # Hosts whose terminfo defines kmous=\E[< make curses itself eat
+            # "\x1b[<" under keypad(True) and return KEY_MOUSE followed by the
+            # bare report body, so fold that body exactly like a leading ESC
+            # whose "[<" prefix was already consumed. An incomplete body is
+            # pushed back and the bare KEY_MOUSE dropped; neither the integer
+            # nor its digits may ever reach the key loop as text.
+            body = self._collect_report_body()
+            wheel = parse_sgr_mouse_report("[<" + "".join(body))
+            if wheel is not None:
+                return wheel
+            self._pushback.extendleft(reversed(body))
+            return None
+        if not isinstance(key, str) or key != "\x1b":
+            return key
+        collected = self._collect_report_body()
         wheel = parse_sgr_mouse_report("".join(collected))
         if wheel is not None:
             return wheel
