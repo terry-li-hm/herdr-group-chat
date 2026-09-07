@@ -133,12 +133,11 @@ description = "new group chat (Astra + Fable + Grok)"
 
 ## Use
 
-Plain messages go to the participant you are currently talking to, not to
-everyone: the single recipient of your most recent message when it named
-exactly one current participant, and otherwise the lead, which defaults to the
-synthesizer and can be set with `--lead NAME`. While the room is idle the
-status row shows `To: @name` so the destination is always visible before you
-send. Fan-out stays explicit; prefix a message to select participants:
+Plain messages follow whoever you last addressed: they go to the recipients of
+your most recent message, kept to current participants, and a fresh room
+starts addressed to everyone. The status row shows the current target as
+`To: @all` or `To: @name` before you send. Fan-out stays visible there too;
+prefix a message to select participants:
 
 ```text
 @all Review this email draft and agree the two most important changes.

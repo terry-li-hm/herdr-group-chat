@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+- **Plain messages follow the last addressed set.** A plain message now goes
+  to the recipients of your most recent message, filtered to current
+  participants in roster order, and a fresh room starts addressed to everyone,
+  replacing the reset-to-lead behaviour. The status row renders the focus as
+  `To: @all` when it covers the full roster and `To: @a,@b` otherwise. The
+  `--lead` flag, the `lead` constructor kwarg, and the `unknown lead` error
+  are removed with no alias or deprecation shim.
 - **The relay refuses credential-shaped payloads.** Every transcript append
   and every turn payload file now passes `credential_kind` before it is
   written; AWS access keys, private-key blocks, JWTs, GitHub, OpenAI-style,

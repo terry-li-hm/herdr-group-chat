@@ -1156,7 +1156,7 @@ def test_delivery_controller_final_status_lookup_keeps_controls_responsive(tmp_p
 
     client.release_states.set()
     assert controller.wait(HARNESS_WAIT_S)
-    assert controller.status() == "To: @pi · Delivered. @pi ready"
+    assert controller.status() == "To: @all · Delivered. @pi ready"
 
 
 class ScriptedTuiScreen:
@@ -1318,7 +1318,7 @@ def test_tui_clears_completed_delivery_notice_before_review(
     assert reviews[0].status() == "Review complete."
 
 
-def test_tui_idle_status_row_names_the_sticky_addressee(
+def test_tui_idle_status_row_names_the_current_focus(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     chat, _, _ = make_chat(tmp_path)
@@ -1345,7 +1345,7 @@ def test_tui_idle_status_row_names_the_sticky_addressee(
 
     run_tui(ExitScreen(), chat, "idle-focus-room")
 
-    assert draws == ["To: @pi · Ready. @pi ready · @claude working · @codex ready · @grok blocked"]
+    assert draws == ["To: @all · Ready. @pi ready · @claude working · @codex ready · @grok blocked"]
 
 
 def test_tui_adopts_terminal_default_colours_before_first_draw(
@@ -2483,17 +2483,22 @@ def test_direct_message_calls_only_one_agent(tmp_path: Path) -> None:
     assert [target for target, _ in client.calls] == ["grok-peer"]
 
 
-def test_plain_message_goes_to_the_lead_on_a_fresh_room(tmp_path: Path) -> None:
+def test_plain_message_goes_to_every_participant_on_a_fresh_room(tmp_path: Path) -> None:
     chat, client, transcript = make_chat(tmp_path)
 
     created = chat.dispatch("hello")
 
-    assert [item["sender"] for item in created] == ["human", "pi"]
-    assert [target for target, _ in client.calls] == ["pi-peer"]
-    assert transcript.read()[0]["recipients"] == ["pi"]
+    assert [item["sender"] for item in created] == ["human", "pi", "claude", "codex", "grok"]
+    assert [target for target, _ in client.calls] == [
+        "pi-peer",
+        "claude-peer",
+        "codex-peer",
+        "grok-peer",
+    ]
+    assert transcript.read()[0]["recipients"] == ["pi", "claude", "codex", "grok"]
 
 
-def test_plain_message_sticks_to_the_last_single_recipient(tmp_path: Path) -> None:
+def test_plain_message_follows_the_last_single_recipient(tmp_path: Path) -> None:
     chat, client, transcript = make_chat(tmp_path)
     chat.dispatch("@claude something")
     client.calls.clear()
@@ -2506,28 +2511,33 @@ def test_plain_message_sticks_to_the_last_single_recipient(tmp_path: Path) -> No
     assert [item["recipients"] for item in human_sends] == [["claude"], ["claude"]]
 
 
-def test_multi_recipient_and_all_sends_reset_the_focus_to_the_lead(tmp_path: Path) -> None:
+def test_multi_recipient_and_all_sends_widen_the_focus_to_that_set(tmp_path: Path) -> None:
     chat, client, _ = make_chat(tmp_path)
     chat.dispatch("@claude,@codex x")
     client.calls.clear()
     chat.dispatch("next")
-    assert [target for target, _ in client.calls] == ["pi-peer"]
+    assert [target for target, _ in client.calls] == ["claude-peer", "codex-peer"]
 
     chat.dispatch("@all x")
     client.calls.clear()
     chat.dispatch("next")
-    assert [target for target, _ in client.calls] == ["pi-peer"]
+    assert [target for target, _ in client.calls] == [
+        "pi-peer",
+        "claude-peer",
+        "codex-peer",
+        "grok-peer",
+    ]
 
 
-def test_finished_review_round_resets_the_focus_to_the_lead(tmp_path: Path) -> None:
+def test_finished_review_round_leaves_the_focus_on_the_reviewers(tmp_path: Path) -> None:
     chat, client, _ = make_chat(tmp_path)
 
     chat.review("@claude,@codex challenge this")
     client.calls.clear()
     created = chat.dispatch("next")
 
-    assert [item["sender"] for item in created] == ["human", "pi"]
-    assert [target for target, _ in client.calls] == ["pi-peer"]
+    assert [item["sender"] for item in created] == ["human", "claude", "codex"]
+    assert [target for target, _ in client.calls] == ["claude-peer", "codex-peer"]
 
 
 def test_unmentioned_review_and_consensus_still_select_every_participant(
@@ -2540,8 +2550,23 @@ def test_unmentioned_review_and_consensus_still_select_every_participant(
     assert consensus.reviewers == ("pi", "claude", "codex", "grok")
 
 
-def test_departed_participant_name_falls_back_to_the_lead(tmp_path: Path) -> None:
+def test_departed_names_are_dropped_from_the_focus(tmp_path: Path) -> None:
     transcript = Transcript(tmp_path, "departed-room")
+    transcript.append("human", ("claude", "grok"), "are you there")
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer"},
+        FakeClient(),
+    )
+
+    assert chat.focus() == ("claude",)
+    created = chat.dispatch("next")
+
+    assert [item["sender"] for item in created] == ["human", "claude"]
+
+
+def test_a_fully_departed_focus_falls_back_to_everyone(tmp_path: Path) -> None:
+    transcript = Transcript(tmp_path, "fully-departed-room")
     transcript.append("human", ("grok",), "are you there")
     chat = GroupChat(
         transcript,
@@ -2549,64 +2574,21 @@ def test_departed_participant_name_falls_back_to_the_lead(tmp_path: Path) -> Non
         FakeClient(),
     )
 
-    assert chat.focus() == "pi"
+    assert chat.focus() == ("pi", "claude")
     created = chat.dispatch("next")
 
-    assert [item["sender"] for item in created] == ["human", "pi"]
+    assert [item["sender"] for item in created] == ["human", "pi", "claude"]
 
 
-def test_focus_label_tracks_the_sticky_addressee(tmp_path: Path) -> None:
+def test_focus_label_names_the_current_focus(tmp_path: Path) -> None:
     chat, _, _ = make_chat(tmp_path)
-    assert focus_label(chat) == "To: @pi"
+    assert focus_label(chat) == "To: @all"
     chat.dispatch("@codex something")
     assert focus_label(chat) == "To: @codex"
-    chat.dispatch("@all everything")
-    assert focus_label(chat) == "To: @pi"
-
-
-def test_lead_defaults_to_the_synthesizer_and_validates_like_one(tmp_path: Path) -> None:
-    chat, _, _ = make_chat(tmp_path)
-    assert chat.lead == "pi"
-
-    explicit = GroupChat(
-        Transcript(tmp_path, "lead-room"),
-        {"pi": "pi-peer", "claude": "claude-peer"},
-        FakeClient(),
-        synthesizer="claude",
-        lead="pi",
-    )
-    assert explicit.lead == "pi"
-    assert explicit.focus() == "pi"  # the lead, not the synthesizer, is the fallback
-
-    with pytest.raises(ChatError, match="unknown lead: @nobody"):
-        GroupChat(
-            Transcript(tmp_path, "lead-room"),
-            {"pi": "pi-peer", "claude": "claude-peer"},
-            FakeClient(),
-            lead="nobody",
-        )
-
-
-def test_plain_message_goes_to_an_explicit_lead(tmp_path: Path) -> None:
-    client = FakeClient()
-    chat = GroupChat(
-        Transcript(tmp_path, "explicit-lead-room"),
-        {
-            "pi": "pi-peer",
-            "claude": "claude-peer",
-            "codex": "codex-peer",
-            "grok": "grok-peer",
-        },
-        client,
-        lead="grok",
-    )
     chat.dispatch("@claude,@codex x")
-    client.calls.clear()
-
-    created = chat.dispatch("next")
-
-    assert [item["sender"] for item in created] == ["human", "grok"]
-    assert [target for target, _ in client.calls] == ["grok-peer"]
+    assert focus_label(chat) == "To: @claude,@codex"
+    chat.dispatch("@all everything")
+    assert focus_label(chat) == "To: @all"
 
 
 def test_codex_is_addressable_and_roster_is_derived() -> None:
@@ -8458,7 +8440,7 @@ def test_once_plain_messages_follow_the_persisted_focus_like_tui_sends(
     monkeypatch.delenv(namespace["PROFILE_RECEIPT_ENV"], raising=False)
     monkeypatch.delenv("HERDR_GROUP_CHAT_SETUP_FAILURES", raising=False)
     monkeypatch.delenv("HERDR_GROUP_CHAT_SYNTHESIZER", raising=False)
-    base = ["--state-dir", str(tmp_path), "--room", "sticky-once"]
+    base = ["--state-dir", str(tmp_path), "--room", "focus-once"]
 
     assert main([*base, "--once", "hello"]) == 0
     assert main([*base, "--once", "@claude something"]) == 0
@@ -8467,44 +8449,18 @@ def test_once_plain_messages_follow_the_persisted_focus_like_tui_sends(
     out = capsys.readouterr().out
     assert "human> hello" in out
     assert "pi> reply from pi-peer" in out
-    assert out.count("claude> reply from claude-peer") == 2
+    assert out.count("claude> reply from claude-peer") == 3
     human_sends = [
-        item for item in Transcript(tmp_path, "sticky-once").read() if item["sender"] == "human"
+        item for item in Transcript(tmp_path, "focus-once").read() if item["sender"] == "human"
     ]
-    assert [item["recipients"] for item in human_sends] == [["pi"], ["claude"], ["claude"]]
+    assert [item["recipients"] for item in human_sends] == [
+        ["pi", "claude", "codex", "grok"],
+        ["claude"],
+        ["claude"],
+    ]
 
 
-def test_main_rejects_an_unknown_lead_before_any_delivery(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    class StaticClient(FakeClient):
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            super().__init__()
-
-    monkeypatch.setattr(module, "HerdrClient", StaticClient)
-    monkeypatch.delenv(namespace["PROFILE_RECEIPT_ENV"], raising=False)
-    monkeypatch.delenv("HERDR_GROUP_CHAT_SETUP_FAILURES", raising=False)
-
-    assert (
-        main(
-            [
-                "--state-dir",
-                str(tmp_path),
-                "--room",
-                "unknown-lead-room",
-                "--lead",
-                "nobody",
-                "--once",
-                "hi",
-            ]
-        )
-        == 2
-    )
-    assert "unknown lead: @nobody" in capsys.readouterr().err
-    assert Transcript(tmp_path, "unknown-lead-room").read() == []
-
-
-def test_main_lead_receives_plain_once_messages(
+def test_main_plain_once_message_on_a_fresh_room_reaches_every_participant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class StaticClient(FakeClient):
@@ -8521,9 +8477,7 @@ def test_main_lead_receives_plain_once_messages(
                 "--state-dir",
                 str(tmp_path),
                 "--room",
-                "lead-once-room",
-                "--lead",
-                "grok",
+                "fresh-once-room",
                 "--once",
                 "hello",
             ]
@@ -8531,9 +8485,9 @@ def test_main_lead_receives_plain_once_messages(
         == 0
     )
 
-    records = Transcript(tmp_path, "lead-once-room").read()
+    records = Transcript(tmp_path, "fresh-once-room").read()
     human_sends = [item for item in records if item["sender"] == "human"]
-    assert [item["recipients"] for item in human_sends] == [["grok"]]
+    assert [item["recipients"] for item in human_sends] == [["pi", "claude", "codex", "grok"]]
     assert records[-1]["sender"] == "grok"
 
 

@@ -2510,7 +2510,6 @@ class GroupChat:
         synthesizer: str = "pi",
         agent_timeouts: dict[str, int] | None = None,
         host_label: str = "Herdr",
-        lead: str | None = None,
     ) -> None:
         if max_turns < 1:
             raise ChatError("max turns must be positive")
@@ -2522,15 +2521,12 @@ class GroupChat:
         self.room_tab_id = room_tab_id
         if synthesizer not in agents:
             raise ChatError(f"unknown synthesizer: @{synthesizer}")
-        if lead is not None and lead not in agents:
-            raise ChatError(f"unknown lead: @{lead}")
         duplicates = sorted(
             target for target in set(agents.values()) if list(agents.values()).count(target) > 1
         )
         if duplicates:
             raise ChatError(f"agent targets must be unique: {', '.join(duplicates)}")
         self.synthesizer = synthesizer
-        self.lead = synthesizer if lead is None else lead
         self.agent_timeouts = dict(agent_timeouts or {})
         self.host_label = host_label
         self.transcript.prune_turns()
@@ -2545,30 +2541,28 @@ class GroupChat:
     def _timeout_for(self, agent: str) -> int | None:
         return self.agent_timeouts.get(agent)
 
-    def focus(self) -> str:
-        """Name the participant a plain message currently addresses.
+    def focus(self) -> tuple[str, ...]:
+        """Name the participants a plain message currently addresses.
 
-        The focus sticks to the recipient of the most recent human message
-        when that message named exactly one current participant; every other
-        shape (no human message yet, several recipients, or a name that is no
-        longer a participant) falls back to the lead.
+        The focus follows the recipients of the most recent human message,
+        kept in roster order and filtered to current participants; a fresh
+        room, or a last entry whose recipients have all departed, addresses
+        every participant.
         """
         for item in reversed(self.transcript.read()):
             if item.get("sender") != "human":
                 continue
             recipients = item.get("recipients")
-            if (
-                isinstance(recipients, list)
-                and len(recipients) == 1
-                and recipients[0] in self.agents
-            ):
-                return recipients[0]
-            return self.lead
-        return self.lead
+            if isinstance(recipients, list):
+                names = tuple(name for name in self.agents if name in recipients)
+                if names:
+                    return names
+            return tuple(self.agents)
+        return tuple(self.agents)
 
     def plain_route(self, text: str) -> Route:
         """Parse one ordinary send so plain text follows the current focus."""
-        return parse_route(text, tuple(self.agents), default=(self.focus(),))
+        return parse_route(text, tuple(self.agents), default=self.focus())
 
     @staticmethod
     def _set_review_state(
@@ -5068,7 +5062,10 @@ def participant_status(chat: GroupChat, prefix: str = "") -> str:
 
 def focus_label(chat: GroupChat) -> str:
     """Render where the next plain message goes."""
-    return f"To: @{chat.focus()}"
+    focus = chat.focus()
+    if focus == tuple(chat.agents):
+        return "To: @all"
+    return "To: @" + ",@".join(focus)
 
 
 def place_room_layout(
@@ -5692,11 +5689,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--synthesizer",
         default=None,
     )
-    parser.add_argument(
-        "--lead",
-        metavar="NAME",
-        default=None,
-    )
     parser.add_argument("--profile", choices=sorted(PROFILE_ROLES), default=None)
     parser.add_argument("--agents-workspace", default=os.environ.get(AGENTS_WORKSPACE_ENV))
     parser.add_argument("--once", metavar="MESSAGE")
@@ -5765,7 +5757,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             room_tab_id=os.environ.get(ROOM_TAB_ENV, "").strip(),
             synthesizer=synthesizer,
             agent_timeouts=agent_timeouts,
-            lead=args.lead,
         )
         # An exact once-resume must stay append-free on every refusal path, so
         # it is detected before any launch-time transcript write and skips both
