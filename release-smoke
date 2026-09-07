@@ -886,7 +886,10 @@ def run_round(
     )
 
     marker = unique_suffix(16)
-    message = f"@all release-smoke {marker}: reply with exactly {SMOKE_REPLY}."
+    message = (
+        f"@all release-smoke {marker}: reply with the single token {SMOKE_REPLY} "
+        "and nothing else, no punctuation"
+    )
     herdr.run(["pane", "send-text", pane_id, message], session, stage=stage)
     herdr.run(["pane", "send-keys", pane_id, "enter"], session, stage=stage)
 

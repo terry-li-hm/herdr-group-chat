@@ -435,14 +435,14 @@ def parse_goal(text: str, known_agents: Sequence[str]) -> GoalSpec:
     tokens = body.split()
     index = 0
     while index < len(tokens):
-        token = tokens[index]
-        if token in {"--rounds", "--budget"}:
+        word = tokens[index]
+        if word in {"--rounds", "--budget"}:
             value = tokens[index + 1] if index + 1 < len(tokens) else ""
             try:
                 number = int(value)
             except ValueError:
                 raise ChatError(GOAL_USAGE) from None
-            if token == "--rounds":
+            if word == "--rounds":
                 if not 1 <= number <= GOAL_MAX_ROUNDS:
                     raise ChatError(f"--rounds must be between 1 and {GOAL_MAX_ROUNDS}")
                 rounds = number
@@ -454,9 +454,9 @@ def parse_goal(text: str, known_agents: Sequence[str]) -> GoalSpec:
                 budget = number
             index += 2
             continue
-        if token.startswith("--"):
+        if word.startswith("--"):
             raise ChatError(GOAL_USAGE)
-        objective_tokens.append(token)
+        objective_tokens.append(word)
         index += 1
     objective = " ".join(objective_tokens).strip()
     if not objective:
@@ -6675,12 +6675,10 @@ def seed_input_history(items: Sequence[Mapping[str, Any]]) -> InputHistory:
 
 
 def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
-    try:
-        # curses.wrapper's start_color() pins pair 0 to white on black unless
-        # the terminal's own colours are re-adopted here, before any drawing.
+    # curses.wrapper's start_color() pins pair 0 to white on black unless
+    # the terminal's own colours are re-adopted here, before any drawing.
+    with suppress(curses.error):
         curses.use_default_colors()
-    except curses.error:
-        pass
     curses.curs_set(1)
     screen.keypad(True)
     screen.timeout(100)

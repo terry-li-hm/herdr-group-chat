@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+## [0.14.0] - 2026-09-07
+
 - **New `/goal` room command: unattended collaboration rounds with a
   convergence stop.** `/goal [@seat,@seat] OBJECTIVE [--rounds N] [--budget
   MINUTES]` lets the human leave the room while the seats keep working on one
