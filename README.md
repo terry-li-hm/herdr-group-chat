@@ -505,18 +505,29 @@ and the probed split ratios keep the right-hand column at equal heights —
 then restores your workspace and tab. `/agents`
 focuses the first peer pane when the room is laid out in grid and the backstage
 workspace otherwise; `/show <role>` focuses that peer's pane. The room's
-`/layout compact|grid` command re-runs the placement step at any time.
+`/layout compact|grid|grid2` command re-runs the placement step at any time.
+
+With `layout = "grid2"`, the room pane stays as the left column and the peers
+fill two columns of equal width to its right in roster order, left to right
+then top to bottom: peer 1 top-left, peer 2 top-right, peer 3 bottom-left,
+peer 4 bottom-right, with a third row for peers 5 and 6. The same placement
+step moves each owned peer that is not already in the room tab: the first
+split keeps 40 percent of the width for the room pane, the second halves the
+peer area into its two columns, and every later peer drops below the peer two
+positions before it with that column's probed ratio, so each column finishes
+at equal heights; your workspace and tab are restored exactly as in grid.
 
 ### Switching layout
 
-`/layout grid` and `/layout compact` in the room re-run the launcher's
-placement step for the recorded room: grid stacks every owned peer in the
-room tab beside the room pane, compact moves each one back into an
+`/layout grid`, `/layout grid2` and `/layout compact` in the room re-run the
+launcher's placement step for the recorded room: grid stacks every owned peer
+in the room tab beside the room pane, grid2 arranges them in two columns
+beside it, and compact moves each one back into an
 `agents · group-chat` workspace as its own tab. The room command is refused
 while a council round is running; it never moves a pane itself, records the
 result as one system line in the transcript, and placement restores your
-workspace and tab when it finishes. `./new-room --place <compact|grid>` does
-the same from a terminal.
+workspace and tab when it finishes. `./new-room --place <compact|grid|grid2>`
+does the same from a terminal.
 
 With `opus = true`, `New group chat` launches the `astra-fable-grok-opus-pi`
 profile: `@astra`, `@fable` and `@grok` as before plus `@opus` running Claude

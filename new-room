@@ -47,10 +47,13 @@ SETUP_FAILURES_ENV = "HERDR_GROUP_CHAT_SETUP_FAILURES"
 LAYOUT_ENV = "HERDR_GROUP_CHAT_LAYOUT"
 SETTINGS_ENV = "HERDR_GROUP_CHAT_SETTINGS"
 SETTINGS_FILENAME = "settings.toml"
-LAYOUTS = ("compact", "grid")
+LAYOUTS = ("compact", "grid", "grid2")
 DEFAULT_PROFILE = "astra-fable-grok-pi"
 OPUS_DEFAULT_PROFILE = "astra-fable-grok-opus-pi"
 GRID_ROOM_RATIO = "0.55"
+# grid2 keeps the room pane as the left column, so it hands the movers less
+# width: the first `right` split leaves the room pane 40 percent of the tab.
+GRID2_ROOM_RATIO = "0.40"
 # Probed live on herdr 0.8.2 in an isolated `hgc-probe-*` session: a
 # `pane move <pane> --split down --target-pane <target> --ratio r` keeps
 # fraction r of the split pane for the TARGET and lands the moved pane below
@@ -1498,6 +1501,30 @@ def grid_peer_split_ratios(participant_count: int) -> tuple[str, ...]:
     )
 
 
+def grid2_moves(mover_count: int) -> tuple[tuple[str, int | None, str], ...]:
+    """Per-mover (split direction, target mover index or None, ratio) for grid2.
+
+    The room pane stays the left column and the peers fill two columns to its
+    right in roster order, left to right then top to bottom: mover 0 splits
+    the room pane `right` keeping GRID2_ROOM_RATIO, mover 1 splits mover 0
+    `right` at half — giving the two peer columns — and every later mover
+    splits the pane of the peer two positions before it (its own column)
+    `down` with the ratio `grid_peer_split_ratios` gives for that column's
+    row count, so each column finishes at equal heights. The left column
+    holds ceil(N/2) rows and the right N//2.
+    """
+    moves: list[tuple[str, int | None, str]] = []
+    for index in range(mover_count):
+        if index == 0:
+            moves.append(("right", None, GRID2_ROOM_RATIO))
+        elif index == 1:
+            moves.append(("right", 0, "0.5"))
+        else:
+            rows = (mover_count + 1) // 2 if index % 2 == 0 else mover_count // 2
+            moves.append(("down", index - 2, grid_peer_split_ratios(rows)[index // 2 - 1]))
+    return tuple(moves)
+
+
 def place(
     herdr_bin: str,
     layout: str,
@@ -1523,6 +1550,12 @@ def place(
     mover splits it `right` keeping GRID_ROOM_RATIO, and every later mover
     splits the previous mover `down` with its ratio from
     `grid_peer_split_ratios`, so the stack finishes with equal heights.
+    `grid2` moves the same peers into the room tab as two columns beside
+    the room pane, driven by `grid2_moves`: the room pane anchors, the
+    first mover splits it `right` keeping GRID2_ROOM_RATIO, the second
+    splits the first `right` at half, and every later mover splits the peer
+    two positions before it `down` with its column's ratio from
+    `grid_peer_split_ratios`.
     The caller's focused workspace and tab are recorded before the first
     move and restored after the last. No workspace is ever closed.
     """
@@ -1591,12 +1624,20 @@ def place(
                 code="place_failed",
             )
         down_ratios = grid_peer_split_ratios(len(movers))
+        grid2_split_moves = grid2_moves(len(movers)) if layout == "grid2" else ()
+        placed_panes: list[str] = []
         anchor = room_pane_id
         if movers:
             caller_workspace, caller_tab = focused_workspace_and_tab(herdr_bin)
         for index, (participant, agent) in enumerate(movers):
             arguments = ["pane", "move", str(agent["pane_id"]), "--tab", room_tab_id, "--split"]
-            if index == 0:
+            if grid2_split_moves:
+                direction, target_index, ratio = grid2_split_moves[index]
+                target_pane = (
+                    room_pane_id if target_index is None else placed_panes[target_index]
+                )
+                arguments.extend([direction, "--target-pane", target_pane, "--ratio", ratio])
+            elif index == 0:
                 arguments.extend(["right", "--target-pane", anchor, "--ratio", GRID_ROOM_RATIO])
             else:
                 arguments.extend(
@@ -1604,6 +1645,7 @@ def place(
                 )
             run_json(herdr_bin, arguments)
             anchor = str(agent["pane_id"])
+            placed_panes.append(anchor)
             moved.append(participant.role)
     panes = state.setdefault("participant_pane_ids", {})
     tabs = state.setdefault("participant_tab_ids", {})
@@ -2461,7 +2503,7 @@ def main() -> int:
 
     executable = Path(__file__).resolve().parent / "herdr-group-chat"
     arguments = [str(executable), "--room", room]
-    if layout != "grid" or agents_workspace_id in workspace_ids(herdr_bin):
+    if layout not in {"grid", "grid2"} or agents_workspace_id in workspace_ids(herdr_bin):
         arguments.extend(["--agents-workspace", agents_workspace_id])
     if profile:
         profile_arguments, receipt = profile_room_exec(profile, participants)
@@ -2556,7 +2598,10 @@ def room_entrypoint() -> int:
             )
         save_launcher_state(state_dir, state, state_path)
         agents_workspace_id = str(state.get("agents_workspace_id") or "")
-        if state.get("layout") == "grid" and agents_workspace_id not in workspace_ids(herdr_bin):
+        if (
+            state.get("layout") in {"grid", "grid2"}
+            and agents_workspace_id not in workspace_ids(herdr_bin)
+        ):
             agents_workspace_id = ""
     # Reopening a retained room must not replay a previous launch's setup failures.
     os.environ.pop(SETUP_FAILURES_ENV, None)
@@ -2617,7 +2662,9 @@ def parse_launch_arguments(arguments: list[str]) -> tuple[str, str | None]:
         return "--adopt-peers", None
     if mode == "--place":
         if len(rest) != 1 or rest[0] not in LAYOUTS:
-            raise BootstrapError("--place requires exactly one layout: compact or grid")
+            raise BootstrapError(
+                f"--place requires exactly one layout: {'|'.join(LAYOUTS)}"
+            )
         return "--place", None
     if mode == "--errors":
         try:

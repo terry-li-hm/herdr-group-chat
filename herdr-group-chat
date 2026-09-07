@@ -75,7 +75,7 @@ ROOM_ENV = "HERDR_GROUP_CHAT_ROOM"
 AGENTS_WORKSPACE_ENV = "HERDR_GROUP_CHAT_AGENTS_WORKSPACE_ID"
 SETUP_FAILURES_ENV = "HERDR_GROUP_CHAT_SETUP_FAILURES"
 ROOM_TAB_ENV = "HERDR_TAB_ID"
-ROOM_LAYOUTS = ("compact", "grid")
+ROOM_LAYOUTS = ("compact", "grid", "grid2")
 PLUGIN_ROOT = Path(__file__).resolve().parent
 LAYOUT_PLACE_TIMEOUT_S = 180
 ROOM_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
@@ -5159,7 +5159,7 @@ def place_room_layout(
     focuses anything in the room process.
     """
     if mode not in ROOM_LAYOUTS:
-        raise ChatError("Usage: /layout compact|grid")
+        raise ChatError("Usage: /layout compact|grid|grid2")
     try:
         result = runner(
             ["./new-room", "--place", mode],
@@ -5238,7 +5238,7 @@ def handle_local_command(
             "Commands: /review [@agents] QUESTION · /anneal @author,@critic QUESTION · "
             "/consensus [@agents] QUESTION · /retry <agent|synthesis> · /cancel · /agents · "
             "/council status · /council export PATH · /council resume · "
-            "/show <agent> · /layout compact|grid · /inbox · /lanes · /room · "
+            "/show <agent> · /layout compact|grid|grid2 · /inbox · /lanes · /room · "
             "PgUp/PgDn · mouse wheel scrolls "
             "· Home/End jump · @ opens a mention picker "
             "(Tab completes, Esc closes)"
@@ -5248,7 +5248,7 @@ def handle_local_command(
             return "A council round is running; use /cancel or wait before sending."
         mode = stripped.removeprefix("/layout").strip()
         if mode not in ROOM_LAYOUTS:
-            return "Usage: /layout compact|grid"
+            return "Usage: /layout compact|grid|grid2"
         try:
             line = place_room_layout(mode, layout_runner)
         except ChatError as error:

@@ -2035,7 +2035,7 @@ def test_layout_command_runs_the_launcher_from_the_plugin_root(
     def fake_run(arguments: list[str], **kwargs: object) -> Completed:
         calls.append((list(arguments), kwargs))
         mode = arguments[2]
-        moved = ["astra", "fable"] if mode == "grid" else []
+        moved = [] if mode == "compact" else ["astra", "fable"]
         return Completed(json.dumps({"layout": mode, "moved": moved}) + "\n")
 
     line = handle_local_command("/layout grid", chat, None, fake_run)
@@ -2052,10 +2052,15 @@ def test_layout_command_runs_the_launcher_from_the_plugin_root(
 
     line = handle_local_command("/layout compact", chat, None, fake_run)
     assert line == "Layout: compact — 0 peers placed, focus restored"
+    line = handle_local_command("/layout grid2", chat, None, fake_run)
+    assert line == "Layout: grid2 — 2 peers placed, focus restored"
     assert [args for args, _ in calls] == [
         ["./new-room", "--place", "grid"],
         ["./new-room", "--place", "compact"],
+        ["./new-room", "--place", "grid2"],
     ]
+    records = transcript.read()
+    assert records[-1]["body"] == line
 
 
 def test_layout_command_renders_the_launcher_error_line(
@@ -2095,9 +2100,11 @@ def test_layout_command_is_blocked_during_a_round_and_rejects_unknown_modes(
         == "A council round is running; use /cancel or wait before sending."
     )
     assert handle_local_command("/layout wide", chat, None, fail_run) == (
-        "Usage: /layout compact|grid"
+        "Usage: /layout compact|grid|grid2"
     )
-    assert handle_local_command("/layout", chat, None, fail_run) == ("Usage: /layout compact|grid")
+    assert handle_local_command("/layout", chat, None, fail_run) == (
+        "Usage: /layout compact|grid|grid2"
+    )
     assert transcript.read() == []
 
 

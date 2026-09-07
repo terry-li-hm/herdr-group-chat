@@ -12,6 +12,11 @@ All notable changes to this project are documented here.
   turn cap and route/focus logic are unchanged, and a single-recipient
   message keeps the original serial delivery. `/review` remains the mode for
   a synthesised round.
+- **New `grid2` room layout.** `layout = "grid2"` keeps the room pane as the
+  left column and fills two equal peer columns to its right in roster order,
+  left to right then top to bottom; `/layout grid2` and
+  `./new-room --place grid2` re-run the placement exactly like the other
+  layouts.
 - **A long-running Pi peer no longer fails re-verification once its session
   file passes 64 KiB.** `pi_session_proves` reads only the first 64 KiB of
   the session JSONL, so a peer that had done enough work grew a file whose

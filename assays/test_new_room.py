@@ -6328,6 +6328,7 @@ def test_inspection_argument_parsing_is_exact() -> None:
     assert module.parse_launch_arguments(["--errors", "5"]) == ("--errors", None)
     assert module.parse_launch_arguments(["--place", "compact"]) == ("--place", None)
     assert module.parse_launch_arguments(["--place", "grid"]) == ("--place", None)
+    assert module.parse_launch_arguments(["--place", "grid2"]) == ("--place", None)
     for arguments in (
         ["--place"],
         ["--place", "diagonal"],
@@ -6409,6 +6410,8 @@ def test_settings_parse_grid_and_opus(tmp_path: Path, monkeypatch: pytest.Monkey
     monkeypatch.setenv("HERDR_GROUP_CHAT_SETTINGS", str(path))
     settings = module.load_settings("terry.herdr-group-chat")
     assert settings == module.Settings(layout="grid", opus=True)
+    path.write_text('layout = "grid2"\n')
+    assert module.load_settings("terry.herdr-group-chat") == module.Settings(layout="grid2")
     assert (
         module.apply_settings_profile("astra-fable-grok-pi", settings) == "astra-fable-grok-opus-pi"
     )
@@ -6422,7 +6425,13 @@ def test_settings_parse_grid_and_opus(tmp_path: Path, monkeypatch: pytest.Monkey
 
 @pytest.mark.parametrize(
     "body",
-    ['layout = "wide"\n', "opus = 1\n", 'layout = "grid"\nextra = true\n', "layout = [\n"],
+    [
+        'layout = "wide"\n',
+        'layout = "grid3"\n',
+        "opus = 1\n",
+        'layout = "grid"\nextra = true\n',
+        "layout = [\n",
+    ],
 )
 def test_settings_fail_closed_on_invalid_content(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str
@@ -6600,6 +6609,156 @@ def test_place_grid_moves_new_peers_in_roster_order_and_restores_focus(
         ("astra", "fable", "grok"), "w-chat:t-room"
     )
     assert state["layout"] == "grid"
+    assert calls[-2:] == [["workspace", "focus", "w-caller"], ["tab", "focus", "w-caller:t9"]]
+    # Focus is restored only after the last move, and no workspace is closed.
+    assert calls.index(moves[-1]) < calls.index(["workspace", "focus", "w-caller"])
+    assert not any(call[:2] == ["workspace", "close"] for call in calls)
+
+
+def test_place_grid2_moves_new_peers_in_roster_order_and_restores_focus(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """grid2 fills two columns beside the room pane: 1 top-left, 2 top-right,
+    3 bottom-left, 4 bottom-right, each column levelling like a grid stack."""
+    calls: list[list[str]] = []
+    roster = module.resolve_profile("astra-fable-grok-opus-pi")
+    moved: set[str] = set()
+    kinds = {
+        "astra-peer": "pi",
+        "fable-peer": "claude",
+        "grok46pi-peer": "pi",
+        "opus-peer": "claude",
+    }
+
+    def agent_payload(name: str) -> dict:
+        role = name.removesuffix("-peer")
+        # A moved pane keeps its pane id; only its tab and workspace change.
+        if name in moved:
+            return place_agent_record(
+                name,
+                kinds[name],
+                pane_id=f"w-old:p-{role}",
+                tab_id="w-chat:t-room",
+                workspace_id="w-chat",
+            )
+        return place_agent_record(
+            name,
+            kinds[name],
+            pane_id=f"w-old:p-{role}",
+            tab_id="w-old:t-room",
+            workspace_id="w-old",
+        )
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["workspace", "list"]:
+            return {
+                "result": {
+                    "workspaces": [
+                        {"workspace_id": "w-chat", "focused": False},
+                        {
+                            "workspace_id": "w-caller",
+                            "focused": True,
+                            "active_tab_id": "w-caller:t9",
+                        },
+                    ]
+                }
+            }
+        if arguments[:2] == ["agent", "get"]:
+            return agent_payload(arguments[2])
+        if arguments[:2] == ["pane", "move"]:
+            moved.add(arguments[2].rsplit(":p-", 1)[1] + "-peer")
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {
+        "agents_cwd": PLACE_AGENTS_CWD,
+        "participant_pane_ids": {
+            "astra": "w-gone:p-astra",
+            "fable": "w-gone:p-fable",
+            "grok": "w-gone:p-grok",
+            "opus": "w-gone:p-opus",
+        },
+        "participant_tab_ids": {
+            "astra": "w-gone:t-astra",
+            "fable": "w-gone:t-fable",
+            "grok": "w-gone:t-grok",
+            "opus": "w-gone:t-opus",
+        },
+    }
+    moved_roles = module.place(
+        "herdr",
+        "grid2",
+        state,
+        roster,
+        room_pane_id="w-chat:p-room",
+        room_tab_id="w-chat:t-room",
+        room_workspace_id="w-chat",
+    )
+    assert moved_roles == ["astra", "fable", "grok", "opus"]
+    moves = [call for call in calls if call[:2] == ["pane", "move"]]
+    assert moves == [
+        [
+            "pane",
+            "move",
+            "w-old:p-astra",
+            "--tab",
+            "w-chat:t-room",
+            "--split",
+            "right",
+            "--target-pane",
+            "w-chat:p-room",
+            "--ratio",
+            "0.40",
+        ],
+        [
+            "pane",
+            "move",
+            "w-old:p-fable",
+            "--tab",
+            "w-chat:t-room",
+            "--split",
+            "right",
+            "--target-pane",
+            "w-old:p-astra",
+            "--ratio",
+            "0.5",
+        ],
+        [
+            "pane",
+            "move",
+            "w-old:p-grok46pi",
+            "--tab",
+            "w-chat:t-room",
+            "--split",
+            "down",
+            "--target-pane",
+            "w-old:p-astra",
+            "--ratio",
+            "0.5000",
+        ],
+        [
+            "pane",
+            "move",
+            "w-old:p-opus",
+            "--tab",
+            "w-chat:t-room",
+            "--split",
+            "down",
+            "--target-pane",
+            "w-old:p-fable",
+            "--ratio",
+            "0.5000",
+        ],
+    ]
+    for move in moves:
+        name = move[2].rsplit(":p-", 1)[1] + "-peer"
+        assert calls.index(["agent", "get", name]) < calls.index(move)
+    assert state["participant_tab_ids"] == dict.fromkeys(
+        ("astra", "fable", "grok", "opus"), "w-chat:t-room"
+    )
+    assert state["layout"] == "grid2"
     assert calls[-2:] == [["workspace", "focus", "w-caller"], ["tab", "focus", "w-caller:t9"]]
     # Focus is restored only after the last move, and no workspace is closed.
     assert calls.index(moves[-1]) < calls.index(["workspace", "focus", "w-caller"])
@@ -7185,6 +7344,38 @@ def test_grid_peer_split_ratios_equalize_the_stack() -> None:
                 heights[-1] = kept
                 heights.append(split_height - kept)
             assert max(heights) - min(heights) <= 1, (rows, count, heights)
+
+
+def test_grid2_moves_layout_for_two_three_four_and_five_peers() -> None:
+    """Exact per-mover (direction, target index, ratio) tuples for grid2.
+
+    N=1 splits the room pane right at 0.40; N=2 adds the second column with a
+    half split of mover 0; from N=3 every mover drops below the peer two
+    positions before it with its column's grid ratio (left column ceil(N/2)
+    rows, right N//2), so both columns finish level."""
+    assert module.grid2_moves(1) == (("right", None, "0.40"),)
+    assert module.grid2_moves(2) == (
+        ("right", None, "0.40"),
+        ("right", 0, "0.5"),
+    )
+    assert module.grid2_moves(3) == (
+        ("right", None, "0.40"),
+        ("right", 0, "0.5"),
+        ("down", 0, "0.5000"),
+    )
+    assert module.grid2_moves(4) == (
+        ("right", None, "0.40"),
+        ("right", 0, "0.5"),
+        ("down", 0, "0.5000"),
+        ("down", 1, "0.5000"),
+    )
+    assert module.grid2_moves(5) == (
+        ("right", None, "0.40"),
+        ("right", 0, "0.5"),
+        ("down", 0, "0.3333"),
+        ("down", 1, "0.5000"),
+        ("down", 2, "0.5000"),
+    )
 
 
 OPUS_SHORT_PANE_SCREEN = "Claude Code\n\u2570 \u2026 ctx 42% \u25af\n"
