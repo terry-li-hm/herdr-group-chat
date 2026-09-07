@@ -121,6 +121,25 @@ LANE_MIN_COLUMN_WIDTH = 24
 LANE_SEPARATOR = "|"
 GRAPHEME_RE = regex.compile(r"\X")
 LEADING_PARTICIPANT_RE = re.compile(r"\A@([a-z0-9_-]+)(?=$|[\s:])", re.IGNORECASE)
+# A mid-body mention must stand alone: no word character, dot, hyphen, or
+# another @ glued before it (so emails and dotted handles stay inert) and no
+# trailing word character or hyphen (so @fable never matches inside @fabler).
+MENTION_SCAN_RE = re.compile(r"(?<![\w@.-])@([a-z0-9_-]+)(?![\w-])", re.IGNORECASE)
+REPLY_WORD_BUDGET = 150
+ROUTE_RECEIPT_LINE_PREFIX = "ROUTE_RECEIPT:"
+ROUTE_RECEIPT_AGAIN_LINE = "ROUTE_RECEIPT: (as before)"
+COMMAND_HINT_LINE = (
+    "Hint: /consensus QUESTION runs a blind round with a ratified vote; "
+    "/review QUESTION runs a blind round with synthesis."
+)
+COMMAND_HINT_PHRASES = (
+    "get consensus",
+    "reach consensus",
+    "review this",
+    "blind review",
+    "anneal",
+    "vote on",
+)
 NO_LEADING_PARTICIPANT = object()
 UNCONFIGURED_LEADING_PARTICIPANT = object()
 CONTROL_ESCAPES = {
@@ -242,6 +261,56 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def route_receipt_first_line(body: str) -> str | None:
+    """Return the body's first line when it opens a ROUTE_RECEIPT, else None."""
+    first_line = body.split("\n", 1)[0]
+    return first_line if first_line.startswith(ROUTE_RECEIPT_LINE_PREFIX) else None
+
+
+def collapse_repeated_receipts(
+    messages: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep each seat's first ROUTE_RECEIPT whole in display and later prompts.
+
+    The transcript file keeps every receipt verbatim; this projection rewrites
+    only the receipt line of a later reply from a seat whose first reply in the
+    given sequence already opened with one. Never collapses the first receipt.
+    """
+    seen: set[str] = set()
+    projected: list[dict[str, Any]] = []
+    for item in messages:
+        sender = item.get("sender")
+        body = _message_body(item)
+        if route_receipt_first_line(body) is None or not isinstance(sender, str):
+            projected.append(dict(item))
+            continue
+        if sender in seen:
+            remainder = body.split("\n", 1)
+            body = (
+                ROUTE_RECEIPT_AGAIN_LINE
+                if len(remainder) == 1
+                else f"{ROUTE_RECEIPT_AGAIN_LINE}\n{remainder[1]}"
+            )
+            collapsed = dict(item)
+            collapsed["body"] = body
+            projected.append(collapsed)
+            continue
+        seen.add(sender)
+        projected.append(dict(item))
+    return projected
+
+
+def command_hint(text: str) -> str | None:
+    """Return the command hint line for a plain message that asks for a mode."""
+    stripped = text.strip()
+    if not stripped or stripped.startswith("/"):
+        return None
+    lowered = stripped.lower()
+    if any(phrase in lowered for phrase in COMMAND_HINT_PHRASES):
+        return COMMAND_HINT_LINE
+    return None
+
+
 def parse_route(
     text: str, known_agents: Sequence[str], default: Sequence[str] | None = None
 ) -> Route:
@@ -252,6 +321,12 @@ def parse_route(
     if not match:
         if stripped.startswith("@"):
             raise ChatError("invalid mention syntax; use @name MESSAGE")
+        found = {name.lower() for name in MENTION_SCAN_RE.findall(stripped)}
+        if "all" in found:
+            return Route(tuple(known_agents), stripped)
+        mentioned = [agent for agent in known_agents if agent in found]
+        if mentioned:
+            return Route(tuple(mentioned), stripped)
         if default is not None:
             return Route(tuple(default), stripped)
         return Route(tuple(known_agents), stripped)
@@ -1494,7 +1569,10 @@ def extract_grok_session_reply(session_dir: Path, token: str) -> str:
 def format_context(messages: Sequence[dict[str, Any]]) -> str:
     if not messages:
         return "(No new group messages.)"
-    return "\n\n".join(f"[{item['sender']}] {item['body']}" for item in messages)
+    return "\n\n".join(
+        f"[{item['sender']}] {item['body']}"
+        for item in collapse_repeated_receipts(messages)
+    )
 
 
 # Room-signal system lines are journal events for the human, never prompt
@@ -1506,10 +1584,14 @@ SIGNAL_KIND_NAMES: Mapping[str, str] = {
     "credential_refused": "refused",
 }
 
+# Kinds an agent must never see in a prompt. Signal lines stay counted by
+# room_signal_counts; the command hint is human-facing only and adds no count.
+AGENT_HIDDEN_KINDS: frozenset[str] = frozenset({*SIGNAL_KIND_NAMES, "hint"})
+
 
 def message_visible_to_agent(item: Mapping[str, Any], agent: str) -> bool:
-    """Hide room-signal lines and council-scoped items from outside audiences."""
-    if item.get("kind") in SIGNAL_KIND_NAMES:
+    """Hide room-signal lines, human-only hints, and council-scoped items."""
+    if item.get("kind") in AGENT_HIDDEN_KINDS:
         return False
     meta = item.get("meta")
     if not isinstance(meta, dict) or "council_participants" not in meta:
@@ -1541,8 +1623,24 @@ def build_prompt(
     token: str,
     participants: Sequence[str],
     host: str = "Herdr",
+    receipt_expected: bool = True,
 ) -> str:
     roster = ", ".join(["a human", *(f"@{name}" for name in participants)])
+    if receipt_expected:
+        receipt_rule = (
+            "If eligible, begin the message with a non-secret ROUTE_RECEIPT "
+            "naming that route, and only on your first reply in this room or when "
+            "your route changes; after that, omit the ROUTE_RECEIPT line. If "
+            "ineligible, refuse before reading and name the missing condition."
+        )
+    else:
+        receipt_rule = (
+            "A ROUTE_RECEIPT is not expected in this reply: this room has already "
+            "recorded your receipt and your route is unchanged, so omit it. Begin "
+            "with a fresh non-secret ROUTE_RECEIPT naming the route only if your "
+            "route has changed; if ineligible, refuse before reading and name the "
+            "missing condition."
+        )
     return (
         f"You are @{agent}, a full participant in a local group chat with {roster}. "
         "Keep your normal capabilities and instructions. "
@@ -1552,11 +1650,11 @@ def build_prompt(
         "eligibility never transfers to you. If the user invokes a bounded disclosure, "
         "verify your active provider, model, account-surface eligibility, exact payload, and "
         "purpose before reading. Avoid auxiliary index or shell probes when the exact "
-        "named payload can be read directly. If eligible, begin the message with a non-secret "
-        "ROUTE_RECEIPT naming that route; otherwise refuse before reading and name the "
-        "missing condition.\n\n"
+        f"named payload can be read directly. {receipt_rule}\n\n"
         "New room messages since your last delivered turn:\n\n"
         f"{format_context(messages)}\n\n"
+        f"Keep the reply under about {REPLY_WORD_BUDGET} words unless the human "
+        "asked for detail or the task is a document review; lead with the answer. "
         "Return one direct group-chat message. Wrap only that message between these marker "
         "lines:\n"
         f"HGCHAT_REPLY_BEGIN {token}\n"
@@ -1581,6 +1679,8 @@ def build_review_prompt(
         "group-chat relay handles delivery.\n\n"
         "Question for independent review:\n\n"
         f"{question}\n\n"
+        f"Keep the reply under about {REPLY_WORD_BUDGET} words unless the human "
+        "asked for detail or the task is a document review; lead with the answer. "
         "Return one direct review message. Wrap only that message between these marker lines:\n"
         f"HGCHAT_REPLY_BEGIN {token}\n"
         f"HGCHAT_REPLY_END {token}\n"
@@ -2541,6 +2641,14 @@ class GroupChat:
     def _timeout_for(self, agent: str) -> int | None:
         return self.agent_timeouts.get(agent)
 
+    def receipt_expected(self, agent: str) -> bool:
+        """True until this seat has one earlier reply opening a ROUTE_RECEIPT."""
+        return not any(
+            item.get("sender") == agent
+            and route_receipt_first_line(_message_body(item)) is not None
+            for item in self.transcript.read()
+        )
+
     def focus(self) -> tuple[str, ...]:
         """Name the participants a plain message currently addresses.
 
@@ -2689,6 +2797,15 @@ class GroupChat:
         created: list[dict[str, Any]] = []
         cancellation_recorded = False
 
+        def finish(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            """Close one delivered ordinary send with its human-only hint."""
+            hint_body = command_hint(route.body)
+            if hint_body is not None:
+                items.append(
+                    self.transcript.append("system", ("human",), hint_body, kind="hint")
+                )
+            return items
+
         def set_state(agent: str, state: str) -> None:
             if on_state is not None:
                 on_state(agent, state)
@@ -2759,7 +2876,14 @@ class GroupChat:
                     ]
                     delivered_through = max(item["seq"] for item in messages)
                     token = uuid.uuid4().hex
-                    prompt = build_prompt(agent, messages, token, tuple(self.agents), self.host_label)
+                    prompt = build_prompt(
+                        agent,
+                        messages,
+                        token,
+                        tuple(self.agents),
+                        self.host_label,
+                        receipt_expected=self.receipt_expected(agent),
+                    )
                     item = self._plain_turn(
                         agent, prompt, delivered_through, cancel_event, set_state
                     )
@@ -2767,7 +2891,7 @@ class GroupChat:
                         cancel_remaining(index + 1)
                         break
                     created.append(item)
-                return created
+                return finish(created)
             # Every recipient is prompted from this one snapshot, so none of
             # them can see another recipient's reply to this message.
             snapshot = self.transcript.read()
@@ -2782,7 +2906,12 @@ class GroupChat:
                     and message_visible_to_agent(item, agent)
                 ]
                 prompts[agent] = build_prompt(
-                    agent, messages, uuid.uuid4().hex, tuple(self.agents), self.host_label
+                    agent,
+                    messages,
+                    uuid.uuid4().hex,
+                    tuple(self.agents),
+                    self.host_label,
+                    receipt_expected=self.receipt_expected(agent),
                 )
                 delivered_through[agent] = max(item["seq"] for item in messages)
             with ThreadPoolExecutor(
@@ -2805,7 +2934,7 @@ class GroupChat:
                         record_cancellation()
                     else:
                         created.append(item)
-            return created
+            return finish(created)
 
     def plan_review(self, text: str) -> ReviewRound:
         route = parse_route(text, tuple(self.agents))
@@ -4327,7 +4456,7 @@ def message_lines(messages: Sequence[dict[str, Any]], width: int) -> list[str]:
     """Render room items to terminal cells without splitting graphemes."""
     width = max(1, width)
     lines: list[str] = []
-    for item in messages:
+    for item in collapse_repeated_receipts(messages):
         prefix = f"{terminal_safe_text(_message_label(item))}> "
         prefix_width = terminal_display_width(prefix)
         paragraphs = terminal_safe_text(_message_body(item), preserve_line_breaks=True).split("\n")

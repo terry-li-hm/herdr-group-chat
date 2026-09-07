@@ -47,6 +47,12 @@ claude_project_dir_name = namespace.get("claude_project_dir_name")
 build_prompt = namespace["build_prompt"]
 build_review_prompt = namespace["build_review_prompt"]
 build_synthesis_prompt = namespace["build_synthesis_prompt"]
+format_context = namespace["format_context"]
+message_visible_to_agent = namespace["message_visible_to_agent"]
+room_signal_counts = namespace["room_signal_counts"]
+command_hint = namespace["command_hint"]
+REPLY_WORD_BUDGET = namespace["REPLY_WORD_BUDGET"]
+ROUTE_RECEIPT_AGAIN_LINE = namespace["ROUTE_RECEIPT_AGAIN_LINE"]
 message_lines = namespace["message_lines"]
 parse_agent_timeouts = namespace["parse_agent_timeouts"]
 parse_route = namespace["parse_route"]
@@ -285,6 +291,64 @@ def test_parse_route_default_redirects_only_plain_messages() -> None:
         parse_route("@claude", roster, default=("codex",))
     with pytest.raises(ChatError, match="message is empty"):
         parse_route("   ", roster, default=("codex",))
+
+
+def test_parse_route_finds_mid_body_mentions_without_rewriting_the_body() -> None:
+    roster = ("pi", "fable", "grok")
+    # A mid-body mention routes to that seat and the text is delivered as typed.
+    solo = "maybe @fable to help update the draft"
+    assert parse_route(solo, roster, default=("pi",)) == Route(("fable",), solo)
+    # Several mentions resolve to those seats in roster order, body unchanged.
+    both = "ask @fable and @grok"
+    assert parse_route(both, roster, default=("pi",)) == Route(("fable", "grok"), both)
+    # Roster order wins over the order the mentions appear in the text.
+    assert parse_route(both, ("grok", "fable", "pi")) == Route(("grok", "fable"), both)
+    # @all anywhere addresses everyone in roster order.
+    everyone = "can @all weigh in before we cut?"
+    assert parse_route(everyone, roster, default=("pi",)) == Route(roster, everyone)
+    # Word boundaries keep emails and unknown handles inert: the default wins.
+    email = "mail me at a@b.com"
+    assert parse_route(email, roster, default=("pi",)) == Route(("pi",), email)
+    unknown = "ask @nobody anything"
+    assert parse_route(unknown, roster, default=("pi",)) == Route(("pi",), unknown)
+    assert parse_route(unknown, roster) == Route(roster, unknown)
+    # A longer handle never partially matches a shorter participant name.
+    assert parse_route("ping @fabler today", roster, default=("pi",)) == Route(
+        ("pi",), "ping @fabler today"
+    )
+    # Leading-mention semantics are unchanged, including the unknown-name error.
+    assert parse_route("@fable hi", roster, default=("pi",)) == Route(("fable",), "hi")
+    with pytest.raises(ChatError, match="unknown participant"):
+        parse_route("@nobody hi", roster)
+
+
+def test_prompt_builders_carry_the_reply_word_budget() -> None:
+    roster = ("pi", "claude", "codex", "grok")
+    budget_sentence = (
+        f"Keep the reply under about {REPLY_WORD_BUDGET} words unless the human "
+        "asked for detail or the task is a document review; lead with the answer."
+    )
+    assert REPLY_WORD_BUDGET == 150
+    prompt = build_prompt("codex", [], "a" * 32, roster)
+    review = build_review_prompt("claude", "is this ready?", "b" * 32, roster)
+    assert budget_sentence in prompt
+    assert budget_sentence in review
+
+
+def test_command_hint_matches_phrases_case_insensitively_and_only_plain_text() -> None:
+    expected = (
+        "Hint: /consensus QUESTION runs a blind round with a ratified vote; "
+        "/review QUESTION runs a blind round with synthesis."
+    )
+    assert command_hint("can we get consensus?") == expected
+    assert command_hint("We should REACH CONSENSUS here") == expected
+    assert command_hint("please review this before sending") == expected
+    assert command_hint("run a blind review of the draft") == expected
+    assert command_hint("let us anneal the plan") == expected
+    assert command_hint("should we vote on it?") == expected
+    assert command_hint("nothing to hint here") is None
+    assert command_hint("/consensus question") is None
+    assert command_hint("") is None
 
 
 def test_participant_status_normalizes_ready_and_preserves_attention_states(
@@ -2706,6 +2770,109 @@ def test_focus_label_names_the_current_focus(tmp_path: Path) -> None:
     assert focus_label(chat) == "To: @claude,@codex"
     chat.dispatch("@all everything")
     assert focus_label(chat) == "To: @all"
+
+
+def test_route_receipt_is_expected_once_per_seat_per_room(tmp_path: Path) -> None:
+    receipt_one = "ROUTE_RECEIPT: provider=openai-codex model=gpt-5.6 attempt=one"
+    receipt_two = "ROUTE_RECEIPT: provider=openai-codex model=gpt-5.6 attempt=two"
+
+    class ReceiptClient(FakeClient):
+        def turn(
+            self,
+            target: str,
+            prompt: str,
+            timeout_ms: int | None = None,
+            cancel_event: threading.Event | None = None,
+            agent_label: str | None = None,
+        ) -> tuple[str, str]:
+            self.calls.append((target, prompt))
+            self.timeouts.append(timeout_ms)
+            attempt = sum(1 for observed, _ in self.calls if observed == target)
+            receipt = receipt_one if attempt == 1 else receipt_two
+            return "done", f"{receipt}\nanswer {attempt} from {target}"
+
+    client = ReceiptClient()
+    transcript = Transcript(tmp_path, "receipt-room")
+    chat = GroupChat(
+        transcript,
+        {"pi": "pi-peer", "claude": "claude-peer"},
+        client,
+        max_turns=2,
+    )
+
+    chat.dispatch("@pi first question")
+    first_prompt = client.calls[0][1]
+    assert "A ROUTE_RECEIPT is not expected" not in first_prompt
+    assert "only on your first reply in this room" in first_prompt
+
+    chat.dispatch("@pi second question")
+    second_prompt = client.calls[1][1]
+    assert "A ROUTE_RECEIPT is not expected in this reply" in second_prompt
+
+    # A later prompt to another seat keeps the first receipt whole and shows the
+    # second seat receipt collapsed to the marker line.
+    chat.dispatch("@claude read the room")
+    claude_prompt = client.calls[-1][1]
+    assert receipt_one in claude_prompt
+    assert receipt_two not in claude_prompt
+    assert ROUTE_RECEIPT_AGAIN_LINE in claude_prompt
+
+    # The same projection drives format_context for later prompts.
+    visible = [
+        item
+        for item in transcript.read()
+        if item["sender"] != "claude" and message_visible_to_agent(item, "claude")
+    ]
+    context = format_context(visible)
+    assert receipt_one in context
+    assert receipt_two not in context
+    assert ROUTE_RECEIPT_AGAIN_LINE in context
+
+    # The room display collapses the repeated receipt the same way.
+    display = "\n".join(message_lines(transcript.read(), 200))
+    assert receipt_one in display
+    assert "attempt=two" not in display
+    assert ROUTE_RECEIPT_AGAIN_LINE in display
+
+    # The transcript file keeps both full bodies verbatim.
+    bodies = [item["body"] for item in transcript.read() if item["sender"] == "pi"]
+    assert bodies == [
+        f"{receipt_one}\nanswer 1 from pi-peer",
+        f"{receipt_two}\nanswer 2 from pi-peer",
+    ]
+
+
+def test_plain_message_with_a_command_phrase_appends_one_human_only_hint(
+    tmp_path: Path,
+) -> None:
+    chat, client, transcript = make_chat(tmp_path)
+
+    created = chat.dispatch("can we get consensus on the design?")
+
+    hints = [item for item in transcript.read() if item.get("kind") == "hint"]
+    assert len(hints) == 1
+    hint = hints[0]
+    assert hint["sender"] == "system"
+    assert hint["recipients"] == ["human"]
+    assert hint["body"] == (
+        "Hint: /consensus QUESTION runs a blind round with a ratified vote; "
+        "/review QUESTION runs a blind round with synthesis."
+    )
+    # The hint lands after the delivered message and its replies.
+    assert transcript.read()[-1] == hint
+    assert created[-1] == hint
+    # The hint is hidden from every seat and never counted as a room signal.
+    assert not any(message_visible_to_agent(hint, agent) for agent in chat.agents)
+    assert set(room_signal_counts(transcript.read()).values()) == {0}
+
+    chat.dispatch("plain message without any phrase")
+    assert len([item for item in transcript.read() if item.get("kind") == "hint"]) == 1
+
+    # A later seat prompt proves the hint never reaches an agent context.
+    chat.dispatch("@claude what changed")
+    claude_prompt = client.calls[-1][1]
+    assert "Hint:" not in claude_prompt
+    assert "[human] what changed" in claude_prompt
 
 
 def test_codex_is_addressable_and_roster_is_derived() -> None:

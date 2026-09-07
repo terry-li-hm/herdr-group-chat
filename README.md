@@ -145,6 +145,20 @@ prefix a message to select participants:
 @pi Summarise the decision.
 ```
 
+Mentions work anywhere in a plain message, not only at the front: `maybe
+@fable to help update the draft` routes to @fable alone with the text unchanged,
+several mid-message mentions resolve to those seats in roster order, and
+`@all` anywhere addresses everyone, while tokens that name no participant — an
+email address, an unknown handle — are ignored so the focus stands.
+
+When a plain message asks for a mode by phrase — get consensus, reach
+consensus, review this, blind review, anneal, or vote on — the room appends one
+system line after delivery hinting that `/consensus QUESTION` runs a blind round
+with a ratified vote and `/review QUESTION` runs a blind round with synthesis.
+
+Seats are asked to keep replies under about 150 words unless you asked for
+detail or the task is a document review, and to lead with the answer.
+
 Use `/review` when the agents should reach their views independently before any
 answer can influence another. Mentions select reviewers; without mentions, all
 participants review. Pi synthesizes by default.

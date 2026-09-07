@@ -13,6 +13,28 @@ All notable changes to this project are documented here.
   profile and workspace and the `done` sound. A notification command that
   itself fails is swallowed, never masking the original error or changing the
   exit code, and `HERDR_GROUP_CHAT_NO_NOTIFY=1` suppresses both notifications.
+- **A seat's ROUTE_RECEIPT is recorded once per room.** Ordinary prompts now
+  tell a participant to emit the ROUTE_RECEIPT line only on its first reply in
+  the room or when its route changes, and to omit it otherwise; `build_prompt`
+  gains a `receipt_expected` flag that `dispatch` computes from the transcript.
+  The room display and later agent contexts collapse a repeated receipt line to
+  `ROUTE_RECEIPT: (as before)` while the transcript file keeps every receipt
+  verbatim, and the first receipt is never collapsed.
+- **Mentions route from anywhere in a plain message.** After the leading-mention
+  parse fails, `parse_route` scans the body for `@name` tokens naming known
+  participants (`@all` too) with word boundaries so emails and unknown handles
+  stay inert; the matches resolve in roster order and the body is delivered
+  unchanged. Leading-mention semantics, including the unknown-name error, are
+  untouched.
+- **Plain-message command hint.** When a plain message contains one of the
+  phrases get consensus, reach consensus, review this, blind review, anneal, or
+  vote on (case-insensitively), the room appends one `kind="hint"` system line
+  after delivery pointing at `/consensus` and `/review`; hints are addressed to
+  the human and hidden from every seat without joining the signal counts.
+- **Reply length budget in prompts.** `build_prompt` and `build_review_prompt`
+  now ask for a reply under about `REPLY_WORD_BUDGET = 150` words unless the
+  human asked for detail or the task is a document review, leading with the
+  answer. Prompt guidance only; nothing is enforced or truncated.
 - **Plain messages to several participants are now delivered in parallel and
   blind for that turn.** `GroupChat.dispatch` fans a multi-recipient ordinary
   message out through a `hgchat-plain` thread pool, prompting every recipient
