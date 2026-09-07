@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+- **A long-running Pi peer no longer fails re-verification once its session
+  file passes 64 KiB.** `pi_session_proves` reads only the first 64 KiB of
+  the session JSONL, so a peer that had done enough work grew a file whose
+  capped read cut the final line mid-JSON; the parse raised and the proof
+  failed closed, refusing to reopen the profile room. The read now drops that
+  truncated tail line only when more file exists beyond the cap, since the
+  identity events sit at the top; a malformed line in a fully read file still
+  fails closed. Observed live: an 81 KiB astra session failed process
+  verification with correct provider, model and thinking level.
 - **Pi participants' route receipt names the account surface.** `new-room`
   now runs `pi auth check --provider <provider>` as a preflight beside the
   catalog check, fails closed with `failed the native auth preflight` when

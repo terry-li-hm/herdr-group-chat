@@ -948,16 +948,23 @@ def pi_session_proves(session_path: str, provider: str, model: str, effort: str)
     The session JSONL carries the exact provider, model and thinking level in
     its last `model_change` and `thinking_level_change` events. A missing
     file, a missing event, a malformed line, or any mismatch fails closed.
-    Only the first 64 KiB are read; the identity events sit at the top.
+    Only the first 64 KiB are read; the identity events sit at the top. The
+    capped read may cut the final line mid-JSON, so when more file exists
+    beyond the cap the truncated tail line is dropped before parsing; a
+    malformed line in a fully read file still fails closed.
     """
     try:
         with open(session_path, "rb") as handle:
             raw = handle.read(PI_SESSION_READ_LIMIT)
+            capped = len(raw) == PI_SESSION_READ_LIMIT and handle.read(1) != b""
     except OSError:
         return False
     last_model: dict[str, Any] | None = None
     last_thinking: dict[str, Any] | None = None
-    for line in raw.decode("utf-8", errors="replace").splitlines():
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    if capped and lines:
+        lines = lines[:-1]
+    for line in lines:
         if not line.strip():
             continue
         try:
