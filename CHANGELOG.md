@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+## [0.15.0] - 2026-09-08
+
 - **Intent front door: plain-language confirms into slash commands.** A plain
   message that matches an intent rule (for example `ask @fable to update the
   note`, `what does everyone think about the draft`, `get consensus on the
