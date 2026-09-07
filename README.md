@@ -205,14 +205,14 @@ Use Page Up and Page Down to scroll the active room, inbox, or lane presentation
 while work continues.
 
 Typing `@` at the start of the recipient token — at the beginning of the line
-or right after `/review `, `/anneal `, `/consensus `, `/task `, or a comma still inside that token —
+or right after `/review `, `/anneal `, `/consensus `, `/task `, or `/goal `, or a comma still inside that token —
 opens a compact mention picker on the status row (`Mentions: [@astra] @fable`).
 Typed characters filter it case-insensitively, Up/Down cycle the selection,
 Tab completes the selected handle without adding a trailing space (a comma
 continues the recipient list, a space begins the message), Esc closes it with
 the text unchanged, and Enter still submits exactly what is shown. Already
 selected handles are excluded from later suggestions; `@all` is offered for
-plain messages, `/review`, `/consensus`, and `/task` but never for `/anneal`.
+plain messages, `/review`, `/consensus`, `/task`, and `/goal` but never for `/anneal`.
 
 Use `/anneal @author,@critic QUESTION` for a two-participant adversarial pass
 over one question. Both answer blind and concurrently (a missing blind reply
@@ -283,6 +283,62 @@ covered, hidden from every seat, and that same line is the completion status.
 `/minutes` runs through the review controller, so `/cancel` works and
 ordinary sends wait, and it is refused while a council round is active.
 
+### Goal mode
+
+Use `/goal [@seat,@seat] OBJECTIVE [--rounds N] [--budget MINUTES]` when you
+will leave the room and the seats should keep working on one objective without
+further prompts. Mentions select the participants; without any, every
+participant takes part. `--rounds` defaults to 4 (maximum 10) and `--budget` to
+30 minutes (maximum 180); a missing objective returns
+`Usage: /goal [@agents] OBJECTIVE [--rounds N] [--budget MINUTES]`. `/goal` is
+refused while a council round or an ordinary delivery is active, and while a
+goal runs, ordinary sends wait.
+
+Round 1 is a blind parallel pass, exactly as `/review`'s blind pool: each seat
+works independently and sees no other reply. Every later-round prompt carries
+every participant's previous-round reply verbatim, labelled by handle, and
+adds one shortcut: a seat that agrees with the current best proposal and has
+nothing to add replies with exactly `AGREED` on the first line followed by at
+most one sentence.
+
+The goal stops after a round when every participant's reply begins with
+`AGREED` (`agreed`); at the round cap (`rounds`); when the wall-clock budget,
+measured from `/goal` start, is exceeded before a round would start
+(`budget`); on `/cancel` (`cancelled`); or when any participant's turn is
+blocked or fails twice in a row (`goal_stopped`). `/cancel` stops local
+orchestration at any phase without interrupting participant tabs.
+
+After the last round the configured synthesizer writes minutes through the
+same machinery as `/minutes`, covering only this goal's items, to
+`<state dir>/<room>-goal-<UTC timestamp>.md` with the same
+refuse-to-overwrite, exclusive-create, mode 0600, remove-partial-leaf
+semantics. The room then appends one human-only `goal_result` system item with
+the rounds run, the stop reason, and the minutes path; that item is hidden
+from every seat. All goal items carry
+`meta={"goal_id", "goal_round", "goal_participants"}` and stay visible in later
+prompts only to the goal's participants, exactly like council scope, so a
+non-participant seat never receives them.
+
+Nothing in goal mode sends, publishes, pushes, or deletes. Each seat is told
+the human is away, works toward the objective with its ordinary tools, may
+create or edit files inside its own session's working tree and report paths,
+must not send messages, push, publish, delete, or take any action outside its
+session, and reports in at most about 200 words what it did or proposes and
+what remains. The status row shows `goal r/N` with the per-seat states while
+the rounds run.
+
+A two-seat run that converges early looks like:
+
+```text
+/goal @pi,@claude Land the indexer refactor while I am away --rounds 3 --budget 45
+Goal started with @pi, @claude; 3 rounds, 45 min budget; @pi synthesizes.
+pi [goal r1]> Drafted the migration in indexer.py; the tests remain.
+claude [goal r1]> The migration breaks the audit window; propose a feature flag.
+pi [goal r2]> AGREED — flagged it; I added the flag and the tests.
+claude [goal r2]> AGREED
+system [goal result]> Goal stopped after 2 round(s): agreed. Minutes: <state dir>/<room>-goal-20260907T101530Z.md.
+```
+
 ### Resumable councils
 
 Every schema-v2 consensus round (manifest `recovery_protocol:
@@ -350,10 +406,10 @@ profile setup:
 ```
 
 `/inbox` switches the transcript to a presentation-only inbox of final agent
-replies, review syntheses, system notices, and review statuses that need
-attention (non-unanimous, blocked, failed, timed out, refused, or cancelled);
-clean unanimous consensus statuses stay in the room while `consensus_final`
-remains in the inbox.
+replies, review syntheses, system notices, and review or goal statuses that
+need attention (non-unanimous, blocked, failed, timed out, refused, or
+cancelled); clean unanimous consensus statuses stay in the room while
+`consensus_final` remains in the inbox.
 
 `/lanes` switches to one stable column per configured participant, in configured
 roster order. Each lane shows human turns addressed to that participant or all,
@@ -395,6 +451,7 @@ The standalone CLI remains available:
 ./herdr-group-chat --once "/review @claude,@codex Compare these options."
 ./herdr-group-chat --once "/anneal @pi,@claude Harden this plan."
 ./herdr-group-chat --once "/consensus @claude,@codex Decide whether this is ready."
+./herdr-group-chat --once "/goal @pi,@claude Harden the plan --rounds 3"
 # In the interactive TUI: /room, /inbox, and /lanes switch presentations.
 ./herdr-group-chat --council-status
 ./herdr-group-chat --council-export council-ledger.json

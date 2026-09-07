@@ -4,6 +4,47 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+- **New `/goal` room command: unattended collaboration rounds with a
+  convergence stop.** `/goal [@seat,@seat] OBJECTIVE [--rounds N] [--budget
+  MINUTES]` lets the human leave the room while the seats keep working on one
+  objective without further prompts. Mentions select the participants (`@all`
+  allowed; none means everyone), `--rounds` defaults to 4 with a maximum of
+  10, `--budget` defaults to 30 minutes with a maximum of 180, and a missing
+  objective returns
+  `Usage: /goal [@agents] OBJECTIVE [--rounds N] [--budget MINUTES]`. The
+  command is refused while a council round or an ordinary delivery is active,
+  and while a goal runs, ordinary sends wait. Round 1 is a blind parallel pass
+  exactly as `/review`'s blind pool, prompted through the new
+  `build_goal_prompt(agent, objective, round_index, total_rounds, prior,
+  token, participants, host)`: the seat is told the human is away, works toward
+  the objective with its ordinary tools, may create or edit files inside its
+  own session's working tree and report paths, must not send messages, push,
+  publish, delete, or take any action outside its session, and reports in at
+  most about 200 words what it did or proposes and what remains. Rounds 2 to N
+  carry every participant's previous-round reply verbatim, labelled by
+  handle, and add the `AGREED` shortcut: a seat agreeing with the current best
+  proposal with nothing to add replies with exactly `AGREED` on the first line
+  followed by at most one sentence. Stop conditions, checked after each round
+  (and before starting one for the budget and local cancellation):
+  every participant's reply begins with `AGREED` (`agreed`), the round cap
+  (`rounds`), the wall-clock budget measured from `/goal` start (`budget`,
+  where 0 stops before round 1), `/cancel` (`cancelled`), or any participant's
+  turn blocked or failing twice in a row (`goal_stopped`). After the last
+  round the configured synthesizer writes minutes through the existing
+  `/minutes` machinery — same note shape, exclusions, and
+  refuse-to-overwrite, exclusive-create, mode 0600 writer — covering only this
+  goal's items, to `<state dir>/<room>-goal-<UTC timestamp>.md`, and the room
+  appends one human-only `kind="goal_result"` system item (hidden from every
+  seat) with the rounds run, stop reason, and minutes path. All goal items
+  carry `meta={"goal_id", "goal_round", "goal_participants"}` and
+  `message_visible_to_agent` keeps them visible only to the goal's
+  participants, like council scope, so later ordinary prompts to
+  non-participants omit them; goal statuses needing attention also reach the
+  inbox. Goals run through the review controller, so the status row shows
+  `goal r/N` with per-seat states, `/cancel` stops at any phase without
+  interrupting participant tabs, and the mention picker opens after
+  `/goal `. The standalone CLI runs the same command synchronously with
+  `--once '/goal ...'`.
 - **Up and Down recall input history in the room.** While the mention picker is
   closed, Up steps back through the human's own sent lines and Down steps
   forward, like a shell; the first Up stashes the unsent draft so Down past the

@@ -128,6 +128,11 @@ MENTION_SCAN_RE = re.compile(r"(?<![\w@.-])@([a-z0-9_-]+)(?![\w-])", re.IGNORECA
 REPLY_WORD_BUDGET = 150
 MINUTES_WORD_BUDGET = 400
 TASK_REPORT_WORD_BUDGET = 150
+GOAL_REPLY_WORD_BUDGET = 200
+GOAL_DEFAULT_ROUNDS = 4
+GOAL_MAX_ROUNDS = 10
+GOAL_DEFAULT_BUDGET_MINUTES = 30
+GOAL_MAX_BUDGET_MINUTES = 180
 ROUTE_RECEIPT_LINE_PREFIX = "ROUTE_RECEIPT:"
 ROUTE_RECEIPT_AGAIN_LINE = "ROUTE_RECEIPT: (as before)"
 COMMAND_HINT_LINE = (
@@ -259,6 +264,29 @@ class ReviewRound:
     recovery_pending: bool = False
 
 
+@dataclass
+class GoalRound(ReviewRound):
+    """One bounded unattended goal: parallel rounds toward one objective.
+
+    Inherits the review-round shape so the review controller, `/cancel`, and
+    the status row treat a goal as one orchestrated round; the goal-specific
+    fields carry the round cap, the wall-clock budget, the verbatim per-round
+    replies, and the stop reason for the final human-only result item.
+    """
+
+    rounds_cap: int = GOAL_DEFAULT_ROUNDS
+    budget_s: float = GOAL_DEFAULT_BUDGET_MINUTES * 60.0
+    deadline: float = 0.0
+    current_round: int = 0
+    rounds_run: int = 0
+    replies: dict[int, dict[str, str]] = field(default_factory=dict)
+    failure_streaks: dict[str, int] = field(default_factory=dict)
+    stop_reason: str | None = None
+    stop_detail: str | None = None
+    minutes_path: str | None = None
+    result_line: str | None = None
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
@@ -352,6 +380,93 @@ def parse_route(
 
 
 TASK_USAGE = "Usage: /task @agent[,@agent] INSTRUCTION"
+
+GOAL_USAGE = "Usage: /goal [@agents] OBJECTIVE [--rounds N] [--budget MINUTES]"
+
+
+@dataclass(frozen=True)
+class GoalSpec:
+    """One parsed /goal command: seats, objective, round cap, minute budget."""
+
+    participants: tuple[str, ...]
+    objective: str
+    rounds: int
+    budget_minutes: int
+
+
+def parse_goal(text: str, known_agents: Sequence[str]) -> GoalSpec:
+    """Parse "/goal [@seats] OBJECTIVE [--rounds N] [--budget MINUTES]".
+
+    Mentions are optional and `@all` is allowed; without a leading mention the
+    goal addresses every participant. `--rounds` defaults to 4 (1 to 10) and
+    `--budget` to 30 minutes (0 to 180, where 0 stops before round 1). Flags
+    are recognized anywhere after the objective text; any other `--flag` is a
+    usage error so an objective can never silently swallow a misspelled one.
+    """
+    stripped = text.strip()
+    if stripped == "/goal" or stripped.startswith("/goal "):
+        stripped = stripped.removeprefix("/goal").strip()
+    else:
+        raise ChatError(GOAL_USAGE)
+    match = MENTION_RE.match(stripped)
+    if match is not None:
+        raw_recipients, body = match.groups()
+        requested = [item.removeprefix("@").strip().lower() for item in raw_recipients.split(",")]
+        if "all" in requested:
+            participants = list(known_agents)
+        else:
+            participants = []
+            for name in requested:
+                if name not in known_agents:
+                    raise ChatError(f"unknown participant: @{name}")
+                if name not in participants:
+                    participants.append(name)
+        if not participants:
+            raise ChatError("no participants selected")
+    else:
+        if stripped.startswith("@"):
+            # A bare or malformed mention block never becomes the objective.
+            raise ChatError(GOAL_USAGE)
+        body = stripped
+        participants = list(known_agents)
+    objective_tokens: list[str] = []
+    rounds: int | None = None
+    budget: int | None = None
+    tokens = body.split()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"--rounds", "--budget"}:
+            value = tokens[index + 1] if index + 1 < len(tokens) else ""
+            try:
+                number = int(value)
+            except ValueError:
+                raise ChatError(GOAL_USAGE) from None
+            if token == "--rounds":
+                if not 1 <= number <= GOAL_MAX_ROUNDS:
+                    raise ChatError(f"--rounds must be between 1 and {GOAL_MAX_ROUNDS}")
+                rounds = number
+            else:
+                if not 0 <= number <= GOAL_MAX_BUDGET_MINUTES:
+                    raise ChatError(
+                        f"--budget must be between 0 and {GOAL_MAX_BUDGET_MINUTES} minutes"
+                    )
+                budget = number
+            index += 2
+            continue
+        if token.startswith("--"):
+            raise ChatError(GOAL_USAGE)
+        objective_tokens.append(token)
+        index += 1
+    objective = " ".join(objective_tokens).strip()
+    if not objective:
+        raise ChatError(GOAL_USAGE)
+    return GoalSpec(
+        tuple(participants),
+        objective,
+        rounds if rounds is not None else GOAL_DEFAULT_ROUNDS,
+        budget if budget is not None else GOAL_DEFAULT_BUDGET_MINUTES,
+    )
 
 
 def parse_task(text: str, known_agents: Sequence[str]) -> Route:
@@ -1623,10 +1738,13 @@ SIGNAL_KIND_NAMES: Mapping[str, str] = {
 }
 
 # Kinds an agent must never see in a prompt. Signal lines, human-only
-# hints, and minutes notes stay journal events for the human; the command
-# hint is human-facing only, minutes notes are addressed to the human, and
-# signal kinds keep their own counts in room_signal_counts.
-AGENT_HIDDEN_KINDS: frozenset[str] = frozenset({*SIGNAL_KIND_NAMES, "hint", "minutes"})
+# hints, minutes notes, and the goal result stay journal events for the human;
+# the command hint is human-facing only, minutes notes and the goal result are
+# addressed to the human, and signal kinds keep their own counts in
+# room_signal_counts.
+AGENT_HIDDEN_KINDS: frozenset[str] = frozenset(
+    {*SIGNAL_KIND_NAMES, "hint", "minutes", "goal_result"}
+)
 
 
 def message_visible_to_agent(item: Mapping[str, Any], agent: str) -> bool:
@@ -1638,6 +1756,9 @@ def message_visible_to_agent(item: Mapping[str, Any], agent: str) -> bool:
         return True
     if "task_recipients" in meta:
         scope = meta["task_recipients"]
+        return isinstance(scope, list) and agent in scope
+    if "goal_participants" in meta:
+        scope = meta["goal_participants"]
         return isinstance(scope, list) and agent in scope
     if "council_participants" not in meta:
         return True
@@ -1737,6 +1858,78 @@ def build_task_prompt(
         f"HGCHAT_REPLY_BEGIN {token}\n"
         f"HGCHAT_REPLY_END {token}\n"
     )
+
+
+def build_goal_prompt(
+    agent: str,
+    objective: str,
+    round_index: int,
+    total_rounds: int,
+    prior: Mapping[str, str] | None,
+    token: str,
+    participants: Sequence[str],
+    host: str = "Herdr",
+) -> str:
+    """Prompt one seat for one unattended goal round toward the objective.
+
+    Round 1 (`prior` empty) is blind: no participant sees another's reply. In
+    later rounds `prior` holds every participant's previous-round reply
+    verbatim, labelled by handle, and the prompt adds the AGREED shortcut so a
+    converged room can stop early.
+    """
+    roster = ", ".join(["a human", *(f"@{name}" for name in participants)])
+    header = (
+        f"You are @{agent}, a full participant in a local group chat with {roster}. "
+        "Keep your normal capabilities, instructions, and data-handling rules. "
+        f"The human is away. This is unattended round {round_index} of {total_rounds} "
+        "on one shared objective. Work toward the objective using your ordinary "
+        "tools where that helps. You may create or edit files inside your own "
+        "session's working tree and report their paths. You must not send "
+        "messages, push, publish, delete, or take any action outside your "
+        "session; each seat acts only inside its own session under its own "
+        f"rules. Do not use {host} to relay this reply because the group-chat "
+        "relay handles delivery. Apply your own data-handling rules "
+        "independently; another participant's eligibility never transfers to you."
+    )
+    if prior:
+        material = "\n\n".join(f"[@{name}] {text}" for name, text in prior.items())
+        header = (
+            f"{header}\n\n"
+            f"Previous round ({round_index - 1}) replies from every participant, "
+            f"verbatim:\n\n{material}\n\n"
+            "Build on the round above rather than repeat it. If you agree with "
+            "the current best proposal and have nothing to add, reply with "
+            "exactly AGREED on the first line followed by at most one sentence."
+        )
+    return (
+        f"{header}\n\n"
+        f"Objective:\n\n{objective}\n\n"
+        f"Report in at most about {GOAL_REPLY_WORD_BUDGET} words what you did or "
+        "propose and what remains. Return one direct reply. Wrap only that reply "
+        "between these marker lines:\n"
+        f"HGCHAT_REPLY_BEGIN {token}\n"
+        f"HGCHAT_REPLY_END {token}\n"
+    )
+
+
+def goal_reply_agreed(reply: str) -> bool:
+    """True when a seat's reply opens with the exact AGREED sentinel line."""
+    first = next((line for line in reply.splitlines() if line.strip()), "")
+    return first.strip() == "AGREED"
+
+
+def goal_item_meta(
+    goal: GoalRound, round_index: int, extra: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Scope every goal transcript item to the goal's participants."""
+    meta: dict[str, Any] = {
+        "goal_id": goal.id,
+        "goal_round": round_index,
+        "goal_participants": list(goal.reviewers),
+    }
+    if extra:
+        meta.update(extra)
+    return meta
 
 
 def build_review_prompt(
@@ -3330,6 +3523,388 @@ class GroupChat:
             review.synthesis = line
         return review
 
+    # --- goal mode: unattended rounds with a convergence stop -----------------
+
+    def plan_goal(self, text: str) -> GoalRound:
+        """Build the goal round for one parsed /goal command."""
+        spec = parse_goal(text, tuple(self.agents))
+        participants = tuple(spec.participants[: self.max_turns])
+        required = tuple(dict.fromkeys((*participants, self.synthesizer)))
+        return GoalRound(
+            id=uuid.uuid4().hex,
+            question=spec.objective,
+            reviewers=participants,
+            synthesizer=self.synthesizer,
+            prompts={},
+            question_seq=None,
+            states={agent: "queued" for agent in required},
+            mode="goal",
+            rounds_cap=spec.rounds,
+            budget_s=float(spec.budget_minutes * 60),
+        )
+
+    def goal(
+        self,
+        text: str,
+        on_state: Callable[[str, str], None] | None = None,
+    ) -> GoalRound:
+        """Run one goal synchronously; the review controller wraps it."""
+        return self.execute_goal(self.plan_goal(text), on_state)
+
+    def execute_goal(
+        self,
+        goal: GoalRound,
+        on_state: Callable[[str, str], None] | None = None,
+    ) -> GoalRound:
+        """Run bounded unattended rounds toward one objective, then minute them.
+
+        Nothing here sends, pushes, publishes, or deletes: every participant
+        turn is one ordinary session turn under the seat's own rules. Stop
+        conditions, checked after each round (and before starting one for the
+        budget and local cancellation): every reply opens with AGREED, the
+        round cap, the wall-clock budget, /cancel, or a blocked seat / two
+        consecutive failures for one seat.
+        """
+        with goal.lock:
+            if goal.cancel_event.is_set():
+                return goal
+            goal.deadline = time.monotonic() + goal.budget_s
+        required = tuple(dict.fromkeys((*goal.reviewers, goal.synthesizer)))
+        self._ensure_live(required)
+        with goal.lock:
+            if goal.cancel_event.is_set():
+                return goal
+            question_item = self.transcript.append(
+                "human",
+                goal.reviewers,
+                goal.question,
+                kind="goal",
+                round_id=goal.id,
+                meta=goal_item_meta(goal, 0),
+            )
+            goal.question_seq = question_item["seq"]
+        reason = "rounds"
+        detail: str | None = None
+        for index in range(1, goal.rounds_cap + 1):
+            if goal.cancel_event.is_set():
+                reason = "cancelled"
+                break
+            if time.monotonic() >= goal.deadline:
+                reason = "budget"
+                break
+            goal.current_round = index
+            with goal.lock:
+                previous = goal.replies.get(index - 1, {})
+                prior = {
+                    name: previous[name] for name in goal.reviewers if name in previous
+                }
+            prompts = {
+                agent: build_goal_prompt(
+                    agent,
+                    goal.question,
+                    index,
+                    goal.rounds_cap,
+                    prior,
+                    uuid.uuid4().hex,
+                    tuple(self.agents),
+                    self.host_label,
+                )
+                for agent in goal.reviewers
+            }
+            for agent in goal.reviewers:
+                self._set_review_state(goal, agent, "queued", on_state)
+            self._goal_round_pool(goal, on_state, prompts)
+            with goal.lock:
+                if goal.cancel_event.is_set():
+                    reason = "cancelled"
+                    break
+                goal.rounds_run = index
+                round_states = {
+                    agent: goal.states.get(agent, "failed") for agent in goal.reviewers
+                }
+                replies = dict(goal.replies.get(index, {}))
+                for agent in goal.reviewers:
+                    if round_states[agent] in {"failed", "timed_out"}:
+                        goal.failure_streaks[agent] = goal.failure_streaks.get(agent, 0) + 1
+                    else:
+                        goal.failure_streaks[agent] = 0
+                stopped = [
+                    agent for agent, state in round_states.items() if state == "blocked"
+                ]
+                stalled = [
+                    agent for agent in goal.reviewers if goal.failure_streaks.get(agent, 0) >= 2
+                ]
+                agreed = len(replies) == len(goal.reviewers) and all(
+                    goal_reply_agreed(replies[agent]) for agent in goal.reviewers
+                )
+            if stopped:
+                reason = "goal_stopped"
+                detail = f"@{stopped[0]} is blocked and needs attention in {self.host_label}"
+                break
+            if stalled:
+                reason = "goal_stopped"
+                detail = f"@{stalled[0]} failed twice in a row"
+                break
+            if agreed:
+                reason = "agreed"
+                break
+        minutes_path: str | None = None
+        if not goal.cancel_event.is_set():
+            minutes_path = self._goal_minutes(goal, on_state)
+        with goal.lock:
+            goal.stop_reason = reason
+            goal.stop_detail = detail
+            goal.minutes_path = minutes_path
+            rounds_run = goal.rounds_run
+            cancelled = goal.cancel_event.is_set()
+        head = f"Goal stopped after {rounds_run} round(s): {reason}"
+        if detail:
+            head += f" ({detail})"
+        if minutes_path is not None:
+            body = f"{head}. Minutes: {minutes_path}."
+        elif cancelled:
+            body = f"{head}. Participants may continue working; minutes were not written."
+        else:
+            body = f"{head}. Minutes were not written."
+        self.transcript.append(
+            "system",
+            ("human",),
+            body,
+            kind="goal_result",
+            round_id=goal.id,
+            meta=goal_item_meta(
+                goal,
+                rounds_run,
+                {
+                    "rounds_run": rounds_run,
+                    "stop_reason": reason,
+                    "stop_detail": detail,
+                    "minutes_path": minutes_path,
+                },
+            ),
+        )
+        with goal.lock:
+            goal.result_line = body
+        return goal
+
+    def _goal_round_pool(
+        self,
+        goal: GoalRound,
+        on_state: Callable[[str, str], None] | None,
+        prompts: Mapping[str, str],
+    ) -> None:
+        with ThreadPoolExecutor(
+            max_workers=max(1, len(goal.reviewers)), thread_name_prefix="hgchat-goal"
+        ) as pool:
+            futures = {
+                pool.submit(self._run_goal_turn, goal, agent, prompts[agent], on_state): agent
+                for agent in goal.reviewers
+            }
+            for future in as_completed(futures):
+                self._record_goal_turn(goal, futures[future], future, on_state)
+
+    def _run_goal_turn(
+        self,
+        goal: GoalRound,
+        agent: str,
+        prompt: str,
+        on_state: Callable[[str, str], None] | None,
+    ) -> tuple[str, str]:
+        if not self._begin_review_call(goal, agent, "working", on_state):
+            raise ChatError("goal cancelled")
+        return self.client.turn(
+            self.agents[agent],
+            prompt,
+            self._timeout_for(agent),
+            goal.cancel_event,
+            agent_label=agent,
+        )
+
+    def _record_goal_turn(
+        self,
+        goal: GoalRound,
+        agent: str,
+        future: Future[tuple[str, str]],
+        on_state: Callable[[str, str], None] | None,
+    ) -> None:
+        round_index = goal.current_round
+        try:
+            status, reply = future.result()
+        except ChatError as error:
+            state = failure_state(error)
+            self._commit_goal_phase(
+                goal,
+                agent,
+                state,
+                on_state,
+                round_index,
+                message=(
+                    "system",
+                    ("human",),
+                    f"@{agent} goal round {round_index} {state.replace('_', ' ')}: {error}",
+                    "goal_status",
+                ),
+            )
+            return
+        except Exception as error:
+            self._commit_goal_phase(
+                goal,
+                agent,
+                "failed",
+                on_state,
+                round_index,
+                message=(
+                    "system",
+                    ("human",),
+                    f"@{agent} goal round {round_index} failed: unexpected {error!r}",
+                    "goal_status",
+                ),
+            )
+            return
+        if status == "blocked":
+            self._commit_goal_phase(
+                goal,
+                agent,
+                "blocked",
+                on_state,
+                round_index,
+                message=(
+                    "system",
+                    ("human",),
+                    f"@{agent} is blocked and needs attention in {self.host_label}.",
+                    "goal_status",
+                ),
+            )
+            return
+        if not reply.strip():
+            self._commit_goal_phase(
+                goal,
+                agent,
+                "failed",
+                on_state,
+                round_index,
+                message=(
+                    "system",
+                    ("human",),
+                    f"@{agent} goal round {round_index} failed: empty response",
+                    "goal_status",
+                ),
+            )
+            return
+        self._commit_goal_phase(
+            goal,
+            agent,
+            "done",
+            on_state,
+            round_index,
+            message=(agent, ("human", "all"), reply, "goal_reply"),
+            store_reply=reply,
+        )
+
+    def _commit_goal_phase(
+        self,
+        goal: GoalRound,
+        agent: str,
+        state: str,
+        on_state: Callable[[str, str], None] | None,
+        round_index: int,
+        *,
+        message: tuple[str, tuple[str, ...], str, str] | None = None,
+        store_reply: str | None = None,
+    ) -> bool:
+        """Commit one goal-turn outcome atomically with its cancellation decision."""
+        with goal.lock:
+            if goal.cancel_event.is_set():
+                goal.states[agent] = "cancelled"
+                effective_state = "cancelled"
+                committed = False
+            else:
+                if message is not None:
+                    sender, recipients, body, kind = message
+                    self.transcript.append(
+                        sender,
+                        recipients,
+                        body,
+                        kind=kind,
+                        round_id=goal.id,
+                        meta=goal_item_meta(goal, round_index),
+                    )
+                if store_reply is not None:
+                    goal.replies.setdefault(round_index, {})[agent] = store_reply
+                goal.states[agent] = state
+                effective_state = state
+                committed = True
+        if on_state is not None:
+            on_state(agent, effective_state)
+        return committed
+
+    def _goal_minutes(
+        self,
+        goal: GoalRound,
+        on_state: Callable[[str, str], None] | None,
+    ) -> str | None:
+        """Write goal minutes through the /minutes machinery, goal-scoped.
+
+        Covers only this goal's transcript items, keeps the /minutes note shape
+        and writer semantics, and writes to the room state directory as
+        `<room>-goal-<UTC timestamp>.md`. A failed, blocked, or cancelled
+        synthesizer turn returns None so the goal result still records the
+        outcome truthfully.
+        """
+        covered = [
+            item
+            for item in self.transcript.read()
+            if _message_meta(item).get("goal_id") == goal.id
+            and item.get("kind") != "goal_result"
+        ]
+        if not self._begin_review_call(goal, goal.synthesizer, "synthesizing", on_state):
+            return None
+        prompt = build_minutes_prompt(
+            goal.synthesizer,
+            covered,
+            uuid.uuid4().hex,
+            self.host_label,
+        )
+        try:
+            status, reply = self.client.turn(
+                self.agents[goal.synthesizer],
+                prompt,
+                self._timeout_for(goal.synthesizer),
+                goal.cancel_event,
+                agent_label=goal.synthesizer,
+            )
+        except ChatError as error:
+            if goal.cancel_event.is_set():
+                self._set_review_state(goal, goal.synthesizer, "cancelled", on_state)
+            else:
+                self._set_review_state(
+                    goal, goal.synthesizer, failure_state(error), on_state
+                )
+            return None
+        if goal.cancel_event.is_set():
+            self._set_review_state(goal, goal.synthesizer, "cancelled", on_state)
+            return None
+        if status == "blocked":
+            self._set_review_state(goal, goal.synthesizer, "blocked", on_state)
+            return None
+        if not reply.strip():
+            self._set_review_state(goal, goal.synthesizer, "failed", on_state)
+            return None
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        path = self.transcript.state_dir / f"{self.transcript.room}-goal-{stamp}.md"
+        try:
+            written = write_private_leaf(
+                reply.encode("utf-8"),
+                path,
+                subject="goal minutes",
+                label="goal minutes file",
+            )
+        except ChatError:
+            self._set_review_state(goal, goal.synthesizer, "failed", on_state)
+            return None
+        self._set_review_state(goal, goal.synthesizer, "done", on_state)
+        return str(written)
+
     def prepare_review(self, text: str) -> ReviewRound:
         review = self.plan_review(text)
         self._activate_review(review)
@@ -4732,6 +5307,14 @@ def _message_label(item: Mapping[str, Any]) -> str:
         label += " [final]"
     elif kind == "consensus_status":
         label += " [consensus status]"
+    elif kind == "goal":
+        label += " [goal]"
+    elif kind == "goal_reply":
+        label += f" [goal r{_message_meta(item).get('goal_round', '?')}]"
+    elif kind == "goal_status":
+        label += " [goal status]"
+    elif kind == "goal_result":
+        label += " [goal result]"
     return label
 
 
@@ -4790,7 +5373,7 @@ def inbox_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
                 "refused",
             }:
                 kept.append(item)
-        elif kind == "review_status":
+        elif kind in {"review_status", "goal_status"}:
             body = _message_body(item).lower()
             if any(marker in body for marker in attention_markers):
                 kept.append(item)
@@ -5124,7 +5707,7 @@ def visible_wrapped_lines(
     return lines[start:end], max_offset
 
 
-MENTION_COMMAND_PREFIXES = ("/review ", "/anneal ", "/consensus ", "/task ")
+MENTION_COMMAND_PREFIXES = ("/review ", "/anneal ", "/consensus ", "/task ", "/goal ")
 MENTION_NAME_RE = re.compile(r"@([a-z0-9_-]+)", re.IGNORECASE)
 
 
@@ -5370,6 +5953,9 @@ class ReviewController:
                 # The minutes line naming the written path and covered seq
                 # range is the outcome the human needs; repeat it verbatim.
                 notice = review.synthesis
+            elif review.mode == "goal" and isinstance(review, GoalRound) and review.result_line:
+                # The goal result line is likewise the human-facing outcome.
+                notice = review.result_line
             else:
                 notice = f"{label} complete."
             self._last = review
@@ -5426,6 +6012,18 @@ class ReviewController:
                 lambda: self.chat.run_minutes(review, target, self._on_state), review
             )
         return f"Minutes started; @{review.synthesizer} synthesizes."
+
+    def start_goal(self, text: str) -> str:
+        with self._lock:
+            if self._active is not None:
+                raise ChatError("a review is already running")
+            goal = self.chat.plan_goal(text)
+            self._launch(lambda: self.chat.execute_goal(goal, self._on_state), goal)
+        seats = ", @".join(goal.reviewers)
+        return (
+            f"Goal started with @{seats}; {goal.rounds_cap} rounds, "
+            f"{int(goal.budget_s // 60)} min budget; @{goal.synthesizer} synthesizes."
+        )
 
     def start_resume(self) -> str:
         with self._lock:
@@ -5519,8 +6117,20 @@ class ReviewController:
             review = self._active
             order = tuple(dict.fromkeys((*review.reviewers, review.synthesizer)))
             labels = [f"@{name} {self._states.get(name, 'queued')}" for name in order]
+            if isinstance(review, GoalRound):
+                return (
+                    f"goal r{review.current_round}/{review.rounds_cap} · "
+                    + " · ".join(labels)
+                )
             prefix = review.mode.title()
         return f"{prefix}: " + " · ".join(labels)
+
+    def refusal_line(self) -> str:
+        """Name what blocks an ordinary send while a controller round runs."""
+        with self._lock:
+            if isinstance(self._active, GoalRound):
+                return "A goal is running; use /cancel or wait before sending."
+        return "A council round is running; use /cancel or wait before sending."
 
     def clear_notice(self) -> None:
         with self._lock:
@@ -5664,6 +6274,7 @@ def handle_local_command(
         return (
             "Commands: /task @agent[,@agent] INSTRUCTION · /review [@agents] QUESTION · "
             "/anneal @author,@critic QUESTION · /consensus [@agents] QUESTION · "
+            "/goal [@agents] OBJECTIVE [--rounds N] [--budget MINUTES] · "
             "/retry <agent|synthesis> · /cancel · /agents · "
             "/council status · /council export PATH · /council resume · /minutes [PATH] · "
             "/show <agent> · /layout compact|grid|grid2 · /inbox · /lanes · /room · "
@@ -5728,6 +6339,12 @@ def handle_local_command(
             return f"Unknown participant: {name}"
         chat.client.focus(chat.agents[name])
         return f"Focused @{name}."
+    if stripped == "/goal" or stripped.startswith("/goal "):
+        if reviews is None:
+            return "Review control is unavailable."
+        if reviews.is_active():
+            return "A council round is running; use /cancel or wait before sending."
+        return reviews.start_goal(stripped)
     if stripped == "/task" or stripped.startswith("/task "):
         # A task is delivered to seats, not handled locally: return None so the
         # caller routes it through the ordinary delivery controller, whose
@@ -6244,7 +6861,7 @@ def _run_tui_loop(
                 buffer = ""
                 continue
             if reviews.is_active():
-                status = "A council round is running; use /cancel or wait before sending."
+                status = reviews.refusal_line()
                 status_override = "independent"
                 buffer = ""
                 continue
@@ -6415,6 +7032,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 created = transcript.read()[before:]
             elif args.once.strip() == "/task" or args.once.strip().startswith("/task "):
                 created = chat.dispatch(args.once, task=True)
+            elif args.once.strip() == "/goal" or args.once.strip().startswith("/goal "):
+                chat.goal(args.once)
+                created = transcript.read()[before:]
             elif args.once.strip() == "/minutes" or args.once.strip().startswith("/minutes "):
                 target = args.once.strip().removeprefix("/minutes").strip()
                 chat.minutes(target or None)

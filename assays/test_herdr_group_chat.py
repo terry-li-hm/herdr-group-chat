@@ -47,6 +47,13 @@ claude_project_dir_name = namespace.get("claude_project_dir_name")
 build_prompt = namespace["build_prompt"]
 build_task_prompt = namespace.get("build_task_prompt")
 parse_task = namespace.get("parse_task")
+parse_goal = namespace.get("parse_goal")
+build_goal_prompt = namespace.get("build_goal_prompt")
+goal_reply_agreed = namespace.get("goal_reply_agreed")
+GoalSpec = namespace.get("GoalSpec")
+GOAL_USAGE = namespace.get("GOAL_USAGE")
+GOAL_MAX_ROUNDS = namespace.get("GOAL_MAX_ROUNDS")
+GOAL_MAX_BUDGET_MINUTES = namespace.get("GOAL_MAX_BUDGET_MINUTES")
 build_minutes_prompt = namespace.get("build_minutes_prompt")
 minutes_items = namespace.get("minutes_items")
 TASK_USAGE = namespace.get("TASK_USAGE")
@@ -11064,3 +11071,455 @@ def test_minutes_refused_while_a_council_round_runs(tmp_path: Path) -> None:
         "A council round is running; use /cancel or wait before sending."
     )
     assert transcript.read() == []
+
+
+class GoalClient(FakeClient):
+    """FakeClient whose seat turns follow a per-target script.
+
+    Minutes prompts (detected by the shared marker) always return the canned
+    note; a script entry may be a plain reply string or a (status, reply)
+    tuple returned verbatim, so a seat can be scripted blocked.
+    """
+
+    def __init__(self, script: dict[str, list[object]], note: str = "# Minutes\n") -> None:
+        super().__init__()
+        self.script = {target: list(entries) for target, entries in script.items()}
+        self.note = note
+        self.minutes_prompts: list[str] = []
+
+    def turn(
+        self,
+        target: str,
+        prompt: str,
+        timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+        agent_label: str | None = None,
+    ) -> tuple[str, str]:
+        self.calls.append((target, prompt))
+        if MINUTES_MARKER in prompt:
+            self.minutes_prompts.append(prompt)
+            return "done", self.note
+        entries = self.script.get(target)
+        assert entries, f"unexpected goal turn for {target}"
+        entry = entries.pop(0)
+        if isinstance(entry, tuple):
+            status, reply = entry
+            return str(status), str(reply)
+        return "done", str(entry)
+
+
+def make_goal_chat(
+    tmp_path: Path,
+    script: dict[str, list[object]],
+    note: str = "# Minutes\n",
+) -> tuple[GroupChat, GoalClient, Transcript]:
+    transcript = Transcript(tmp_path, "goal-room")
+    client = GoalClient(script, note)
+    chat = GroupChat(
+        transcript, {"pi": "pi-peer", "claude": "claude-peer"}, client, synthesizer="pi"
+    )
+    return chat, client, transcript
+
+
+def goal_result(transcript: Transcript) -> dict[str, object]:
+    items = [
+        item for item in transcript.read() if item.get("kind") == "goal_result"
+    ]
+    assert len(items) == 1
+    return items[0]
+
+
+def test_goal_parse_selects_mentions_flags_and_defaults() -> None:
+    agents = ("pi", "claude", "codex", "grok")
+    spec = parse_goal("/goal @pi,@claude harden the plan --rounds 3 --budget 45", agents)
+    assert spec == GoalSpec(("pi", "claude"), "harden the plan", 3, 45)
+    assert parse_goal("/goal ship it", agents) == GoalSpec(agents, "ship it", 4, 30)
+    assert parse_goal("/goal @all ship it", agents).participants == agents
+    assert parse_goal("  /goal   @pi   trim me  --rounds 1 ", agents) == GoalSpec(
+        ("pi",), "trim me", 1, 30
+    )
+    assert parse_goal("/goal ship it --budget 0", agents).budget_minutes == 0
+    for bad in ("/goal", "/goal --rounds 3", "/goal @pi", "/goal --budget"):
+        with pytest.raises(ChatError, match=re.escape(GOAL_USAGE)):
+            parse_goal(bad, agents)
+    with pytest.raises(ChatError, match="unknown participant: @nobody"):
+        parse_goal("/goal @nobody do X", agents)
+    with pytest.raises(ChatError, match=r"--rounds must be between 1 and 10"):
+        parse_goal("/goal x --rounds 11", agents)
+    with pytest.raises(ChatError, match=r"--rounds must be between 1 and 10"):
+        parse_goal("/goal x --rounds 0", agents)
+    with pytest.raises(ChatError, match=r"--budget must be between 0 and 180 minutes"):
+        parse_goal("/goal x --budget 181", agents)
+    with pytest.raises(ChatError, match=r"--budget must be between 0 and 180 minutes"):
+        parse_goal("/goal x --budget -5", agents)
+    with pytest.raises(ChatError, match=re.escape(GOAL_USAGE)):
+        parse_goal("/goal x --energy 5", agents)
+    with pytest.raises(ChatError, match=re.escape(GOAL_USAGE)):
+        parse_goal("/goal x --rounds many", agents)
+
+
+def test_goal_prompt_is_blind_and_bounded_in_round_one() -> None:
+    token = "b" * 32
+    prompt = build_goal_prompt("pi", "Refactor the indexer", 1, 4, {}, token, ("pi", "claude"))
+    assert "The human is away" in prompt
+    assert "unattended round 1 of 4" in prompt
+    assert "using your ordinary tools where that helps" in prompt
+    assert "create or edit files inside your own session's working tree" in prompt
+    assert (
+        "must not send messages, push, publish, delete, "
+        "or take any action outside your session" in prompt
+    )
+    assert "at most about 200 words" in prompt
+    assert "what you did or propose and what remains" in prompt
+    assert "Do not use Herdr to relay" in prompt
+    assert f"HGCHAT_REPLY_BEGIN {token}" in prompt
+    assert f"HGCHAT_REPLY_END {token}" in prompt
+    assert "AGREED" not in prompt
+    assert "Previous round" not in prompt
+
+
+def test_goal_prompt_shares_prior_verbatim_and_adds_agreed_in_later_rounds() -> None:
+    token = "c" * 32
+    prior = {"pi": "Proposal: pin the schema.", "claude": "Objection: the audit is open."}
+    prompt = build_goal_prompt("pi", "Settle the schema", 2, 3, prior, token, ("pi", "claude"))
+    assert "unattended round 2 of 3" in prompt
+    assert "[@pi] Proposal: pin the schema." in prompt
+    assert "[@claude] Objection: the audit is open." in prompt
+    assert "verbatim" in prompt
+    assert "exactly AGREED on the first line followed by at most one sentence" in prompt
+    assert prompt.count("Proposal: pin the schema.") == 1
+
+
+def test_goal_reply_agreed_requires_the_exact_sentinel_first_line() -> None:
+    assert goal_reply_agreed("AGREED\nPlan A stands.")
+    assert goal_reply_agreed("\n\n  AGREED  \nOne sentence.")
+    assert not goal_reply_agreed("AGREED, with reservations.\nMore.")
+    assert not goal_reply_agreed("I AGREED with the plan.")
+    assert not goal_reply_agreed("")
+
+
+def test_goal_stops_after_unanimous_agreement_and_writes_minutes(tmp_path: Path) -> None:
+    note = "# Minutes\n\n## Decisions\n\nShip plan A.\n"
+    script = {
+        "pi-peer": ["Drafted plan A; the migration notes remain.", "AGREED\nPlan A stands."],
+        "claude-peer": ["Objection: plan A ignores the audit window.", "AGREED"],
+    }
+    chat, client, transcript = make_goal_chat(tmp_path, script, note=note)
+
+    goal = chat.goal("/goal @pi,@claude settle the release --rounds 4")
+
+    assert goal.stop_reason == "agreed"
+    assert goal.rounds_run == 2
+    assert goal.minutes_path is not None
+    minutes = Path(goal.minutes_path)
+    assert minutes.parent == tmp_path
+    assert minutes.name.startswith("goal-room-goal-")
+    assert minutes.name.endswith(".md")
+    assert minutes.read_text() == note
+    assert minutes.stat().st_mode & 0o777 == 0o600
+    # Two rounds of two seat turns, then one goal-scoped minutes prompt.
+    assert len(client.calls) == 5
+    assert len(client.minutes_prompts) == 1
+    minutes_prompt = client.minutes_prompts[0]
+    assert "[seq 1] [human] settle the release" in minutes_prompt
+    assert "[pi] Drafted plan A; the migration notes remain." in minutes_prompt
+    assert "Objection: plan A ignores the audit window." in minutes_prompt
+    result = goal_result(transcript)
+    assert result["sender"] == "system"
+    assert result["recipients"] == ["human"]
+    meta = result["meta"]
+    assert meta["rounds_run"] == 2
+    assert meta["stop_reason"] == "agreed"
+    assert meta["minutes_path"] == str(minutes)
+    assert meta["goal_id"] == goal.id
+    assert meta["goal_participants"] == ["pi", "claude"]
+    # The result is hidden from every seat, participants included.
+    assert not message_visible_to_agent(result, "pi")
+    assert not message_visible_to_agent(result, "claude")
+
+
+def test_goal_stops_at_the_round_cap_with_reason_rounds(tmp_path: Path) -> None:
+    script = {
+        "pi-peer": ["round one from pi", "round two from pi"],
+        "claude-peer": ["round one from claude", "round two from claude"],
+    }
+    chat, client, transcript = make_goal_chat(tmp_path, script)
+
+    goal = chat.goal("/goal @pi,@claude keep polishing --rounds 2")
+
+    assert goal.stop_reason == "rounds"
+    assert goal.rounds_run == 2
+    assert len(client.calls) == 5
+    assert goal.minutes_path is not None
+    assert Path(goal.minutes_path).exists()
+    assert goal_result(transcript)["meta"]["stop_reason"] == "rounds"
+
+
+def test_goal_zero_budget_stops_before_round_one_and_still_writes_a_result(
+    tmp_path: Path,
+) -> None:
+    note = "# Minutes\n"
+    script = {"pi-peer": ["never prompted"], "claude-peer": ["never prompted"]}
+    chat, client, transcript = make_goal_chat(tmp_path, script, note=note)
+
+    goal = chat.goal("/goal @pi,@claude tidy the notes --budget 0")
+
+    assert goal.stop_reason == "budget"
+    assert goal.rounds_run == 0
+    # No seat was prompted at all; only the synthesizer's minutes turn ran.
+    assert [target for target, _ in client.calls] == ["pi-peer"]
+    assert len(client.minutes_prompts) == 1
+    assert "[seq 1] [human] tidy the notes" in client.minutes_prompts[0]
+    assert goal.minutes_path is not None
+    assert Path(goal.minutes_path).read_text() == note
+    meta = goal_result(transcript)["meta"]
+    assert meta["stop_reason"] == "budget"
+    assert meta["rounds_run"] == 0
+    assert meta["minutes_path"] == goal.minutes_path
+    assert not any(
+        item.get("kind") == "goal_reply" for item in transcript.read()
+    )
+
+
+def test_goal_cancel_mid_round_records_result_and_prompts_nothing_further(
+    tmp_path: Path,
+) -> None:
+    chat, client, transcript = make_cancellation_aware_ordinary_chat(tmp_path)
+    reviews = ReviewController(chat)
+
+    assert handle_local_command(
+        "/goal @pi,@claude fix the build", chat, reviews
+    ).startswith("Goal started")
+    assert client.started.wait(HARNESS_WAIT_S)
+    assert _wait_until(lambda: len(client.calls) == 2, HARNESS_WAIT_S)
+    assert reviews.is_active()
+    assert reviews.status() == "goal r1/4 · @pi working · @claude working"
+    assert reviews.cancel() == (
+        "Local cancellation requested; participants may continue working."
+    )
+    assert reviews.wait(HARNESS_WAIT_S)
+    assert not reviews.is_active()
+
+    # Round 1 only: two blocked seat turns, no round 2, no minutes prompt.
+    assert len(client.calls) == 2
+    assert all(MINUTES_MARKER not in prompt for _, prompt in client.calls)
+    meta = goal_result(transcript)["meta"]
+    assert meta["stop_reason"] == "cancelled"
+    assert meta["minutes_path"] is None
+    assert not list(tmp_path.glob("*-goal-*.md"))
+    assert reviews.status() == "Goal cancelled locally; participants may continue working."
+
+
+def test_goal_round_two_prompts_carry_every_round_one_reply_and_round_one_none(
+    tmp_path: Path,
+) -> None:
+    pi_first = "Proposal: pin the schema in v2 and note the migration."
+    claude_first = "Objection: v2 cannot land before the audit closes."
+    script = {
+        "pi-peer": [pi_first, "AGREED\nConverged on the audit precondition."],
+        "claude-peer": [claude_first, "AGREED"],
+    }
+    chat, client, _transcript = make_goal_chat(tmp_path, script)
+
+    chat.goal("/goal settle the schema --rounds 2")
+
+    prompts_by_target: dict[str, list[str]] = {}
+    for target, prompt in client.calls:
+        if MINUTES_MARKER in prompt:
+            continue
+        prompts_by_target.setdefault(target, []).append(prompt)
+    first_round = [prompts[0] for prompts in prompts_by_target.values()]
+    second_round = [prompts[1] for prompts in prompts_by_target.values()]
+    assert len(first_round) == 2
+    assert len(second_round) == 2
+    for prompt in first_round:
+        assert "unattended round 1 of 2" in prompt
+        assert pi_first not in prompt
+        assert claude_first not in prompt
+        assert "AGREED" not in prompt
+    for prompt in second_round:
+        assert "unattended round 2 of 2" in prompt
+        assert f"[@pi] {pi_first}" in prompt
+        assert f"[@claude] {claude_first}" in prompt
+        assert "exactly AGREED on the first line" in prompt
+
+
+def test_goal_items_stay_scoped_to_participants_in_later_prompts(tmp_path: Path) -> None:
+    chat, client, transcript = make_chat(tmp_path)
+
+    goal = chat.goal("/goal @pi,@claude reorganize the vault --rounds 2")
+
+    assert goal.stop_reason == "rounds"
+    items = transcript.read()
+    question = next(item for item in items if item.get("kind") == "goal")
+    reply = next(item for item in items if item.get("kind") == "goal_reply")
+    for item in (question, reply):
+        meta = item["meta"]
+        assert meta["goal_id"] == goal.id
+        assert isinstance(meta["goal_round"], int)
+        assert meta["goal_participants"] == ["pi", "claude"]
+        assert message_visible_to_agent(item, "pi")
+        assert message_visible_to_agent(item, "claude")
+        assert not message_visible_to_agent(item, "codex")
+        assert not message_visible_to_agent(item, "grok")
+
+    chat.dispatch("@codex status check")
+    codex_prompt = client.calls[-1][1]
+    assert "reorganize the vault" not in codex_prompt
+    assert "reply from pi-peer" not in codex_prompt
+    assert "reply from claude-peer" not in codex_prompt
+
+    chat.dispatch("@pi status check")
+    pi_prompt = client.calls[-1][1]
+    assert "reorganize the vault" in pi_prompt
+    assert "reply from claude-peer" in pi_prompt
+
+
+def test_goal_blocked_seat_stops_immediately_with_goal_stopped(tmp_path: Path) -> None:
+    script = {
+        "pi-peer": [("blocked", "stuck on a dialog")],
+        "claude-peer": ["fine to continue"],
+    }
+    chat, client, transcript = make_goal_chat(tmp_path, script)
+
+    goal = chat.goal("/goal @pi,@claude unblock the release --rounds 3")
+
+    assert goal.stop_reason == "goal_stopped"
+    assert goal.stop_detail is not None and "blocked" in goal.stop_detail
+    assert goal.rounds_run == 1
+    seat_prompts = [prompt for _, prompt in client.calls if MINUTES_MARKER not in prompt]
+    assert len(seat_prompts) == 2
+    status_line = next(item for item in transcript.read() if item.get("kind") == "goal_status")
+    assert "@pi is blocked" in status_line["body"]
+    assert message_visible_to_agent(status_line, "pi")
+    assert not message_visible_to_agent(status_line, "codex")
+    # Attention goal statuses reach the human's inbox like review statuses.
+    assert status_line in inbox_messages(transcript.read())
+    meta = goal_result(transcript)["meta"]
+    assert meta["stop_reason"] == "goal_stopped"
+    assert meta["rounds_run"] == 1
+
+
+def test_goal_seat_failing_twice_in_a_row_stops_with_goal_stopped(tmp_path: Path) -> None:
+    script = {
+        "pi-peer": ["", ""],
+        "claude-peer": ["first attempt", "second attempt"],
+    }
+    chat, client, transcript = make_goal_chat(tmp_path, script)
+
+    goal = chat.goal("/goal @pi,@claude stabilize the build --rounds 4")
+
+    assert goal.stop_reason == "goal_stopped"
+    assert goal.stop_detail is not None and "twice in a row" in goal.stop_detail
+    assert goal.rounds_run == 2
+    seat_prompts = [prompt for _, prompt in client.calls if MINUTES_MARKER not in prompt]
+    assert len(seat_prompts) == 4
+    assert goal_result(transcript)["meta"]["stop_reason"] == "goal_stopped"
+
+
+def test_goal_usage_refusals_and_help_surface(tmp_path: Path) -> None:
+    chat, _, transcript = make_chat(tmp_path)
+    assert handle_local_command("/goal", chat, None) == "Review control is unavailable."
+    assert handle_local_command("/goal @pi work", chat, ActiveReviewStub()) == (
+        "A council round is running; use /cancel or wait before sending."
+    )
+    line = handle_local_command("/help", chat, None)
+    assert "/goal [@agents] OBJECTIVE [--rounds N] [--budget MINUTES]" in line
+    assert mention_fragment("/goal @p") == (6, "p")
+    assert "all" in (mention_suggestions("/goal @", ("pi", "claude")) or ())
+    with pytest.raises(ChatError, match=re.escape(GOAL_USAGE)):
+        chat.goal("/goal")
+    with pytest.raises(ChatError, match=r"--rounds must be between 1 and 10"):
+        chat.goal("/goal work --rounds 99")
+    assert transcript.read() == []
+
+
+def test_goal_status_row_and_completion_notice_through_the_controller(
+    tmp_path: Path,
+) -> None:
+    chat, client, transcript = make_blocking_ordinary_chat(tmp_path)
+    reviews = ReviewController(chat)
+
+    assert handle_local_command("/goal keep improving the notes --rounds 2", chat, reviews) == (
+        "Goal started with @pi, @claude; 2 rounds, 30 min budget; @pi synthesizes."
+    )
+    assert client.started.wait(HARNESS_WAIT_S)
+    assert _wait_until(lambda: len(client.calls) == 2, HARNESS_WAIT_S)
+    assert reviews.status() == "goal r1/2 · @pi working · @claude working"
+    assert reviews.refusal_line() == "A goal is running; use /cancel or wait before sending."
+
+    client.release.set()
+    assert reviews.wait(HARNESS_WAIT_S)
+    assert not reviews.is_active()
+
+    result = goal_result(transcript)
+    assert result["meta"]["stop_reason"] == "rounds"
+    assert reviews.status() == result["body"]
+    assert "Minutes:" in reviews.status()
+
+
+def test_tui_refuses_goal_commands_while_an_ordinary_delivery_drains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, client, transcript = make_blocking_ordinary_chat(tmp_path)
+    deliveries: list[DeliveryController] = []
+
+    class TrackingDeliveryController(DeliveryController):
+        def __init__(self, tracked_chat: object) -> None:
+            super().__init__(tracked_chat)
+            deliveries.append(self)
+
+    draws: list[str] = []
+    keys = [
+        *list("/task @pi do the thing\n"),
+        "WAIT_FOR_TURN",
+        *list("/goal @pi more unattended work\n"),
+        "RELEASE_WORKER",
+        "\x11",
+    ]
+    screen = ScriptedTuiScreen(
+        keys,
+        client,
+        release_wait=lambda: _wait_until(lambda: not deliveries[0].is_active(), HARNESS_WAIT_S),
+    )
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    monkeypatch.setattr(
+        module,
+        "draw_tui",
+        lambda _screen, _transcript, _room, _buffer, status, _participants, _scroll=0, **_kw: (
+            draws.append(status) or 0
+        ),
+    )
+    monkeypatch.setattr(module, "DeliveryController", TrackingDeliveryController)
+
+    run_tui(screen, chat, "goal-refused-room")
+
+    assert (
+        "Ordinary delivery is still draining; use /cancel or wait before starting more work."
+        in draws
+    )
+    assert [target for target, _ in client.calls] == ["pi-peer"]
+    assert "Task from the human" in client.calls[0][1]
+    assert not [item for item in transcript.read() if item.get("kind") == "goal"]
+
+
+def test_once_routes_goal_commands_through_the_goal_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[str] = []
+
+    class CommandOnceChat:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def goal(self, text: str, on_state: object = None) -> None:
+            calls.append(text)
+
+    monkeypatch.setattr(module, "GroupChat", CommandOnceChat)
+    assert (
+        main(["--state-dir", str(tmp_path), "--room", "once-goal", "--once", "/goal @pi x"]) == 0
+    )
+    assert calls == ["/goal @pi x"]
+    assert capsys.readouterr().out == ""
