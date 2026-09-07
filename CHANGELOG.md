@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+- **Pi participants' route receipt names the account surface.** `new-room`
+  now runs `pi auth check --provider <provider>` as a preflight beside the
+  catalog check, fails closed with `failed the native auth preflight` when
+  it does not print `ready`, and records `account pi auth check ready` in
+  the profile receipt for every Pi participant. A peer bound by a
+  disclosure rule can read provider, model and account from the transcript
+  before its first protected read instead of touring the constitution and
+  stopping one field short. Non-Pi entries are unchanged.
 - **Plain messages follow the last addressed set.** A plain message now goes
   to the recipients of your most recent message, filtered to current
   participants in roster order, and a fresh room starts addressed to everyone,

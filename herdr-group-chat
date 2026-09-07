@@ -4147,6 +4147,8 @@ def load_profile_receipt(
             "provider" in entry and not entry["provider"]
         ):
             raise ChatError("the profile receipt payload is invalid")
+        if "account" in entry and not (isinstance(entry["account"], str) and entry["account"]):
+            raise ChatError("the profile receipt payload is invalid")
     receipt_mapping = {entry["role"]: entry["target"] for entry in entries}
     if len(receipt_mapping) != len(entries) or receipt_mapping != dict(agents):
         raise ChatError("the profile receipt does not match this room's agent mappings")
@@ -4160,12 +4162,18 @@ def profile_receipt_body(payload: Mapping[str, Any]) -> str:
         fields = [
             f"role @{entry['role']}",
             f"harness {entry['harness']}",
-            f"target {entry['target']}",
-            f"model {entry['model']}",
-            f"effort {entry['effort']}",
         ]
         if entry.get("provider"):
-            fields.insert(2, f"provider {entry['provider']}")
+            fields.append(f"provider {entry['provider']}")
+        if entry.get("account"):
+            fields.append(f"account {entry['account']}")
+        fields.extend(
+            [
+                f"target {entry['target']}",
+                f"model {entry['model']}",
+                f"effort {entry['effort']}",
+            ]
+        )
         parts.append(" · ".join([*fields, "native-ui verified"]))
     return f"{payload['profile']} room profile receipt (non-secret): " + "; ".join(parts)
 

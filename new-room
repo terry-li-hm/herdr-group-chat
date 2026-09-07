@@ -839,6 +839,34 @@ def catalog_proof(participant: Participant) -> bool:
     )
 
 
+def native_auth_ready(provider: str) -> bool:
+    """Require `pi auth check` to end on a bare `ready` line for this provider."""
+    command = ["pi", "auth", "check", "--provider", provider]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return bool(lines) and lines[-1] == "ready"
+
+
+def auth_proof(participant: Participant) -> bool:
+    """Auth preflight; a Pi participant's provider OAuth must be ready."""
+    return (
+        participant.kind != "pi"
+        or participant.provider is None
+        or native_auth_ready(participant.provider)
+    )
+
+
 def native_pane_process_proves(
     herdr_bin: str, pane_id: str, argv0: str, expected_args: Sequence[str]
 ) -> bool:
@@ -1074,6 +1102,8 @@ def profile_receipt_payload(profile: str, participants: Sequence[Participant]) -
         }
         if participant.provider:
             verified["provider"] = participant.provider
+        if participant.kind == "pi" and participant.provider is not None:
+            verified["account"] = "pi auth check ready"
         return verified
 
     return {
@@ -1984,6 +2014,7 @@ def start_participants(
                 continue
             if needs_native_proof(participant) and not (
                 catalog_proof(participant)
+                and auth_proof(participant)
                 and participant_process_proves(herdr_bin, participant, str(owned["pane_id"]))
             ):
                 pending = pending_tabs.get(role)
@@ -2084,6 +2115,12 @@ def start_participants(
                     f"@{role}: {name} failed the native catalog preflight; no tab was created"
                 )
                 print(f"unverified @{role} (catalog)", flush=True)
+                continue
+            if not auth_proof(participant):
+                failures.append(
+                    f"@{role}: {name} failed the native auth preflight; no tab was created"
+                )
+                print(f"unverified @{role} (auth)", flush=True)
                 continue
             pending_label = f"hgchat-{role}-{uuid.uuid4().hex[:10]}"
             pending_tabs[role] = {
@@ -2451,6 +2488,7 @@ def reverify_profile_participants(
         owned = owned_participant(herdr_bin, participant, agents_cwd)
         if owned is None or not (
             catalog_proof(participant)
+            and auth_proof(participant)
             and participant_process_proves(herdr_bin, participant, str(owned["pane_id"]))
         ):
             raise BootstrapError(

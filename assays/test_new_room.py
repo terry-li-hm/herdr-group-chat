@@ -2768,6 +2768,7 @@ def install_profile_host(
     workspaces: list[dict] | None = None,
     tmp_path: Path | None = None,
     agent_sessions: dict[str, Path | str | None] | None = None,
+    auth_ready: dict[str, bool] | None = None,
 ) -> None:
     """Fake Herdr plus the native Pi catalog for profile participant flows.
 
@@ -2777,6 +2778,7 @@ def install_profile_host(
     None for no session at all.
     """
     catalog_rows = catalog_rows if catalog_rows is not None else {}
+    auth_ready = auth_ready if auth_ready is not None else {}
     live_agents = [] if live_agents is None else live_agents
     workspaces = (
         workspaces
@@ -2875,6 +2877,12 @@ def install_profile_host(
     monkeypatch.setattr(module, "run_json", fake_run_json)
     monkeypatch.setattr(module, "run_text", fake_run_text)
     monkeypatch.setattr(module, "native_catalog_row_present", fake_catalog)
+
+    def fake_auth(provider: object) -> bool:
+        calls.append(["pi", "auth", "check", "--provider", str(provider)])
+        return auth_ready.get(str(provider), True)
+
+    monkeypatch.setattr(module, "native_auth_ready", fake_auth)
     monkeypatch.setattr(module, "VERIFY_PANE_INTERVAL_S", 0)
 
 
@@ -4891,6 +4899,7 @@ def test_astra_fable_glm_composes_reused_participants_in_exact_order() -> None:
         "effort": "high",
         "verification": "native-ui verified",
         "evidence": "pi-session",
+        "account": "pi auth check ready",
     }
     # The stored profiles are unchanged and never pick up the GLM participant.
     assert astra_fable == (module.ASTRA_PARTICIPANT, module.FABLE_PARTICIPANT)
@@ -5613,6 +5622,7 @@ def test_astra_fable_grok_pi_reuses_astra_fable_and_preserves_native_grok_profil
         "effort": "high",
         "verification": "native-ui verified",
         "evidence": "pi-session",
+        "account": "pi auth check ready",
     }
 
 
