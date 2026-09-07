@@ -5674,6 +5674,78 @@ def draw_tui(
     return max_scroll
 
 
+class InputHistory:
+    """Shell-style recall of the human's own sent lines, oldest to newest.
+
+    A navigation position of None means the operator is typing a new message;
+    the first `previous` stashes that unsent draft so `next` past the newest
+    entry can restore it exactly.
+    """
+
+    CAPACITY = 200
+
+    def __init__(self) -> None:
+        self._entries: list[str] = []
+        self._index: int | None = None
+        self._stash: str | None = None
+
+    def push(self, text: str) -> None:
+        """Record one sent line; blank lines and immediate repeats are dropped."""
+        if not text.strip():
+            return
+        if self._entries and self._entries[-1] == text:
+            return
+        self._entries.append(text)
+        del self._entries[: -self.CAPACITY]
+        # The entry list just changed, so any navigation position is stale.
+        self.reset()
+
+    def previous(self, current: str) -> str | None:
+        """Step one entry back, stashing the draft on the first press."""
+        if not self._entries:
+            return None
+        if self._index is None:
+            self._stash = current
+            self._index = len(self._entries) - 1
+        elif self._index > 0:
+            self._index -= 1
+        else:
+            return None
+        return self._entries[self._index]
+
+    def next(self) -> str | None:
+        """Step one entry forward, restoring the stashed draft past the newest."""
+        if self._index is None:
+            return None
+        if self._index < len(self._entries) - 1:
+            self._index += 1
+            return self._entries[self._index]
+        self._index = None
+        stash, self._stash = self._stash, None
+        return "" if stash is None else stash
+
+    def reset(self) -> None:
+        """Return to typing a new message without clearing the entries."""
+        self._index = None
+        self._stash = None
+
+    def entries(self) -> tuple[str, ...]:
+        """Expose the recorded lines in order for inspection and seeding tests."""
+        return tuple(self._entries)
+
+
+def seed_input_history(items: Sequence[Mapping[str, Any]]) -> InputHistory:
+    """Build room-start input history from the transcript's human items."""
+    history = InputHistory()
+    for item in items:
+        if item.get("sender") != "human":
+            continue
+        body = item.get("body")
+        if isinstance(body, str):
+            history.push(body)
+    return history
+
+
 def run_tui(screen: curses.window, chat: GroupChat, room: str) -> None:
     try:
         # curses.wrapper's start_color() pins pair 0 to white on black unless
@@ -5706,6 +5778,8 @@ def _run_tui_loop(
     status_override: Literal["delivery", "independent"] | None = None
     picker_dismissed_start: int | None = None
     picker_index = 0
+    # A reopened room recalls earlier human lines, so seed from the transcript.
+    history = seed_input_history(chat.transcript.read())
     while True:
         review_status = reviews.status()
         fragment = mention_fragment(buffer)
@@ -5800,9 +5874,23 @@ def _run_tui_loop(
         if key == curses.KEY_END:
             scroll_offset = 0
             continue
+        if not picker_active and key == curses.KEY_UP:
+            recalled = history.previous(buffer)
+            if recalled is not None:
+                buffer = recalled
+            continue
+        if not picker_active and key == curses.KEY_DOWN:
+            recalled = history.next()
+            if recalled is not None:
+                buffer = recalled
+            continue
         if key in ("\n", "\r"):
             if not buffer.strip():
                 continue
+            # The exact sent line is recallable, including any /command or
+            # @mention prefix; navigation restarts from a fresh draft.
+            history.push(buffer)
+            history.reset()
             deliveries.clear_notice()
             reviews.clear_notice()
             status_override = None
@@ -5860,10 +5948,13 @@ def _run_tui_loop(
             scroll_offset = 0
             continue
         if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
-            buffer = buffer[:-1]
+            if buffer:
+                buffer = buffer[:-1]
+                history.reset()
             continue
         if isinstance(key, str) and key.isprintable():
             buffer += key
+            history.reset()
 
 
 def record_setup_failures(transcript: Transcript) -> None:

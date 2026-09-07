@@ -92,6 +92,8 @@ lane_message_lines = namespace["lane_message_lines"]
 lane_view_lines = namespace["lane_view_lines"]
 draw_tui = namespace["draw_tui"]
 run_tui = namespace["run_tui"]
+InputHistory = namespace["InputHistory"]
+seed_input_history = namespace["seed_input_history"]
 tui_regions = namespace["tui_regions"]
 terminal_display_width = namespace["terminal_display_width"]
 terminal_safe_text = namespace["terminal_safe_text"]
@@ -1560,6 +1562,178 @@ def test_tui_adopts_terminal_default_colours_before_first_draw(
     run_tui(ExitScreen(), chat, "default-colours-room")
 
     assert events == ["draw_tui"]
+
+
+def test_input_history_push_ignores_blank_and_immediate_repeats() -> None:
+    history = InputHistory()
+    history.push("")
+    history.push("   \t ")
+    assert history.entries() == ()
+    assert history.previous("draft") is None
+
+    history.push("hello")
+    history.push("hello")
+    assert history.entries() == ("hello",)
+
+    history.push("world")
+    history.push("hello")
+    assert history.entries() == ("hello", "world", "hello")
+
+
+def test_input_history_capacity_drops_oldest_entries() -> None:
+    history = InputHistory()
+    for index in range(InputHistory.CAPACITY + 5):
+        history.push(f"line {index}")
+
+    assert len(history.entries()) == InputHistory.CAPACITY
+    assert history.entries()[0] == "line 5"
+    assert history.entries()[-1] == f"line {InputHistory.CAPACITY + 4}"
+
+
+def test_input_history_walks_back_and_forward_with_stashed_draft() -> None:
+    history = InputHistory()
+    for line in ("one", "two", "three"):
+        history.push(line)
+
+    assert history.previous("draft") == "three"
+    assert history.previous("draft") == "two"
+    assert history.previous("draft") == "one"
+    assert history.previous("one") is None
+
+    assert history.next() == "two"
+    assert history.next() == "three"
+    assert history.next() == "draft"
+    assert history.next() is None
+
+
+def test_input_history_reset_returns_to_typing_without_clearing_entries() -> None:
+    history = InputHistory()
+    history.push("sent")
+
+    assert history.previous("scratch") == "sent"
+    history.reset()
+    assert history.next() is None
+
+    history.push("sent edited")
+    assert history.entries() == ("sent", "sent edited")
+    assert history.previous("") == "sent edited"
+
+
+def test_seed_input_history_keeps_transcript_human_items_in_order() -> None:
+    items = [
+        {"sender": "system", "body": "room opened"},
+        {"sender": "human", "body": "first human line"},
+        {"sender": "pi", "body": "reply"},
+        {"sender": "human", "body": "second human line"},
+        {"sender": "human", "body": "second human line"},
+        {"sender": "system", "body": "hint"},
+    ]
+
+    history = seed_input_history(items)
+
+    assert history.entries() == ("first human line", "second human line")
+    assert history.previous("") == "second human line"
+    assert history.previous("") == "first human line"
+
+
+def test_tui_up_and_down_recall_sent_lines_and_reseed_on_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, client, _ = make_blocking_ordinary_chat(tmp_path)
+    buffers: list[str] = []
+    controllers: list[DeliveryController] = []
+
+    class TrackingDeliveryController(DeliveryController):
+        def __init__(self, tracked_chat: object) -> None:
+            super().__init__(tracked_chat)
+            controllers.append(self)
+
+    keys = [
+        *list("@pi shipped line\n"),
+        "RELEASE_WORKER",
+        module.curses.KEY_UP,
+        module.curses.KEY_DOWN,
+        module.curses.KEY_UP,
+        *list("!"),
+        "\x11",
+    ]
+    screen = ScriptedTuiScreen(
+        keys,
+        client,
+        lambda: _wait_until(lambda: not controllers[0].is_active(), HARNESS_WAIT_S),
+    )
+
+    def track_buffer(
+        _screen: object,
+        _transcript: object,
+        _room: object,
+        buffer: object,
+        _status: object,
+        _participants: object,
+        _scroll: object = 0,
+        **_kwargs: object,
+    ) -> int:
+        buffers.append(str(buffer))
+        return 0
+
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    monkeypatch.setattr(module, "draw_tui", track_buffer)
+    monkeypatch.setattr(module, "DeliveryController", TrackingDeliveryController)
+
+    run_tui(screen, chat, "ordinary-cancel-room")
+
+    # The exact sent line, mention prefix included, is recalled by Up, cleared
+    # by Down past the newest entry, recalled again, and typing after a recall
+    # edits the draft instead of navigating further.
+    assert "@pi shipped line" in buffers
+    assert buffers[-1] == "@pi shipped line!"
+
+    reopened: list[str] = []
+    reopen_screen = ScriptedTuiScreen([module.curses.KEY_UP, "\x11"], client)
+
+    def track_reopen_buffer(
+        _screen: object,
+        _transcript: object,
+        _room: object,
+        buffer: object,
+        *_args: object,
+        **_kwargs: object,
+    ) -> int:
+        reopened.append(str(buffer))
+        return 0
+
+    monkeypatch.setattr(module, "draw_tui", track_reopen_buffer)
+    run_tui(reopen_screen, chat, "ordinary-cancel-room")
+
+    # The transcript stores the routed body, so the reopened room recalls that
+    # recorded human line.
+    assert reopened[-1] == "shipped line"
+
+
+def test_tui_enter_pushes_view_commands_into_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, client, _ = make_chat(tmp_path)
+    buffers: list[str] = []
+    keys = [
+        *list("/room\n"),
+        module.curses.KEY_UP,
+        "\x11",
+    ]
+    screen = ScriptedTuiScreen(keys, client)
+
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    monkeypatch.setattr(
+        module,
+        "draw_tui",
+        lambda _screen, _transcript, _room, buffer, *_args, **_kwargs: (
+            buffers.append(str(buffer)) or 0
+        ),
+    )
+
+    run_tui(screen, chat, "test-room")
+
+    assert buffers[-1] == "/room"
 
 
 def test_tui_ctrl_q_waits_for_ordinary_cancellation_outcome_before_returning(

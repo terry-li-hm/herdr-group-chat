@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+- **Up and Down recall input history in the room.** While the mention picker is
+  closed, Up steps back through the human's own sent lines and Down steps
+  forward, like a shell; the first Up stashes the unsent draft so Down past the
+  newest line restores it, editing a recalled line starts a new draft, and a
+  reopened room seeds the history from the transcript's human items (capacity
+  200, blank and immediately repeated lines dropped).
 - **Launch failures and readiness now surface as Herdr notifications.** When a
   launch-facing mode (`--launch`, `--open`, `--place`, `--room-entrypoint`)
   fails, `new-room` shows one top-right notification `Group chat: launch

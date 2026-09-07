@@ -151,6 +151,11 @@ several mid-message mentions resolve to those seats in roster order, and
 `@all` anywhere addresses everyone, while tokens that name no participant — an
 email address, an unknown handle — are ignored so the focus stands.
 
+While the mention picker is closed, Up recalls your own earlier sent lines and
+Down moves forward through them, like a shell; the first Up stashes the unsent
+draft so Down past the newest line restores it, and editing a recalled line
+turns it into a new draft.
+
 When a plain message asks for a mode by phrase — get consensus, reach
 consensus, review this, blind review, anneal, or vote on — the room appends one
 system line after delivery hinting that `/consensus QUESTION` runs a blind round
