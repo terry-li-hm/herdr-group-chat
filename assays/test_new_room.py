@@ -6270,6 +6270,265 @@ def test_hold_returns_immediately_after_enter(
     assert stdin.readline_calls == 1
 
 
+# --- launch notifications -----------------------------------------------------------------
+
+
+def install_notification_host(
+    monkeypatch: pytest.MonkeyPatch,
+    notification_error: Exception | None = None,
+) -> list[list[str]]:
+    """Fake Herdr that records every call; `notification show` can be made to fail."""
+    calls: list[list[str]] = []
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments[:2] == ["notification", "show"]:
+            if notification_error is not None:
+                raise notification_error
+            return {"result": {"type": "notification_show"}}
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    return calls
+
+
+def _fail_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: list[str],
+    target: str,
+    error: Exception,
+) -> int:
+    """Run one launcher invocation whose dispatched action raises; return its exit code."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(module, target, lambda *args, **kwargs: (_ for _ in ()).throw(error))
+    try:
+        module.run_launcher(arguments)
+    except SystemExit as exited:
+        assert exited.code is not None
+        return exited.code
+    raise AssertionError("a recorded failure must exit")
+
+
+def _notification_calls(calls: list[list[str]]) -> list[list[str]]:
+    return [call for call in calls if call[:2] == ["notification", "show"]]
+
+
+ROOM_READY_NOTIFICATION = [
+    "notification",
+    "show",
+    "Group chat ready",
+    "--body",
+    "astra-fable in workspace group-chat",
+    "--position",
+    "top-right",
+    "--sound",
+    "done",
+]
+
+
+def test_launch_failure_notifies_once_with_the_first_message_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = install_notification_host(monkeypatch)
+    error = BootstrapError(
+        "the room could not open\nsecond line\nthird line", code="server_unavailable"
+    )
+
+    exit_code = _fail_launcher(tmp_path, monkeypatch, ["--launch"], "launch_room", error)
+
+    assert exit_code == 2
+    assert "new-room: the room could not open" in capsys.readouterr().err
+    assert _notification_calls(calls) == [
+        [
+            "notification",
+            "show",
+            "Group chat: launch failed",
+            "--body",
+            "the room could not open",
+            "--position",
+            "top-right",
+            "--sound",
+            "request",
+        ]
+    ]
+    # The durable record still carries the full multi-line message.
+    record = json.loads((tmp_path / "launcher-errors.jsonl").read_text(encoding="utf-8"))
+    assert record["mode"] == "--launch"
+    assert record["message"] == "the room could not open\nsecond line\nthird line"
+
+
+def test_launch_failure_notification_body_is_one_line_capped_at_160_chars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = install_notification_host(monkeypatch)
+    error = BootstrapError("x" * 200 + "\nnever shown")
+
+    exit_code = _fail_launcher(tmp_path, monkeypatch, ["--launch"], "launch_room", error)
+
+    assert exit_code == 2
+    (notification,) = _notification_calls(calls)
+    assert notification[notification.index("--body") + 1] == "x" * 160
+
+
+def test_unexpected_launch_failure_also_notifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = install_notification_host(monkeypatch)
+
+    exit_code = _fail_launcher(
+        tmp_path, monkeypatch, ["--room-entrypoint"], "room_entrypoint", RuntimeError("kaboom")
+    )
+
+    assert exit_code == 1
+    assert _notification_calls(calls) == [
+        [
+            "notification",
+            "show",
+            "Group chat: launch failed",
+            "--body",
+            "kaboom",
+            "--position",
+            "top-right",
+            "--sound",
+            "request",
+        ]
+    ]
+
+
+def test_last_error_failure_never_notifies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = install_notification_host(monkeypatch)
+
+    exit_code = _fail_launcher(
+        tmp_path, monkeypatch, ["--last-error"], "show_launcher_errors", BootstrapError("boom")
+    )
+
+    assert exit_code == 2
+    assert _notification_calls(calls) == []
+
+
+def test_usage_error_never_notifies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = install_notification_host(monkeypatch)
+
+    exit_code = _fail_launcher(
+        tmp_path, monkeypatch, ["--place", "diagonal"], "place_layout", BootstrapError("boom")
+    )
+
+    assert exit_code == 2
+    assert _notification_calls(calls) == []
+
+
+def test_no_notify_env_suppresses_the_failure_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(module.NO_NOTIFY_ENV, "1")
+    calls = install_notification_host(monkeypatch)
+
+    exit_code = _fail_launcher(
+        tmp_path, monkeypatch, ["--launch"], "launch_room", BootstrapError("boom")
+    )
+
+    assert exit_code == 2
+    assert _notification_calls(calls) == []
+    # Suppression never skips the durable record or changes the exit code.
+    record = json.loads((tmp_path / "launcher-errors.jsonl").read_text(encoding="utf-8"))
+    assert record["message"] == "boom"
+
+
+def test_failed_notification_command_never_masks_the_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = install_notification_host(
+        monkeypatch, notification_error=BootstrapError("notify failed", code="plugin_x")
+    )
+
+    exit_code = _fail_launcher(
+        tmp_path, monkeypatch, ["--launch"], "launch_room", BootstrapError("boom", code="plugin_x")
+    )
+
+    assert exit_code == 2
+    # The notification was attempted exactly once and its failure changed nothing.
+    assert _notification_calls(calls) == [
+        [
+            "notification",
+            "show",
+            "Group chat: launch failed",
+            "--body",
+            "boom",
+            "--position",
+            "top-right",
+            "--sound",
+            "request",
+        ]
+    ]
+    lines = (tmp_path / "launcher-errors.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["message"] == "boom"
+    assert record["code"] == "plugin_x"
+
+
+def test_successful_launch_notifies_room_ready_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    profile_launch_env(tmp_path, monkeypatch, captured)
+    monkeypatch.setenv(module.PROFILE_ENV, "astra-fable")
+    monkeypatch.setenv(module.ROOM_ENV, "chat-profile")
+    calls = install_launch_host(
+        tmp_path, monkeypatch, {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+    )
+    save_launcher_state(tmp_path, profile_room_state(tmp_path))
+
+    module.main()
+
+    assert captured["argv"][captured["argv"].index("--profile") + 1] == "astra-fable"
+    assert _notification_calls(calls) == [ROOM_READY_NOTIFICATION]
+
+
+def test_no_notify_env_suppresses_the_ready_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    profile_launch_env(tmp_path, monkeypatch, captured)
+    monkeypatch.setenv(module.PROFILE_ENV, "astra-fable")
+    monkeypatch.setenv(module.ROOM_ENV, "chat-profile")
+    monkeypatch.setenv(module.NO_NOTIFY_ENV, "1")
+    calls = install_launch_host(
+        tmp_path, monkeypatch, {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+    )
+    save_launcher_state(tmp_path, profile_room_state(tmp_path))
+
+    module.main()
+
+    assert "argv" in captured
+    assert _notification_calls(calls) == []
+
+
+def test_room_reopen_notifies_room_ready_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    room_reopen_env(tmp_path, monkeypatch, captured, "chat-profile")
+    calls = install_launch_host(
+        tmp_path, monkeypatch, {"w-agents:p-astra": ASTRA_SCREEN, "w-agents:p-fable": FABLE_SCREEN}
+    )
+    state = profile_room_state(tmp_path)
+    state.pop("pending_room_id")
+    state.pop("pending_room_operation_id")
+    state.pop("pending_room_profile")
+    state.pop("pending_room_started_unix_ms")
+    state["selected_profile"] = "astra-fable"
+    state["last_room_id"] = "chat-profile"
+    save_launcher_state(tmp_path, state)
+
+    module.room_entrypoint()
+
+    assert "argv" in captured
+    assert _notification_calls(calls) == [ROOM_READY_NOTIFICATION]
+
+
 def test_last_error_prints_most_recent_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

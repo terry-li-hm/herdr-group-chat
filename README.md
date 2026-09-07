@@ -640,6 +640,13 @@ launcher state lock. Interactive panes also hold themselves open after an
 error with `Press Enter to close (auto-closes in 60s)`; set
 `HERDR_GROUP_CHAT_NO_HOLD=1` to skip that hold.
 
+Launches also speak up in Herdr itself: a failed `--launch`, `--open`,
+`--place` or `--room-entrypoint` invocation shows one top-right notification
+`Group chat: launch failed` carrying the error's first line, and a fully
+placed room shows `Group chat ready` with its profile and workspace, so a
+failure that happens while you are looking elsewhere still surfaces its
+reason. Set `HERDR_GROUP_CHAT_NO_NOTIFY=1` to suppress these notifications.
+
 Inspect recorded failures read-only with:
 
 ```bash

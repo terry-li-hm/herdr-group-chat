@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+- **Launch failures and readiness now surface as Herdr notifications.** When a
+  launch-facing mode (`--launch`, `--open`, `--place`, `--room-entrypoint`)
+  fails, `new-room` shows one top-right notification `Group chat: launch
+  failed` carrying the error message's first line capped at 160 characters
+  with the `request` sound, beside the durable `launcher-errors.jsonl` record;
+  once a launch's placement completes, it shows `Group chat ready` with the
+  profile and workspace and the `done` sound. A notification command that
+  itself fails is swallowed, never masking the original error or changing the
+  exit code, and `HERDR_GROUP_CHAT_NO_NOTIFY=1` suppresses both notifications.
 - **Plain messages to several participants are now delivered in parallel and
   blind for that turn.** `GroupChat.dispatch` fans a multi-recipient ordinary
   message out through a `hgchat-plain` thread pool, prompting every recipient

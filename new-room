@@ -64,12 +64,20 @@ GRID2_ROOM_RATIO = "0.40"
 # columns and the moved peer the right-hand 38.
 PROFILE_RECEIPT_ENV = "HERDR_GROUP_CHAT_PROFILE_RECEIPT"
 NO_HOLD_ENV = "HERDR_GROUP_CHAT_NO_HOLD"
+NO_NOTIFY_ENV = "HERDR_GROUP_CHAT_NO_NOTIFY"
 LAUNCHER_ERRORS_NAME = "launcher-errors.jsonl"
 LAUNCHER_ERRORS_MAX_RECORDS = 200
 HOLD_MODES = ("setup", "--room-entrypoint")
 AGENTS_WORKSPACE_LABEL = "agents · group-chat"
 HOLD_PROMPT = "Press Enter to close (auto-closes in 60s)"
 HOLD_TIMEOUT_SECONDS = 60.0
+# Only launch-facing modes notify: inspection, adoption and usage errors stay
+# quiet, and the quiet modes never change the recorded exit code.
+NOTIFY_MODES = ("--launch", "--open", "--place", "--room-entrypoint")
+LAUNCH_FAILED_TITLE = "Group chat: launch failed"
+ROOM_READY_TITLE = "Group chat ready"
+ROOM_READY_PROFILE_FALLBACK = "classic"
+NOTIFY_BODY_MAX_CHARS = 160
 
 GROK_START_ARGS = (
     "--model",
@@ -403,6 +411,67 @@ def hold_pane_open(mode: str) -> None:
             sys.stdin.readline()
     except (OSError, ValueError):
         pass
+
+
+def notifications_suppressed() -> bool:
+    """Whether HERDR_GROUP_CHAT_NO_NOTIFY=1 turned launcher notifications off."""
+    return os.environ.get(NO_NOTIFY_ENV, "").strip() == "1"
+
+
+def show_notification(herdr_bin: str, title: str, body: str, sound: str) -> None:
+    """Show one Herdr notification at the top-right; best effort, never raises.
+
+    `herdr notification show` answers with the same JSON envelope as every
+    other Herdr command, so it rides the shared runner and its timeout. Any
+    failure of the notification itself is swallowed: it must never mask the
+    condition it reports or change the launcher's exit code.
+    """
+    with suppress(Exception):
+        run_json(
+            herdr_bin,
+            [
+                "notification",
+                "show",
+                title,
+                "--body",
+                body,
+                "--position",
+                "top-right",
+                "--sound",
+                sound,
+            ],
+        )
+
+
+def notify_launch_failure(herdr_bin: str, mode: str, error: BaseException) -> None:
+    """Surface a failed launch mode as one Herdr notification; never raises.
+
+    Only the launch-facing modes notify; `--last-error`, `--errors`, adoption
+    and usage errors stay quiet. The body is the error message's first line
+    capped at NOTIFY_BODY_MAX_CHARS, because the pane that prints the full
+    reason closes within a minute.
+    """
+    if mode not in NOTIFY_MODES or notifications_suppressed():
+        return
+    first_line = (str(error).splitlines() or [""])[0]
+    show_notification(herdr_bin, LAUNCH_FAILED_TITLE, first_line[:NOTIFY_BODY_MAX_CHARS], "request")
+
+
+def notify_room_ready(herdr_bin: str, profile: str | None, workspace_id: str) -> None:
+    """Announce a fully placed room; best effort, never raises, exactly once."""
+    if notifications_suppressed():
+        return
+    label = "group-chat"
+    with suppress(Exception):
+        live_label = workspace_label_by_id(herdr_bin).get(workspace_id, "")
+        if live_label:
+            label = live_label
+    show_notification(
+        herdr_bin,
+        ROOM_READY_TITLE,
+        f"{profile or ROOM_READY_PROFILE_FALLBACK} in workspace {label}",
+        "done",
+    )
 
 
 def session_key(environ: Mapping[str, str] = os.environ) -> str:
@@ -2491,6 +2560,9 @@ def main() -> int:
         print("\nOpening the room with the available peers...", flush=True)
     else:
         print("\nAll participants ready. Opening the room...", flush=True)
+        # Placement completed and the state is saved: the room is ready, and
+        # the pane is about to become the room process, so announce it now.
+        notify_room_ready(herdr_bin, profile, workspace_id)
 
     # Hand the failures to the room process so they survive the setup pane's
     # redraw; a launch without failures must never show a previous launch's.
@@ -2605,6 +2677,7 @@ def room_entrypoint() -> int:
             agents_workspace_id = ""
     # Reopening a retained room must not replay a previous launch's setup failures.
     os.environ.pop(SETUP_FAILURES_ENV, None)
+    notify_room_ready(herdr_bin, profile, workspace_id)
     executable = Path(__file__).resolve().parent / "herdr-group-chat"
     arguments = [str(executable), "--room", room]
     if agents_workspace_id:
@@ -2689,6 +2762,7 @@ def parse_launch_arguments(arguments: list[str]) -> tuple[str, str | None]:
 
 def run_launcher(arguments: list[str]) -> int:
     """Dispatch one invocation, recording every failure durably before exiting."""
+    herdr_bin = os.environ.get("HERDR_BIN_PATH", "herdr")
     mode = "unknown"
     try:
         mode, profile = parse_launch_arguments(arguments)
@@ -2710,11 +2784,13 @@ def run_launcher(arguments: list[str]) -> int:
     except BootstrapError as error:
         print(f"new-room: {error}", file=sys.stderr)
         append_launcher_error(mode, arguments, error)
+        notify_launch_failure(herdr_bin, mode, error)
         hold_pane_open(mode)
         raise SystemExit(2) from error
     except Exception as error:
         traceback.print_exc()
         append_launcher_error(mode, arguments, error)
+        notify_launch_failure(herdr_bin, mode, error)
         hold_pane_open(mode)
         raise SystemExit(1) from error
 
