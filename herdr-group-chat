@@ -341,6 +341,202 @@ def command_hint(text: str) -> str | None:
     return None
 
 
+INTENT_QUESTION_EXEMPT_PREFIXES = ("ask", "get", "tell")
+
+
+@dataclass(frozen=True)
+class IntentProposal:
+    """A rule-derived slash command proposed for a plain-language message."""
+
+    command: str
+    label: str
+    reason: str
+
+
+def _intent_normalise(text: str) -> str:
+    flat = " ".join(text.replace("\u2018", "'").replace("\u2019", "'").split())
+    return flat
+
+
+INTENT_TASK_RE = re.compile(
+    r"^(?:(?:ask|get|tell)\s+"
+    r"((?:@[a-z0-9_-]+)(?:\s+and\s+@[a-z0-9_-]+)*)\s+to\s+"
+    r"|have\s+((?:@[a-z0-9_-]+)(?:\s+and\s+@[a-z0-9_-]+)*)\s+"
+    r"|(@[a-z0-9_-]+)\s*,?\s*please\s+)",
+    re.IGNORECASE,
+)
+
+
+def _intent_recipients(
+    matched_mentions: Sequence[str], known_agents: Sequence[str]
+) -> list[str]:
+    found = [name.lower().removeprefix("@") for name in matched_mentions]
+    if "all" in found:
+        return list(dict.fromkeys(known_agents))
+    wanted = set(found)
+    return [agent for agent in dict.fromkeys(known_agents) if agent in wanted]
+
+
+def _intent_rest(text: str, matched: re.Match[str]) -> str:
+    remainder = text[matched.end() :]
+    remainder = MENTION_SCAN_RE.sub(" ", remainder)
+    return remainder.strip(" :,.").strip()
+
+
+def _intent_rest_after_phrase(text: str, phrase: str) -> str:
+    lowered = text.lower()
+    index = lowered.find(phrase)
+    remainder = text[:index] + " " + text[index + len(phrase) :]
+    remainder = MENTION_SCAN_RE.sub(" ", remainder)
+    return " ".join(remainder.split()).strip(" :,.").strip()
+
+
+INTENT_REVIEW_PHRASES = (
+    "everyone's view",
+    "each of you independently",
+    "blind review",
+    "independent views",
+    "what does everyone think",
+    "review this independently",
+)
+
+
+INTENT_CONSENSUS_PHRASES = (
+    "get consensus",
+    "reach consensus",
+    "vote on",
+    "agree or disagree",
+    "can we agree",
+)
+
+
+INTENT_MINUTES_PHRASES = frozenset(
+    {
+        "minutes",
+        "write minutes",
+        "write the minutes",
+        "summarise decisions",
+        "summarize decisions",
+        "what did we decide",
+    }
+)
+
+
+INTENT_GOAL_PHRASES = (
+    "keep going without me",
+    "while i'm away",
+    "while im away",
+    "carry on until",
+    "work on this until you agree",
+    "unattended",
+)
+INTENT_GOAL_ROUNDS_RE = re.compile(r"(?:for\s+)?(\d+)\s+rounds?")
+INTENT_GOAL_MINUTES_RE = re.compile(r"for\s+(\d+)\s+minutes?")
+
+
+INTENT_LAYOUT_TARGETS = {
+    "switch to grid": "grid",
+    "grid layout": "grid",
+    "two columns": "grid2",
+    "grid2": "grid2",
+    "switch to grid2": "grid2",
+    "compact": "compact",
+    "compact layout": "compact",
+    "switch to compact": "compact",
+}
+
+
+def resolve_intent(text: str, known_agents: Sequence[str]) -> IntentProposal | None:
+    """Propose a slash command for a plain-language room request."""
+    flat = _intent_normalise(text)
+    if not flat or flat.startswith("/"):
+        return None
+    lowered = flat.lower()
+    task_match = INTENT_TASK_RE.match(lowered)
+    if task_match:
+        mentions = [
+            name
+            for group in task_match.groups()
+            if group
+            for name in re.findall(r"@[a-z0-9_-]+", group)
+        ]
+        recipients = _intent_recipients(mentions, known_agents)
+        if not recipients:
+            return None
+        rest = _intent_rest(flat, task_match)
+        if not rest:
+            return None
+        joined = ",".join(f"@{name}" for name in recipients)
+        return IntentProposal(
+            command=f"/task {joined} {rest}",
+            label=f"task for {joined}",
+            reason="task",
+        )
+    question = lowered.endswith("?")
+    if not question:
+        for phrase in INTENT_REVIEW_PHRASES:
+            if phrase in lowered:
+                mentions = [name.lower() for name in MENTION_SCAN_RE.findall(flat)]
+                recipients = _intent_recipients(mentions, known_agents)
+                rest = _intent_rest_after_phrase(flat, phrase)
+                joined = ",".join(f"@{name}" for name in recipients)
+                prefix = f"{joined} " if recipients else ""
+                return IntentProposal(
+                    command=f"/review {prefix}{rest}".strip(),
+                    label=(f"review by {joined}" if recipients else "review by the room"),
+                    reason="review",
+                )
+        for phrase in INTENT_CONSENSUS_PHRASES:
+            if phrase in lowered:
+                mentions = [name.lower() for name in MENTION_SCAN_RE.findall(flat)]
+                recipients = _intent_recipients(mentions, known_agents)
+                rest = _intent_rest_after_phrase(flat, phrase)
+                joined = ",".join(f"@{name}" for name in recipients)
+                prefix = f"{joined} " if recipients else ""
+                return IntentProposal(
+                    command=f"/consensus {prefix}{rest}".strip(),
+                    label=(f"consensus of {joined}" if recipients else "room consensus"),
+                    reason="consensus",
+                )
+    if lowered.rstrip(".!?") in INTENT_MINUTES_PHRASES:
+        return IntentProposal(command="/minutes", label="write minutes", reason="minutes")
+    for phrase in INTENT_GOAL_PHRASES:
+        if phrase in lowered and not lowered.endswith("?"):
+            mentions = [name.lower() for name in MENTION_SCAN_RE.findall(flat)]
+            recipients = _intent_recipients(mentions, known_agents)
+            rest = _intent_rest_after_phrase(flat, phrase)
+            flags = ""
+            rounds = INTENT_GOAL_ROUNDS_RE.search(rest)
+            if rounds:
+                flags += f" --rounds {rounds.group(1)}"
+                rest = INTENT_GOAL_ROUNDS_RE.sub(" ", rest, count=1)
+            minutes = INTENT_GOAL_MINUTES_RE.search(rest)
+            if minutes:
+                flags += f" --budget {minutes.group(1)}"
+                rest = INTENT_GOAL_MINUTES_RE.sub(" ", rest, count=1)
+            for hour_phrase in ("for half an hour", "for an hour", "half an hour"):
+                if hour_phrase in rest:
+                    flags += f" --budget {30 if 'half' in hour_phrase else 60}"
+                    rest = rest.replace(hour_phrase, " ")
+                    break
+            rest = " ".join(rest.split()).strip(" :,.").strip()
+            if not rest:
+                return None
+            joined = ",".join(f"@{name}" for name in recipients)
+            prefix = f"{joined} " if recipients else ""
+            return IntentProposal(
+                command=f"/goal {prefix}{rest}{flags}".strip(),
+                label=(f"unattended goal for {joined}" if recipients else "unattended goal"),
+                reason="goal",
+            )
+    if lowered.rstrip(".!?") in INTENT_LAYOUT_TARGETS:
+        target = INTENT_LAYOUT_TARGETS[lowered.rstrip(".!?")]
+        return IntentProposal(
+            command=f"/layout {target}", label=f"switch to {target} layout", reason="layout"
+        )
+    return None
+
+
 def parse_route(
     text: str, known_agents: Sequence[str], default: Sequence[str] | None = None
 ) -> Route:

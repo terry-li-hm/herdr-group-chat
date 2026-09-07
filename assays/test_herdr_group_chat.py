@@ -11525,3 +11525,102 @@ def test_once_routes_goal_commands_through_the_goal_path(
     )
     assert calls == ["/goal @pi x"]
     assert capsys.readouterr().out == ""
+
+
+ROSTER = ["fable", "grok", "pi", "claude"]
+
+
+def test_resolve_intent_task_rule() -> None:
+    resolve = namespace["resolve_intent"]
+    assert resolve("ask @grok to review the diff", ROSTER) == namespace[
+        "IntentProposal"
+    ](
+        command="/task @grok review the diff",
+        label="task for @grok",
+        reason="task",
+    )
+    assert resolve("tell @pi and @grok to fix the flaky test", ROSTER) is not None
+    assert resolve("ask @grok to", ROSTER) is None
+    assert resolve("plain message with no rule", ROSTER) is None
+
+
+def test_resolve_intent_review_rule() -> None:
+    resolve = namespace["resolve_intent"]
+    proposal = resolve("@fable @grok blind review the PR description", ROSTER)
+    assert proposal is not None
+    assert proposal.command == "/review @fable,@grok the PR description"
+    assert proposal.reason == "review"
+    assert resolve("what does everyone think of the draft", ROSTER).command == (
+        "/review of the draft"
+    )
+    assert resolve("what does everyone think of the draft?", ROSTER) is None
+    assert resolve("any thoughts on the design?", ROSTER) is None
+
+
+def test_resolve_intent_consensus_rule() -> None:
+    resolve = namespace["resolve_intent"]
+    proposal = resolve("@grok @fable can we agree on the rollout plan", ROSTER)
+    assert proposal is not None
+    assert proposal.command == "/consensus @fable,@grok on the rollout plan"
+    assert proposal.reason == "consensus"
+    assert resolve("vote on the colour scheme", ROSTER).command == (
+        "/consensus the colour scheme"
+    )
+    assert resolve("shall we vote on lunch?", ROSTER) is None
+    assert resolve("keep discussing", ROSTER) is None
+
+
+def test_resolve_intent_minutes_rule() -> None:
+    resolve = namespace["resolve_intent"]
+    for text in ("minutes", "write the minutes.", "what did we decide"):
+        assert resolve(text, ROSTER) == namespace["IntentProposal"](
+            command="/minutes", label="write minutes", reason="minutes"
+        )
+    assert resolve("minutes of the last meeting please", ROSTER) is None
+    assert resolve("write the agenda", ROSTER) is None
+
+
+def test_resolve_intent_goal_rule() -> None:
+    resolve = namespace["resolve_intent"]
+    assert resolve("keep going without me for 3 rounds on the design", ROSTER).command == (
+        "/goal on the design --rounds 3"
+    )
+    assert resolve("while I’m away for an hour refine the docs", ROSTER).command == (  # noqa: RUF001
+        "/goal refine the docs --budget 60"
+    )
+    assert resolve("unattended for half an hour on tests", ROSTER).command == (
+        "/goal on tests --budget 30"
+    )
+    assert resolve("while I'm away for 20 minutes improve the copy", ROSTER).command == (
+        "/goal improve the copy --budget 20"
+    )
+    assert resolve("keep going without me", ROSTER) is None
+    assert resolve("should you keep going unattended?", ROSTER) is None
+    assert resolve("keep going unattended?", ROSTER) is None
+
+
+def test_resolve_intent_layout_rule() -> None:
+    resolve = namespace["resolve_intent"]
+    for text, target in (
+        ("switch to grid", "grid"),
+        ("two columns", "grid2"),
+        ("compact layout", "compact"),
+        ("switch to compact", "compact"),
+    ):
+        assert resolve(text, ROSTER).command == f"/layout {target}"
+    assert resolve("grid layout please", ROSTER) is None
+    assert resolve("columns", ROSTER) is None
+
+
+def test_resolve_intent_mention_handling_and_guards() -> None:
+    resolve = namespace["resolve_intent"]
+    order = resolve("ask @grok and @fable to draft the summary", ROSTER)
+    assert order is not None
+    assert order.command == "/task @fable,@grok draft the summary"
+    every = resolve("ask @all to review the logs", ROSTER)
+    assert every is not None
+    assert every.command == f"/task {','.join('@' + name for name in ROSTER)} review the logs"
+    assert resolve("ask @nobody to sing", ROSTER) is None
+    assert resolve("/review @fable check this", ROSTER) is None
+    assert resolve("", ROSTER) is None
+    assert resolve("   ", ROSTER) is None
