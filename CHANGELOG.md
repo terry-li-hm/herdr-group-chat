@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+- **Intent front door: plain-language confirms into slash commands.** A plain
+  message that matches an intent rule (for example `ask @fable to update the
+  note`, `what does everyone think about the draft`, `get consensus on the
+  plan`, `keep going without me for an hour`) no longer sends on the first
+  Enter: the status row shows
+  `Run as: <command> · Enter runs · Esc sends as written`; Enter runs the
+  command, Esc sends the message as written, and editing clears the proposal.
+  A run records one human-only `kind="intent"` transcript item with the
+  original text, command, and rule. `/intent on|off|status` controls the door
+  and persists as `intent_enabled` in the room's `.state.json`. The review and
+  consensus rules drop a leading `of`, `about`, or `on` from the question, and
+  the old post-delivery command hint line and its machinery are removed.
 - **`/goal` prompt: one writer per file.** Each seat must name every path it edits and never edit a path another participant named in an earlier round of the goal, so two seats cannot edit the same note at once.
 
 ## [0.14.0] - 2026-09-07

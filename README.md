@@ -156,10 +156,16 @@ Down moves forward through them, like a shell; the first Up stashes the unsent
 draft so Down past the newest line restores it, and editing a recalled line
 turns it into a new draft.
 
-When a plain message asks for a mode by phrase — get consensus, reach
-consensus, review this, blind review, anneal, or vote on — the room appends one
-system line after delivery hinting that `/consensus QUESTION` runs a blind round
-with a ratified vote and `/review QUESTION` runs a blind round with synthesis.
+Plain language also has a front door onto the room's commands. When a plain
+message matches one of the intent rules — `ask @fable to update the note`,
+`what does everyone think about X`, `get consensus on X`, or `keep going
+without me for an hour` — Enter does not send it at once; the status row shows
+`Run as: <command> · Enter runs · Esc sends as written`, a second Enter runs
+that command, and Esc sends the text as a plain message. Slash commands remain
+canonical and are what the transcript records: when a proposal runs, one
+system line notes the original text and the command it became. `/intent off`
+turns the front door off, `/intent on` turns it back on, and `/intent status`
+reports the setting, which persists per room in `.state.json`.
 
 Seats are asked to keep replies under about 150 words unless you asked for
 detail or the task is a document review, and to lead with the answer.

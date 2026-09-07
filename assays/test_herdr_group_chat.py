@@ -62,7 +62,6 @@ build_synthesis_prompt = namespace["build_synthesis_prompt"]
 format_context = namespace["format_context"]
 message_visible_to_agent = namespace["message_visible_to_agent"]
 room_signal_counts = namespace["room_signal_counts"]
-command_hint = namespace["command_hint"]
 REPLY_WORD_BUDGET = namespace["REPLY_WORD_BUDGET"]
 ROUTE_RECEIPT_AGAIN_LINE = namespace["ROUTE_RECEIPT_AGAIN_LINE"]
 message_lines = namespace["message_lines"]
@@ -347,22 +346,6 @@ def test_prompt_builders_carry_the_reply_word_budget() -> None:
     review = build_review_prompt("claude", "is this ready?", "b" * 32, roster)
     assert budget_sentence in prompt
     assert budget_sentence in review
-
-
-def test_command_hint_matches_phrases_case_insensitively_and_only_plain_text() -> None:
-    expected = (
-        "Hint: /consensus QUESTION runs a blind round with a ratified vote; "
-        "/review QUESTION runs a blind round with synthesis."
-    )
-    assert command_hint("can we get consensus?") == expected
-    assert command_hint("We should REACH CONSENSUS here") == expected
-    assert command_hint("please review this before sending") == expected
-    assert command_hint("run a blind review of the draft") == expected
-    assert command_hint("let us anneal the plan") == expected
-    assert command_hint("should we vote on it?") == expected
-    assert command_hint("nothing to hint here") is None
-    assert command_hint("/consensus question") is None
-    assert command_hint("") is None
 
 
 def test_participant_status_normalizes_ready_and_preserves_attention_states(
@@ -3027,38 +3010,6 @@ def test_route_receipt_is_expected_once_per_seat_per_room(tmp_path: Path) -> Non
         f"{receipt_two}\nanswer 2 from pi-peer",
     ]
 
-
-def test_plain_message_with_a_command_phrase_appends_one_human_only_hint(
-    tmp_path: Path,
-) -> None:
-    chat, client, transcript = make_chat(tmp_path)
-
-    created = chat.dispatch("can we get consensus on the design?")
-
-    hints = [item for item in transcript.read() if item.get("kind") == "hint"]
-    assert len(hints) == 1
-    hint = hints[0]
-    assert hint["sender"] == "system"
-    assert hint["recipients"] == ["human"]
-    assert hint["body"] == (
-        "Hint: /consensus QUESTION runs a blind round with a ratified vote; "
-        "/review QUESTION runs a blind round with synthesis."
-    )
-    # The hint lands after the delivered message and its replies.
-    assert transcript.read()[-1] == hint
-    assert created[-1] == hint
-    # The hint is hidden from every seat and never counted as a room signal.
-    assert not any(message_visible_to_agent(hint, agent) for agent in chat.agents)
-    assert set(room_signal_counts(transcript.read()).values()) == {0}
-
-    chat.dispatch("plain message without any phrase")
-    assert len([item for item in transcript.read() if item.get("kind") == "hint"]) == 1
-
-    # A later seat prompt proves the hint never reaches an agent context.
-    chat.dispatch("@claude what changed")
-    claude_prompt = client.calls[-1][1]
-    assert "Hint:" not in claude_prompt
-    assert "[human] what changed" in claude_prompt
 
 
 def test_codex_is_addressable_and_roster_is_derived() -> None:
@@ -11551,8 +11502,12 @@ def test_resolve_intent_review_rule() -> None:
     assert proposal.command == "/review @fable,@grok the PR description"
     assert proposal.reason == "review"
     assert resolve("what does everyone think of the draft", ROSTER).command == (
-        "/review of the draft"
+        "/review the draft"
     )
+    assert resolve("what does everyone think about the draft", ROSTER).command == (
+        "/review the draft"
+    )
+    assert resolve("can we agree on the plan", ROSTER).command == "/consensus the plan"
     assert resolve("what does everyone think of the draft?", ROSTER) is None
     assert resolve("any thoughts on the design?", ROSTER) is None
 
@@ -11561,7 +11516,7 @@ def test_resolve_intent_consensus_rule() -> None:
     resolve = namespace["resolve_intent"]
     proposal = resolve("@grok @fable can we agree on the rollout plan", ROSTER)
     assert proposal is not None
-    assert proposal.command == "/consensus @fable,@grok on the rollout plan"
+    assert proposal.command == "/consensus @fable,@grok the rollout plan"
     assert proposal.reason == "consensus"
     assert resolve("vote on the colour scheme", ROSTER).command == (
         "/consensus the colour scheme"
@@ -11624,3 +11579,237 @@ def test_resolve_intent_mention_handling_and_guards() -> None:
     assert resolve("/review @fable check this", ROSTER) is None
     assert resolve("", ROSTER) is None
     assert resolve("   ", ROSTER) is None
+
+
+def test_tui_enter_shows_intent_confirm_line_and_sends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, client, _ = make_chat(tmp_path)
+    draws: list[tuple[str, str]] = []
+    keys = [*list("what does everyone think about the draft"), "\n", "\x11"]
+
+    class IdleScreen(ScriptedTuiScreen):
+        pass
+
+    screen = IdleScreen(keys, client)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+
+    def track(
+        _screen: object,
+        _transcript: object,
+        _room: object,
+        buffer: object,
+        status: object,
+        *_args: object,
+        **_kwargs: object,
+    ) -> int:
+        draws.append((str(buffer), str(status)))
+        return 0
+
+    monkeypatch.setattr(module, "draw_tui", track)
+
+    run_tui(screen, chat, "test-room")
+
+    assert client.calls == []
+    assert draws[-1] == (
+        "what does everyone think about the draft",
+        "Run as: /review the draft · Enter runs · Esc sends as written",
+    )
+
+
+def test_tui_second_enter_runs_intent_item_then_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, client, transcript = make_chat(tmp_path)
+    keys = [*list("ask @pi to update the note"), "\n", "\n", "WAIT", "\x11"]
+
+    class WaitScreen(ScriptedTuiScreen):
+        def get_wch(self) -> object:
+            if self.keys and self.keys[0] == "WAIT":
+                self.keys.pop(0)
+                assert _wait_until(
+                    lambda: len(client.calls) == 1
+                    and any(item.get("sender") == "pi" for item in transcript.read()),
+                    HARNESS_WAIT_S,
+                )
+                return module.curses.KEY_RESIZE
+            return super().get_wch()
+
+    screen = WaitScreen(keys, client)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    monkeypatch.setattr(module, "draw_tui", lambda *_args, **_kwargs: 0)
+
+    run_tui(screen, chat, "test-room")
+
+    assert _wait_until(lambda: len(client.calls) == 1, HARNESS_WAIT_S)
+    items = transcript.read()
+    intent_items = [item for item in items if item.get("kind") == "intent"]
+    assert len(intent_items) == 1
+    assert intent_items[0]["sender"] == "system"
+    assert intent_items[0]["recipients"] == ["human"]
+    assert intent_items[0]["meta"] == {
+        "from": "ask @pi to update the note",
+        "to": "/task @pi update the note",
+        "reason": "task",
+    }
+    task_index = items.index(intent_items[0])
+    following = items[task_index + 1 :]
+    assert following[0]["kind"] == "task"
+    assert following[0]["sender"] == "human"
+    assert following[0]["body"] == "update the note"
+    assert client.calls[0][1] != "ask @pi to update the note"
+    assert not message_visible_to_agent(intent_items[0], "pi")
+
+
+def test_tui_esc_sends_intent_buffer_as_plain_without_intent_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, client, transcript = make_chat(tmp_path)
+    keys = [*list("ask @pi to update the note"), "\n", "\x1b", "y", "WAIT", "\x11"]
+
+    class WaitScreen(ScriptedTuiScreen):
+        def get_wch(self) -> object:
+            if self.keys and self.keys[0] == "WAIT":
+                self.keys.pop(0)
+                assert _wait_until(
+                    lambda: len(client.calls) == 1
+                    and any(item.get("sender") == "pi" for item in transcript.read()),
+                    HARNESS_WAIT_S,
+                )
+                # The wait runs after the Esc has resolved, so the plain
+                # delivery it triggers is already in flight here.
+                return module.curses.KEY_RESIZE
+            return super().get_wch()
+
+    screen = WaitScreen(keys, client)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    monkeypatch.setattr(module, "draw_tui", lambda *_args, **_kwargs: 0)
+
+    run_tui(screen, chat, "test-room")
+
+    assert _wait_until(lambda: len(client.calls) == 1, HARNESS_WAIT_S)
+    assert "update the note" in client.calls[0][1]
+    items = transcript.read()
+    assert not [item for item in items if item.get("kind") == "intent"]
+    assert not [item for item in items if item.get("kind") == "task"]
+    assert any(
+        item["sender"] == "human" and item["body"] == "ask @pi to update the note"
+        for item in items
+    )
+
+
+def test_tui_editing_after_confirm_line_clears_the_proposal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, client, _ = make_chat(tmp_path)
+    draws: list[tuple[str, str]] = []
+    keys = [*list("what does everyone think about the draft"), "\n", "!", "\x11"]
+    screen = ScriptedTuiScreen(keys, client)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+
+    def track(
+        _screen: object,
+        _transcript: object,
+        _room: object,
+        buffer: object,
+        status: object,
+        *_args: object,
+        **_kwargs: object,
+    ) -> int:
+        draws.append((str(buffer), str(status)))
+        return 0
+
+    monkeypatch.setattr(module, "draw_tui", track)
+
+    run_tui(screen, chat, "test-room")
+
+    assert client.calls == []
+    assert any("Run as: /review" in status for _, status in draws)
+    final_buffer, final_status = draws[-1]
+    assert final_buffer == "what does everyone think about the draft!"
+    assert "Run as:" not in final_status
+
+
+def test_tui_intent_off_sends_plain_and_state_persists_across_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chat, client, transcript = make_chat(tmp_path)
+    keys = [
+        *list("/intent off\n"),
+        *list("ask @pi to update the note"),
+        "\n",
+        "y",
+        "WAIT",
+        "\x11",
+    ]
+
+    class WaitScreen(ScriptedTuiScreen):
+        def get_wch(self) -> object:
+            if self.keys and self.keys[0] == "WAIT":
+                self.keys.pop(0)
+                assert _wait_until(
+                    lambda: len(client.calls) == 1
+                    and any(item.get("sender") == "pi" for item in transcript.read()),
+                    HARNESS_WAIT_S,
+                )
+                return module.curses.KEY_RESIZE
+            return super().get_wch()
+
+    statuses: list[str] = []
+    screen = WaitScreen(keys, client)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+    def track_status(
+        _screen: object,
+        _transcript: object,
+        _room: object,
+        _buffer: object,
+        status: object,
+        *_args: object,
+        **_kwargs: object,
+    ) -> int:
+        statuses.append(str(status))
+        return 0
+
+    monkeypatch.setattr(module, "draw_tui", track_status)
+
+    run_tui(screen, chat, "test-room")
+
+    assert "Intent front door off." in statuses
+    # With the front door off, Enter sends the plain message at once.
+    assert not any("Run as:" in status for status in statuses)
+    items = transcript.read()
+    assert not [item for item in items if item.get("kind") == "intent"]
+    assert not [item for item in items if item.get("kind") == "task"]
+    assert any(
+        item["sender"] == "human" and item["body"] == "ask @pi to update the note"
+        for item in items
+    )
+    assert json.loads(transcript.cursor_path.read_text())["intent_enabled"] is False
+
+    # A reopened room reads the setting back from .state.json.
+    assert transcript.intent_enabled() is False
+    status_screen = ScriptedTuiScreen([*list("/intent status\n"), "\x11"], client)  # type: ignore[arg-type]
+    statuses.clear()
+    run_tui(status_screen, chat, "test-room")
+    assert "Intent front door is off." in statuses
+
+
+def test_intent_setting_persists_beside_cursor_advances(tmp_path: Path) -> None:
+    transcript = Transcript(tmp_path, "intent-state-room")
+    assert transcript.intent_enabled() is True
+    transcript.advance_cursor("pi", 3)
+    transcript.set_intent_enabled(False)
+    transcript.advance_cursor("claude", 7)
+    state = json.loads(transcript.cursor_path.read_text())
+    assert state == {"intent_enabled": False, "pi": 3, "claude": 7}
+    assert transcript.cursors() == {"pi": 3, "claude": 7}
+    reopened = Transcript(tmp_path, "intent-state-room")
+    assert reopened.intent_enabled() is False
+    reopened.set_intent_enabled(True)
+    assert reopened.intent_enabled() is True
+    assert reopened.cursors() == {"pi": 3, "claude": 7}

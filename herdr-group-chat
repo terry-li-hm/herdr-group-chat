@@ -135,18 +135,6 @@ GOAL_DEFAULT_BUDGET_MINUTES = 30
 GOAL_MAX_BUDGET_MINUTES = 180
 ROUTE_RECEIPT_LINE_PREFIX = "ROUTE_RECEIPT:"
 ROUTE_RECEIPT_AGAIN_LINE = "ROUTE_RECEIPT: (as before)"
-COMMAND_HINT_LINE = (
-    "Hint: /consensus QUESTION runs a blind round with a ratified vote; "
-    "/review QUESTION runs a blind round with synthesis."
-)
-COMMAND_HINT_PHRASES = (
-    "get consensus",
-    "reach consensus",
-    "review this",
-    "blind review",
-    "anneal",
-    "vote on",
-)
 NO_LEADING_PARTICIPANT = object()
 UNCONFIGURED_LEADING_PARTICIPANT = object()
 CONTROL_ESCAPES = {
@@ -330,17 +318,6 @@ def collapse_repeated_receipts(
     return projected
 
 
-def command_hint(text: str) -> str | None:
-    """Return the command hint line for a plain message that asks for a mode."""
-    stripped = text.strip()
-    if not stripped or stripped.startswith("/"):
-        return None
-    lowered = stripped.lower()
-    if any(phrase in lowered for phrase in COMMAND_HINT_PHRASES):
-        return COMMAND_HINT_LINE
-    return None
-
-
 INTENT_QUESTION_EXEMPT_PREFIXES = ("ask", "get", "tell")
 
 
@@ -389,6 +366,15 @@ def _intent_rest_after_phrase(text: str, phrase: str) -> str:
     remainder = text[:index] + " " + text[index + len(phrase) :]
     remainder = MENTION_SCAN_RE.sub(" ", remainder)
     return " ".join(remainder.split()).strip(" :,.").strip()
+
+
+def _intent_strip_leading_preposition(rest: str) -> str:
+    """Drop a leading of/about/on so "think of the draft" reviews the draft."""
+    lowered = rest.lower()
+    for preposition in ("of ", "about ", "on "):
+        if lowered.startswith(preposition):
+            return rest[len(preposition) :].strip()
+    return rest
 
 
 INTENT_REVIEW_PHRASES = (
@@ -478,7 +464,7 @@ def resolve_intent(text: str, known_agents: Sequence[str]) -> IntentProposal | N
             if phrase in lowered:
                 mentions = [name.lower() for name in MENTION_SCAN_RE.findall(flat)]
                 recipients = _intent_recipients(mentions, known_agents)
-                rest = _intent_rest_after_phrase(flat, phrase)
+                rest = _intent_strip_leading_preposition(_intent_rest_after_phrase(flat, phrase))
                 joined = ",".join(f"@{name}" for name in recipients)
                 prefix = f"{joined} " if recipients else ""
                 return IntentProposal(
@@ -490,7 +476,7 @@ def resolve_intent(text: str, known_agents: Sequence[str]) -> IntentProposal | N
             if phrase in lowered:
                 mentions = [name.lower() for name in MENTION_SCAN_RE.findall(flat)]
                 recipients = _intent_recipients(mentions, known_agents)
-                rest = _intent_rest_after_phrase(flat, phrase)
+                rest = _intent_strip_leading_preposition(_intent_rest_after_phrase(flat, phrase))
                 joined = ",".join(f"@{name}" for name in recipients)
                 prefix = f"{joined} " if recipients else ""
                 return IntentProposal(
@@ -1137,7 +1123,8 @@ class Transcript:
             self._render_cache[width] = (stamp, lines)
             return lines
 
-    def _cursors_unlocked(self) -> dict[str, int]:
+    def _state_unlocked(self) -> dict[str, Any]:
+        """Read the .state.json mapping of cursor seqs and the intent flag."""
         descriptor = self._open_regular(self.cursor_path, os.O_RDONLY, missing_ok=True)
         if descriptor is None:
             return {}
@@ -1146,11 +1133,77 @@ class Transcript:
                 data = json.load(stream)
         except (json.JSONDecodeError, OSError, UnicodeError) as error:
             raise ChatError(f"invalid room state: {error}") from error
-        if not isinstance(data, dict) or not all(
-            isinstance(key, str) and isinstance(value, int) for key, value in data.items()
-        ):
+        if not isinstance(data, dict):
             raise ChatError("invalid room state")
+        intent_flag = data.get("intent_enabled", True)
+        if not isinstance(intent_flag, bool):
+            raise ChatError("invalid room state")
+        for key, value in data.items():
+            if key == "intent_enabled":
+                continue
+            if not isinstance(key, str) or not isinstance(value, int) or isinstance(value, bool):
+                raise ChatError("invalid room state")
         return data
+
+    def _cursors_unlocked(self) -> dict[str, int]:
+        return {
+            key: value
+            for key, value in self._state_unlocked().items()
+            if key != "intent_enabled"
+        }
+
+    def intent_enabled(self) -> bool:
+        """Return the persisted front-door setting, on by default."""
+        with self._lock, self._process_lock():
+            return bool(self._state_unlocked().get("intent_enabled", True))
+
+    def _write_state_unlocked(self, data: Mapping[str, Any]) -> None:
+        """Atomically replace .state.json with the given mapping."""
+        temporary_name = f".{self.cursor_path.name}.{uuid.uuid4().hex}.tmp"
+        directory_descriptor = self._directory_descriptor()
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NONBLOCK
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+            os.fchmod(descriptor, 0o600)
+            self._validate_regular(descriptor)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                descriptor = -1
+                stream.write(json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(
+                temporary_name,
+                self.cursor_path.name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+            )
+            self._fsync_state_dir()
+        except FileExistsError as error:
+            raise ChatError("invalid cursor temporary file") from error
+        except OSError as error:
+            raise ChatError(f"invalid room state: {error}") from error
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
+
+    def set_intent_enabled(self, enabled: bool) -> None:
+        """Persist the front-door setting beside the cursor data."""
+        with self._lock, self._process_lock():
+            state = self._state_unlocked()
+            state["intent_enabled"] = bool(enabled)
+            self._write_state_unlocked(state)
 
     def cursors(self) -> dict[str, int]:
         with self._lock, self._process_lock():
@@ -1159,48 +1212,11 @@ class Transcript:
     def advance_cursor(self, agent: str, seq: int) -> None:
         """Atomically merge one monotonic cursor advance across room processes."""
         with self._lock, self._process_lock():
-            cursors = self._cursors_unlocked()
-            if seq <= cursors.get(agent, 0):
+            state = self._state_unlocked()
+            if seq <= state.get(agent, 0):
                 return
-            cursors[agent] = seq
-            temporary_name = f".{self.cursor_path.name}.{uuid.uuid4().hex}.tmp"
-            directory_descriptor = self._directory_descriptor()
-            descriptor = -1
-            try:
-                descriptor = os.open(
-                    temporary_name,
-                    os.O_WRONLY
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | os.O_NONBLOCK
-                    | os.O_CLOEXEC
-                    | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=directory_descriptor,
-                )
-                os.fchmod(descriptor, 0o600)
-                self._validate_regular(descriptor)
-                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                    descriptor = -1
-                    stream.write(json.dumps(cursors, sort_keys=True, separators=(",", ":")) + "\n")
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(
-                    temporary_name,
-                    self.cursor_path.name,
-                    src_dir_fd=directory_descriptor,
-                    dst_dir_fd=directory_descriptor,
-                )
-                self._fsync_state_dir()
-            except FileExistsError as error:
-                raise ChatError("invalid cursor temporary file") from error
-            except OSError as error:
-                raise ChatError(f"invalid room state: {error}") from error
-            finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
-                with suppress(FileNotFoundError):
-                    os.unlink(temporary_name, dir_fd=directory_descriptor)
+            state[agent] = seq
+            self._write_state_unlocked(state)
 
 
 class HerdrClient:
@@ -1939,12 +1955,12 @@ SIGNAL_KIND_NAMES: Mapping[str, str] = {
 # addressed to the human, and signal kinds keep their own counts in
 # room_signal_counts.
 AGENT_HIDDEN_KINDS: frozenset[str] = frozenset(
-    {*SIGNAL_KIND_NAMES, "hint", "minutes", "goal_result"}
+    {*SIGNAL_KIND_NAMES, "hint", "intent", "minutes", "goal_result"}
 )
 
 
 def message_visible_to_agent(item: Mapping[str, Any], agent: str) -> bool:
-    """Hide room-signal lines, hints, minutes, and scoped items."""
+    """Hide room-signal lines, hints, intents, minutes, and scoped items."""
     if item.get("kind") in AGENT_HIDDEN_KINDS:
         return False
     meta = item.get("meta")
@@ -3347,15 +3363,6 @@ class GroupChat:
         created: list[dict[str, Any]] = []
         cancellation_recorded = False
 
-        def finish(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            """Close one delivered ordinary send with its human-only hint."""
-            hint_body = None if task else command_hint(route.body)
-            if hint_body is not None:
-                items.append(
-                    self.transcript.append("system", ("human",), hint_body, kind="hint")
-                )
-            return items
-
         def set_state(agent: str, state: str) -> None:
             if on_state is not None:
                 on_state(agent, state)
@@ -3458,7 +3465,7 @@ class GroupChat:
                         cancel_remaining(index + 1)
                         break
                     created.append(item)
-                return finish(created)
+                return created
             # Every recipient is prompted from this one snapshot, so none of
             # them can see another recipient's reply to this message.
             snapshot = self.transcript.read()
@@ -3507,7 +3514,7 @@ class GroupChat:
                         record_cancellation()
                     else:
                         created.append(item)
-            return finish(created)
+            return created
 
     def plan_review(self, text: str) -> ReviewRound:
         route = parse_route(text, tuple(self.agents))
@@ -6468,12 +6475,21 @@ def handle_local_command(
                 return f"Council export failed: {error}"
             return f"Exported council ledger to {exported}"
         return "Usage: /council status · /council export PATH · /council resume"
+    if stripped == "/intent" or stripped.startswith("/intent "):
+        argument = stripped.removeprefix("/intent").strip().lower()
+        if argument in {"on", "off"}:
+            chat.transcript.set_intent_enabled(argument == "on")
+            return f"Intent front door {argument}."
+        if argument in {"", "status"}:
+            state = "on" if chat.transcript.intent_enabled() else "off"
+            return f"Intent front door is {state}."
+        return "Usage: /intent on|off|status"
     if stripped == "/help":
         return (
             "Commands: /task @agent[,@agent] INSTRUCTION · /review [@agents] QUESTION · "
             "/anneal @author,@critic QUESTION · /consensus [@agents] QUESTION · "
             "/goal [@agents] OBJECTIVE [--rounds N] [--budget MINUTES] · "
-            "/retry <agent|synthesis> · /cancel · /agents · "
+            "/retry <agent|synthesis> · /cancel · /agents · /intent on|off|status · "
             "/council status · /council export PATH · /council resume · /minutes [PATH] · "
             "/show <agent> · /layout compact|grid|grid2 · /inbox · /lanes · /room · "
             "PgUp/PgDn · mouse wheel scrolls "
@@ -6900,13 +6916,24 @@ def _run_tui_loop(
     view = "room"
     status = participant_status(chat, "Ready.")
     status_override: Literal["delivery", "independent"] | None = None
+    pending_intent: IntentProposal | None = None
     picker_dismissed_start: int | None = None
     picker_index = 0
     # A reopened room recalls earlier human lines, so seed from the transcript.
     history = seed_input_history(chat.transcript.read())
+
+    def _clear_pending_intent() -> None:
+        """Drop a pending intent proposal and restore the idle status line."""
+        nonlocal pending_intent, status, status_override
+        if pending_intent is None:
+            return
+        pending_intent = None
+        status = participant_status(chat, "Ready.")
+        status_override = None
+
     while True:
         review_status = reviews.status()
-        fragment = mention_fragment(buffer)
+        fragment = None if pending_intent is not None else mention_fragment(buffer)
         if fragment is None:
             picker_dismissed_start = None
         suggestions = (
@@ -7002,15 +7029,45 @@ def _run_tui_loop(
             recalled = history.previous(buffer)
             if recalled is not None:
                 buffer = recalled
+                history.reset()
+                _clear_pending_intent()
             continue
         if not picker_active and key == curses.KEY_DOWN:
             recalled = history.next()
             if recalled is not None:
                 buffer = recalled
+                history.reset()
+                _clear_pending_intent()
             continue
-        if key in ("\n", "\r"):
+        if key in ("\n", "\r") or (key == "\x1b" and pending_intent is not None):
             if not buffer.strip():
                 continue
+            if key == "\x1b":
+                # Esc sends the buffer exactly as written through the plain path.
+                pending_intent = None
+                status_override = None
+            elif pending_intent is not None:
+                chat.transcript.append(
+                    "system",
+                    ("human",),
+                    f"Intent: {buffer} → {pending_intent.command}",
+                    kind="intent",
+                    meta={
+                        "from": buffer,
+                        "to": pending_intent.command,
+                        "reason": pending_intent.reason,
+                    },
+                )
+                buffer = pending_intent.command
+                pending_intent = None
+                status_override = None
+            elif chat.transcript.intent_enabled() and not buffer.lstrip().startswith("/"):
+                proposal = resolve_intent(buffer, participants)
+                if proposal is not None:
+                    pending_intent = proposal
+                    status = f"Run as: {proposal.command} · Enter runs · Esc sends as written"
+                    status_override = "independent"
+                    continue
             # The exact sent line is recallable, including any /command or
             # @mention prefix; navigation restarts from a fresh draft.
             history.push(buffer)
@@ -7077,8 +7134,10 @@ def _run_tui_loop(
             if buffer:
                 buffer = buffer[:-1]
                 history.reset()
+                _clear_pending_intent()
             continue
         if isinstance(key, str) and key.isprintable():
+            _clear_pending_intent()
             buffer += key
             history.reset()
 
