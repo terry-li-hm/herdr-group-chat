@@ -47,13 +47,16 @@ SETUP_FAILURES_ENV = "HERDR_GROUP_CHAT_SETUP_FAILURES"
 LAYOUT_ENV = "HERDR_GROUP_CHAT_LAYOUT"
 SETTINGS_ENV = "HERDR_GROUP_CHAT_SETTINGS"
 SETTINGS_FILENAME = "settings.toml"
-LAYOUTS = ("compact", "grid", "grid2")
+LAYOUTS = ("compact", "grid", "grid2", "quad")
 DEFAULT_PROFILE = "astra-fable-grok-pi"
 OPUS_DEFAULT_PROFILE = "astra-fable-grok-opus-pi"
 GRID_ROOM_RATIO = "0.55"
 # grid2 keeps the room pane as the left column, so it hands the movers less
 # width: the first `right` split leaves the room pane 40 percent of the tab.
 GRID2_ROOM_RATIO = "0.40"
+# quad keeps the room pane in the top-left cell of a two-by-two grid, so
+# every quad split keeps half for the target and the four cells end equal.
+QUAD_RATIO = "0.5"
 # Probed live on herdr 0.8.2 in an isolated `hgc-probe-*` session: a
 # `pane move <pane> --split down --target-pane <target> --ratio r` keeps
 # fraction r of the split pane for the TARGET and lands the moved pane below
@@ -1594,6 +1597,32 @@ def grid2_moves(mover_count: int) -> tuple[tuple[str, int | None, str], ...]:
     return tuple(moves)
 
 
+def quad_moves(mover_count: int) -> tuple[tuple[str, int | None, str], ...]:
+    """Per-mover (split direction, target mover index or None, ratio) for quad.
+
+    The room pane keeps the top-left cell of a two-by-two grid and the peers
+    fill the other three cells in roster order, top-right then bottom-left
+    then bottom-right, every cell equal: mover 0 splits the room pane `right`
+    keeping QUAD_RATIO, mover 1 splits the room pane `down` keeping QUAD_RATIO,
+    and mover 2 splits mover 0 `down` keeping QUAD_RATIO — every split keeps
+    half for the target, so the four cells finish equal. More than three
+    movers cannot fit and fail closed before any pane is moved.
+    """
+    if mover_count > 3:
+        raise BootstrapError(
+            "quad layout supports at most three peers; use grid2", code="place_failed"
+        )
+    moves: list[tuple[str, int | None, str]] = []
+    for index in range(mover_count):
+        if index == 0:
+            moves.append(("right", None, QUAD_RATIO))
+        elif index == 1:
+            moves.append(("down", None, QUAD_RATIO))
+        else:
+            moves.append(("down", 0, QUAD_RATIO))
+    return tuple(moves)
+
+
 def place(
     herdr_bin: str,
     layout: str,
@@ -1625,6 +1654,12 @@ def place(
     splits the first `right` at half, and every later mover splits the peer
     two positions before it `down` with its column's ratio from
     `grid_peer_split_ratios`.
+    `quad` moves the same peers into the room tab as the other three cells
+    of a two-by-two grid around the room pane, driven by `quad_moves`: every
+    split keeps half for the target, so the room pane holds the top-left
+    cell, the peers take top-right, bottom-left and bottom-right in roster
+    order, all four cells equal, and a fourth peer fails closed before any
+    pane is moved.
     The caller's focused workspace and tab are recorded before the first
     move and restored after the last. No workspace is ever closed.
     """
@@ -1693,18 +1728,22 @@ def place(
                 code="place_failed",
             )
         down_ratios = grid_peer_split_ratios(len(movers))
-        grid2_split_moves = grid2_moves(len(movers)) if layout == "grid2" else ()
+        split_moves = (
+            grid2_moves(len(movers))
+            if layout == "grid2"
+            else quad_moves(len(movers))
+            if layout == "quad"
+            else ()
+        )
         placed_panes: list[str] = []
         anchor = room_pane_id
         if movers:
             caller_workspace, caller_tab = focused_workspace_and_tab(herdr_bin)
         for index, (participant, agent) in enumerate(movers):
             arguments = ["pane", "move", str(agent["pane_id"]), "--tab", room_tab_id, "--split"]
-            if grid2_split_moves:
-                direction, target_index, ratio = grid2_split_moves[index]
-                target_pane = (
-                    room_pane_id if target_index is None else placed_panes[target_index]
-                )
+            if split_moves:
+                direction, target_index, ratio = split_moves[index]
+                target_pane = room_pane_id if target_index is None else placed_panes[target_index]
                 arguments.extend([direction, "--target-pane", target_pane, "--ratio", ratio])
             elif index == 0:
                 arguments.extend(["right", "--target-pane", anchor, "--ratio", GRID_ROOM_RATIO])
@@ -2575,7 +2614,7 @@ def main() -> int:
 
     executable = Path(__file__).resolve().parent / "herdr-group-chat"
     arguments = [str(executable), "--room", room]
-    if layout not in {"grid", "grid2"} or agents_workspace_id in workspace_ids(herdr_bin):
+    if layout not in {"grid", "grid2", "quad"} or agents_workspace_id in workspace_ids(herdr_bin):
         arguments.extend(["--agents-workspace", agents_workspace_id])
     if profile:
         profile_arguments, receipt = profile_room_exec(profile, participants)
@@ -2670,10 +2709,11 @@ def room_entrypoint() -> int:
             )
         save_launcher_state(state_dir, state, state_path)
         agents_workspace_id = str(state.get("agents_workspace_id") or "")
-        if (
-            state.get("layout") in {"grid", "grid2"}
-            and agents_workspace_id not in workspace_ids(herdr_bin)
-        ):
+        if state.get("layout") in {
+            "grid",
+            "grid2",
+            "quad",
+        } and agents_workspace_id not in workspace_ids(herdr_bin):
             agents_workspace_id = ""
     # Reopening a retained room must not replay a previous launch's setup failures.
     os.environ.pop(SETUP_FAILURES_ENV, None)
@@ -2735,9 +2775,7 @@ def parse_launch_arguments(arguments: list[str]) -> tuple[str, str | None]:
         return "--adopt-peers", None
     if mode == "--place":
         if len(rest) != 1 or rest[0] not in LAYOUTS:
-            raise BootstrapError(
-                f"--place requires exactly one layout: {'|'.join(LAYOUTS)}"
-            )
+            raise BootstrapError(f"--place requires exactly one layout: {'|'.join(LAYOUTS)}")
         return "--place", None
     if mode == "--errors":
         try:

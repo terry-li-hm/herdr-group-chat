@@ -6588,6 +6588,7 @@ def test_inspection_argument_parsing_is_exact() -> None:
     assert module.parse_launch_arguments(["--place", "compact"]) == ("--place", None)
     assert module.parse_launch_arguments(["--place", "grid"]) == ("--place", None)
     assert module.parse_launch_arguments(["--place", "grid2"]) == ("--place", None)
+    assert module.parse_launch_arguments(["--place", "quad"]) == ("--place", None)
     for arguments in (
         ["--place"],
         ["--place", "diagonal"],
@@ -6671,6 +6672,8 @@ def test_settings_parse_grid_and_opus(tmp_path: Path, monkeypatch: pytest.Monkey
     assert settings == module.Settings(layout="grid", opus=True)
     path.write_text('layout = "grid2"\n')
     assert module.load_settings("terry.herdr-group-chat") == module.Settings(layout="grid2")
+    path.write_text('layout = "quad"\n')
+    assert module.load_settings("terry.herdr-group-chat") == module.Settings(layout="quad")
     assert (
         module.apply_settings_profile("astra-fable-grok-pi", settings) == "astra-fable-grok-opus-pi"
     )
@@ -7018,6 +7021,140 @@ def test_place_grid2_moves_new_peers_in_roster_order_and_restores_focus(
         ("astra", "fable", "grok", "opus"), "w-chat:t-room"
     )
     assert state["layout"] == "grid2"
+    assert calls[-2:] == [["workspace", "focus", "w-caller"], ["tab", "focus", "w-caller:t9"]]
+    # Focus is restored only after the last move, and no workspace is closed.
+    assert calls.index(moves[-1]) < calls.index(["workspace", "focus", "w-caller"])
+    assert not any(call[:2] == ["workspace", "close"] for call in calls)
+
+
+def test_place_quad_moves_new_peers_in_roster_order_and_restores_focus(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """quad fills the four equal cells of a two-by-two grid: 1 top-left (the
+    room pane), 2 top-right, 3 bottom-left, 4 bottom-right."""
+    calls: list[list[str]] = []
+    roster = module.resolve_profile("astra-fable-grok-pi")
+    moved: set[str] = set()
+    kinds = {
+        "astra-peer": "pi",
+        "fable-peer": "claude",
+        "grok46pi-peer": "pi",
+    }
+
+    def agent_payload(name: str) -> dict:
+        role = name.removesuffix("-peer")
+        # A moved pane keeps its pane id; only its tab and workspace change.
+        if name in moved:
+            return place_agent_record(
+                name,
+                kinds[name],
+                pane_id=f"w-old:p-{role}",
+                tab_id="w-chat:t-room",
+                workspace_id="w-chat",
+            )
+        return place_agent_record(
+            name,
+            kinds[name],
+            pane_id=f"w-old:p-{role}",
+            tab_id="w-old:t-room",
+            workspace_id="w-old",
+        )
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["workspace", "list"]:
+            return {
+                "result": {
+                    "workspaces": [
+                        {"workspace_id": "w-chat", "focused": False},
+                        {
+                            "workspace_id": "w-caller",
+                            "focused": True,
+                            "active_tab_id": "w-caller:t9",
+                        },
+                    ]
+                }
+            }
+        if arguments[:2] == ["agent", "get"]:
+            return agent_payload(arguments[2])
+        if arguments[:2] == ["pane", "move"]:
+            moved.add(arguments[2].rsplit(":p-", 1)[1] + "-peer")
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    state: dict = {
+        "agents_cwd": PLACE_AGENTS_CWD,
+        "participant_pane_ids": {
+            "astra": "w-gone:p-astra",
+            "fable": "w-gone:p-fable",
+            "grok": "w-gone:p-grok",
+        },
+        "participant_tab_ids": {
+            "astra": "w-gone:t-astra",
+            "fable": "w-gone:t-fable",
+            "grok": "w-gone:t-grok",
+        },
+    }
+    moved_roles = module.place(
+        "herdr",
+        "quad",
+        state,
+        roster,
+        room_pane_id="w-chat:p-room",
+        room_tab_id="w-chat:t-room",
+        room_workspace_id="w-chat",
+    )
+    assert moved_roles == ["astra", "fable", "grok"]
+    moves = [call for call in calls if call[:2] == ["pane", "move"]]
+    assert moves == [
+        [
+            "pane",
+            "move",
+            "w-old:p-astra",
+            "--tab",
+            "w-chat:t-room",
+            "--split",
+            "right",
+            "--target-pane",
+            "w-chat:p-room",
+            "--ratio",
+            "0.5",
+        ],
+        [
+            "pane",
+            "move",
+            "w-old:p-fable",
+            "--tab",
+            "w-chat:t-room",
+            "--split",
+            "down",
+            "--target-pane",
+            "w-chat:p-room",
+            "--ratio",
+            "0.5",
+        ],
+        [
+            "pane",
+            "move",
+            "w-old:p-grok46pi",
+            "--tab",
+            "w-chat:t-room",
+            "--split",
+            "down",
+            "--target-pane",
+            "w-old:p-astra",
+            "--ratio",
+            "0.5",
+        ],
+    ]
+    for move in moves:
+        name = move[2].rsplit(":p-", 1)[1] + "-peer"
+        assert calls.index(["agent", "get", name]) < calls.index(move)
+    assert state["participant_tab_ids"] == dict.fromkeys(
+        ("astra", "fable", "grok"), "w-chat:t-room"
+    )
+    assert state["layout"] == "quad"
     assert calls[-2:] == [["workspace", "focus", "w-caller"], ["tab", "focus", "w-caller:t9"]]
     # Focus is restored only after the last move, and no workspace is closed.
     assert calls.index(moves[-1]) < calls.index(["workspace", "focus", "w-caller"])
@@ -7635,6 +7772,30 @@ def test_grid2_moves_layout_for_two_three_four_and_five_peers() -> None:
         ("down", 1, "0.5000"),
         ("down", 2, "0.5000"),
     )
+
+
+def test_quad_moves_layout_for_one_two_and_three_movers() -> None:
+    """Exact per-mover (direction, target index, ratio) tuples for quad.
+
+    N=1 splits the room pane right at half (peer top-right); N=2 splits the
+    room pane down at half (peer bottom-left); N=3 splits mover 0 down at
+    half (peer bottom-right). Every split keeps half for the target, so the
+    four cells are equal, and a fourth mover fails closed."""
+    assert module.quad_moves(1) == (("right", None, "0.5"),)
+    assert module.quad_moves(2) == (
+        ("right", None, "0.5"),
+        ("down", None, "0.5"),
+    )
+    assert module.quad_moves(3) == (
+        ("right", None, "0.5"),
+        ("down", None, "0.5"),
+        ("down", 0, "0.5"),
+    )
+    with pytest.raises(
+        module.BootstrapError, match="quad layout supports at most three peers; use grid2"
+    ) as raised:
+        module.quad_moves(4)
+    assert raised.value.code == "place_failed"
 
 
 OPUS_SHORT_PANE_SCREEN = "Claude Code\n\u2570 \u2026 ctx 42% \u25af\n"

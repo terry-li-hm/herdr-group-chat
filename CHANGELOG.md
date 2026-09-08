@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ### Unreleased
 
+- Add `quad` layout: room top-left, up to three peers in the other cells, equal sizes; `/layout quad`, `--place quad`, `layout = "quad"`.
+
 ## [0.15.0] - 2026-09-08
 
 - **Intent front door: plain-language confirms into slash commands.** A plain

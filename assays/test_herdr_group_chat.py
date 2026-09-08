@@ -2287,10 +2287,13 @@ def test_layout_command_runs_the_launcher_from_the_plugin_root(
     assert line == "Layout: compact — 0 peers placed, focus restored"
     line = handle_local_command("/layout grid2", chat, None, fake_run)
     assert line == "Layout: grid2 — 2 peers placed, focus restored"
+    line = handle_local_command("/layout quad", chat, None, fake_run)
+    assert line == "Layout: quad — 2 peers placed, focus restored"
     assert [args for args, _ in calls] == [
         ["./new-room", "--place", "grid"],
         ["./new-room", "--place", "compact"],
         ["./new-room", "--place", "grid2"],
+        ["./new-room", "--place", "quad"],
     ]
     records = transcript.read()
     assert records[-1]["body"] == line
@@ -2333,12 +2336,18 @@ def test_layout_command_is_blocked_during_a_round_and_rejects_unknown_modes(
         == "A council round is running; use /cancel or wait before sending."
     )
     assert handle_local_command("/layout wide", chat, None, fail_run) == (
-        "Usage: /layout compact|grid|grid2"
+        "Usage: /layout compact|grid|grid2|quad"
     )
     assert handle_local_command("/layout", chat, None, fail_run) == (
-        "Usage: /layout compact|grid|grid2"
+        "Usage: /layout compact|grid|grid2|quad"
     )
     assert transcript.read() == []
+
+
+def test_place_room_layout_rejects_unknown_modes_with_usage() -> None:
+    """The ChatError usage line names every layout the command accepts."""
+    with pytest.raises(ChatError, match=r"Usage: /layout compact\|grid\|grid2\|quad"):
+        module.place_room_layout("wide")
 
 
 def test_agents_command_focuses_first_peer_in_grid_and_backstage_in_compact(
@@ -3009,7 +3018,6 @@ def test_route_receipt_is_expected_once_per_seat_per_room(tmp_path: Path) -> Non
         f"{receipt_one}\nanswer 1 from pi-peer",
         f"{receipt_two}\nanswer 2 from pi-peer",
     ]
-
 
 
 def test_codex_is_addressable_and_roster_is_derived() -> None:
@@ -10806,9 +10814,7 @@ def test_tui_refuses_task_commands_while_a_council_round_runs(
         "RELEASE_WORKER",
         "\x11",
     ]
-    screen = ScriptedTuiScreen(
-        keys, client, release_wait=lambda: reviews[0].wait(HARNESS_WAIT_S)
-    )
+    screen = ScriptedTuiScreen(keys, client, release_wait=lambda: reviews[0].wait(HARNESS_WAIT_S))
     monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
     monkeypatch.setattr(
         module,
@@ -11073,9 +11079,7 @@ def make_goal_chat(
 
 
 def goal_result(transcript: Transcript) -> dict[str, object]:
-    items = [
-        item for item in transcript.read() if item.get("kind") == "goal_result"
-    ]
+    items = [item for item in transcript.read() if item.get("kind") == "goal_result"]
     assert len(items) == 1
     return items[0]
 
@@ -11229,9 +11233,7 @@ def test_goal_zero_budget_stops_before_round_one_and_still_writes_a_result(
     assert meta["stop_reason"] == "budget"
     assert meta["rounds_run"] == 0
     assert meta["minutes_path"] == goal.minutes_path
-    assert not any(
-        item.get("kind") == "goal_reply" for item in transcript.read()
-    )
+    assert not any(item.get("kind") == "goal_reply" for item in transcript.read())
 
 
 def test_goal_cancel_mid_round_records_result_and_prompts_nothing_further(
@@ -11240,16 +11242,14 @@ def test_goal_cancel_mid_round_records_result_and_prompts_nothing_further(
     chat, client, transcript = make_cancellation_aware_ordinary_chat(tmp_path)
     reviews = ReviewController(chat)
 
-    assert handle_local_command(
-        "/goal @pi,@claude fix the build", chat, reviews
-    ).startswith("Goal started")
+    assert handle_local_command("/goal @pi,@claude fix the build", chat, reviews).startswith(
+        "Goal started"
+    )
     assert client.started.wait(HARNESS_WAIT_S)
     assert _wait_until(lambda: len(client.calls) == 2, HARNESS_WAIT_S)
     assert reviews.is_active()
     assert reviews.status() == "goal r1/4 · @pi working · @claude working"
-    assert reviews.cancel() == (
-        "Local cancellation requested; participants may continue working."
-    )
+    assert reviews.cancel() == ("Local cancellation requested; participants may continue working.")
     assert reviews.wait(HARNESS_WAIT_S)
     assert not reviews.is_active()
 
@@ -11471,9 +11471,7 @@ def test_once_routes_goal_commands_through_the_goal_path(
             calls.append(text)
 
     monkeypatch.setattr(module, "GroupChat", CommandOnceChat)
-    assert (
-        main(["--state-dir", str(tmp_path), "--room", "once-goal", "--once", "/goal @pi x"]) == 0
-    )
+    assert main(["--state-dir", str(tmp_path), "--room", "once-goal", "--once", "/goal @pi x"]) == 0
     assert calls == ["/goal @pi x"]
     assert capsys.readouterr().out == ""
 
@@ -11483,9 +11481,7 @@ ROSTER = ["fable", "grok", "pi", "claude"]
 
 def test_resolve_intent_task_rule() -> None:
     resolve = namespace["resolve_intent"]
-    assert resolve("ask @grok to review the diff", ROSTER) == namespace[
-        "IntentProposal"
-    ](
+    assert resolve("ask @grok to review the diff", ROSTER) == namespace["IntentProposal"](
         command="/task @grok review the diff",
         label="task for @grok",
         reason="task",
@@ -11501,9 +11497,7 @@ def test_resolve_intent_review_rule() -> None:
     assert proposal is not None
     assert proposal.command == "/review @fable,@grok the PR description"
     assert proposal.reason == "review"
-    assert resolve("what does everyone think of the draft", ROSTER).command == (
-        "/review the draft"
-    )
+    assert resolve("what does everyone think of the draft", ROSTER).command == ("/review the draft")
     assert resolve("what does everyone think about the draft", ROSTER).command == (
         "/review the draft"
     )
@@ -11518,9 +11512,7 @@ def test_resolve_intent_consensus_rule() -> None:
     assert proposal is not None
     assert proposal.command == "/consensus @fable,@grok the rollout plan"
     assert proposal.reason == "consensus"
-    assert resolve("vote on the colour scheme", ROSTER).command == (
-        "/consensus the colour scheme"
-    )
+    assert resolve("vote on the colour scheme", ROSTER).command == ("/consensus the colour scheme")
     assert resolve("shall we vote on lunch?", ROSTER) is None
     assert resolve("keep discussing", ROSTER) is None
 
@@ -11559,6 +11551,7 @@ def test_resolve_intent_layout_rule() -> None:
     for text, target in (
         ("switch to grid", "grid"),
         ("two columns", "grid2"),
+        ("four cells", "quad"),
         ("compact layout", "compact"),
         ("switch to compact", "compact"),
     ):
@@ -11629,8 +11622,10 @@ def test_tui_second_enter_runs_intent_item_then_command(
             if self.keys and self.keys[0] == "WAIT":
                 self.keys.pop(0)
                 assert _wait_until(
-                    lambda: len(client.calls) == 1
-                    and any(item.get("sender") == "pi" for item in transcript.read()),
+                    lambda: (
+                        len(client.calls) == 1
+                        and any(item.get("sender") == "pi" for item in transcript.read())
+                    ),
                     HARNESS_WAIT_S,
                 )
                 return module.curses.KEY_RESIZE
@@ -11674,8 +11669,10 @@ def test_tui_esc_sends_intent_buffer_as_plain_without_intent_item(
             if self.keys and self.keys[0] == "WAIT":
                 self.keys.pop(0)
                 assert _wait_until(
-                    lambda: len(client.calls) == 1
-                    and any(item.get("sender") == "pi" for item in transcript.read()),
+                    lambda: (
+                        len(client.calls) == 1
+                        and any(item.get("sender") == "pi" for item in transcript.read())
+                    ),
                     HARNESS_WAIT_S,
                 )
                 # The wait runs after the Esc has resolved, so the plain
@@ -11696,8 +11693,7 @@ def test_tui_esc_sends_intent_buffer_as_plain_without_intent_item(
     assert not [item for item in items if item.get("kind") == "intent"]
     assert not [item for item in items if item.get("kind") == "task"]
     assert any(
-        item["sender"] == "human" and item["body"] == "ask @pi to update the note"
-        for item in items
+        item["sender"] == "human" and item["body"] == "ask @pi to update the note" for item in items
     )
 
 
@@ -11752,8 +11748,10 @@ def test_tui_intent_off_sends_plain_and_state_persists_across_reopen(
             if self.keys and self.keys[0] == "WAIT":
                 self.keys.pop(0)
                 assert _wait_until(
-                    lambda: len(client.calls) == 1
-                    and any(item.get("sender") == "pi" for item in transcript.read()),
+                    lambda: (
+                        len(client.calls) == 1
+                        and any(item.get("sender") == "pi" for item in transcript.read())
+                    ),
                     HARNESS_WAIT_S,
                 )
                 return module.curses.KEY_RESIZE
@@ -11763,6 +11761,7 @@ def test_tui_intent_off_sends_plain_and_state_persists_across_reopen(
     screen = WaitScreen(keys, client)  # type: ignore[arg-type]
 
     monkeypatch.setattr(module.curses, "curs_set", lambda _visibility: None)
+
     def track_status(
         _screen: object,
         _transcript: object,
@@ -11786,8 +11785,7 @@ def test_tui_intent_off_sends_plain_and_state_persists_across_reopen(
     assert not [item for item in items if item.get("kind") == "intent"]
     assert not [item for item in items if item.get("kind") == "task"]
     assert any(
-        item["sender"] == "human" and item["body"] == "ask @pi to update the note"
-        for item in items
+        item["sender"] == "human" and item["body"] == "ask @pi to update the note" for item in items
     )
     assert json.loads(transcript.cursor_path.read_text())["intent_enabled"] is False
 

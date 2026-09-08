@@ -75,7 +75,7 @@ ROOM_ENV = "HERDR_GROUP_CHAT_ROOM"
 AGENTS_WORKSPACE_ENV = "HERDR_GROUP_CHAT_AGENTS_WORKSPACE_ID"
 SETUP_FAILURES_ENV = "HERDR_GROUP_CHAT_SETUP_FAILURES"
 ROOM_TAB_ENV = "HERDR_TAB_ID"
-ROOM_LAYOUTS = ("compact", "grid", "grid2")
+ROOM_LAYOUTS = ("compact", "grid", "grid2", "quad")
 PLUGIN_ROOT = Path(__file__).resolve().parent
 LAYOUT_PLACE_TIMEOUT_S = 180
 ROOM_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
@@ -344,9 +344,7 @@ INTENT_TASK_RE = re.compile(
 )
 
 
-def _intent_recipients(
-    matched_mentions: Sequence[str], known_agents: Sequence[str]
-) -> list[str]:
+def _intent_recipients(matched_mentions: Sequence[str], known_agents: Sequence[str]) -> list[str]:
     found = [name.lower().removeprefix("@") for name in matched_mentions]
     if "all" in found:
         return list(dict.fromkeys(known_agents))
@@ -426,6 +424,9 @@ INTENT_LAYOUT_TARGETS = {
     "two columns": "grid2",
     "grid2": "grid2",
     "switch to grid2": "grid2",
+    "four cells": "quad",
+    "quad": "quad",
+    "switch to quad": "quad",
     "compact": "compact",
     "compact layout": "compact",
     "switch to compact": "compact",
@@ -1147,9 +1148,7 @@ class Transcript:
 
     def _cursors_unlocked(self) -> dict[str, int]:
         return {
-            key: value
-            for key, value in self._state_unlocked().items()
-            if key != "intent_enabled"
+            key: value for key, value in self._state_unlocked().items() if key != "intent_enabled"
         }
 
     def intent_enabled(self) -> bool:
@@ -1165,12 +1164,7 @@ class Transcript:
         try:
             descriptor = os.open(
                 temporary_name,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | os.O_NONBLOCK
-                | os.O_CLOEXEC
-                | os.O_NOFOLLOW,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
                 0o600,
                 dir_fd=directory_descriptor,
             )
@@ -1935,8 +1929,7 @@ def format_context(messages: Sequence[dict[str, Any]]) -> str:
     if not messages:
         return "(No new group messages.)"
     return "\n\n".join(
-        f"[{item['sender']}] {item['body']}"
-        for item in collapse_repeated_receipts(messages)
+        f"[{item['sender']}] {item['body']}" for item in collapse_repeated_receipts(messages)
     )
 
 
@@ -3697,9 +3690,7 @@ class GroupChat:
             raise ChatError("minutes cancelled")
         if status == "blocked":
             self._set_review_state(review, synthesizer, "blocked", on_state)
-            raise ChatError(
-                f"@{synthesizer} is blocked and needs attention in {self.host_label}."
-            )
+            raise ChatError(f"@{synthesizer} is blocked and needs attention in {self.host_label}.")
         if not reply.strip():
             self._set_review_state(review, synthesizer, "failed", on_state)
             raise ChatError(f"@{synthesizer} minutes failed: empty response")
@@ -3800,9 +3791,7 @@ class GroupChat:
             goal.current_round = index
             with goal.lock:
                 previous = goal.replies.get(index - 1, {})
-                prior = {
-                    name: previous[name] for name in goal.reviewers if name in previous
-                }
+                prior = {name: previous[name] for name in goal.reviewers if name in previous}
             prompts = {
                 agent: build_goal_prompt(
                     agent,
@@ -3824,18 +3813,14 @@ class GroupChat:
                     reason = "cancelled"
                     break
                 goal.rounds_run = index
-                round_states = {
-                    agent: goal.states.get(agent, "failed") for agent in goal.reviewers
-                }
+                round_states = {agent: goal.states.get(agent, "failed") for agent in goal.reviewers}
                 replies = dict(goal.replies.get(index, {}))
                 for agent in goal.reviewers:
                     if round_states[agent] in {"failed", "timed_out"}:
                         goal.failure_streaks[agent] = goal.failure_streaks.get(agent, 0) + 1
                     else:
                         goal.failure_streaks[agent] = 0
-                stopped = [
-                    agent for agent, state in round_states.items() if state == "blocked"
-                ]
+                stopped = [agent for agent, state in round_states.items() if state == "blocked"]
                 stalled = [
                     agent for agent in goal.reviewers if goal.failure_streaks.get(agent, 0) >= 2
                 ]
@@ -4059,8 +4044,7 @@ class GroupChat:
         covered = [
             item
             for item in self.transcript.read()
-            if _message_meta(item).get("goal_id") == goal.id
-            and item.get("kind") != "goal_result"
+            if _message_meta(item).get("goal_id") == goal.id and item.get("kind") != "goal_result"
         ]
         if not self._begin_review_call(goal, goal.synthesizer, "synthesizing", on_state):
             return None
@@ -4082,9 +4066,7 @@ class GroupChat:
             if goal.cancel_event.is_set():
                 self._set_review_state(goal, goal.synthesizer, "cancelled", on_state)
             else:
-                self._set_review_state(
-                    goal, goal.synthesizer, failure_state(error), on_state
-                )
+                self._set_review_state(goal, goal.synthesizer, failure_state(error), on_state)
             return None
         if goal.cancel_event.is_set():
             self._set_review_state(goal, goal.synthesizer, "cancelled", on_state)
@@ -6213,9 +6195,7 @@ class ReviewController:
             if self._active is not None:
                 raise ChatError("a review is already running")
             review = self.chat.plan_minutes()
-            self._launch(
-                lambda: self.chat.run_minutes(review, target, self._on_state), review
-            )
+            self._launch(lambda: self.chat.run_minutes(review, target, self._on_state), review)
         return f"Minutes started; @{review.synthesizer} synthesizes."
 
     def start_goal(self, text: str) -> str:
@@ -6323,10 +6303,7 @@ class ReviewController:
             order = tuple(dict.fromkeys((*review.reviewers, review.synthesizer)))
             labels = [f"@{name} {self._states.get(name, 'queued')}" for name in order]
             if isinstance(review, GoalRound):
-                return (
-                    f"goal r{review.current_round}/{review.rounds_cap} · "
-                    + " · ".join(labels)
-                )
+                return f"goal r{review.current_round}/{review.rounds_cap} · " + " · ".join(labels)
             prefix = review.mode.title()
         return f"{prefix}: " + " · ".join(labels)
 
@@ -6401,7 +6378,7 @@ def place_room_layout(
     focuses anything in the room process.
     """
     if mode not in ROOM_LAYOUTS:
-        raise ChatError("Usage: /layout compact|grid|grid2")
+        raise ChatError("Usage: /layout compact|grid|grid2|quad")
     try:
         result = runner(
             ["./new-room", "--place", mode],
@@ -6491,7 +6468,7 @@ def handle_local_command(
             "/goal [@agents] OBJECTIVE [--rounds N] [--budget MINUTES] · "
             "/retry <agent|synthesis> · /cancel · /agents · /intent on|off|status · "
             "/council status · /council export PATH · /council resume · /minutes [PATH] · "
-            "/show <agent> · /layout compact|grid|grid2 · /inbox · /lanes · /room · "
+            "/show <agent> · /layout compact|grid|grid2|quad · /inbox · /lanes · /room · "
             "PgUp/PgDn · mouse wheel scrolls "
             "· Home/End jump · @ opens a mention picker "
             "(Tab completes, Esc closes)"
@@ -6501,7 +6478,7 @@ def handle_local_command(
             return "A council round is running; use /cancel or wait before sending."
         mode = stripped.removeprefix("/layout").strip()
         if mode not in ROOM_LAYOUTS:
-            return "Usage: /layout compact|grid|grid2"
+            return "Usage: /layout compact|grid|grid2|quad"
         try:
             line = place_room_layout(mode, layout_runner)
         except ChatError as error:

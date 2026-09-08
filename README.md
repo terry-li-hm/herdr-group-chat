@@ -605,7 +605,7 @@ directory printed by `herdr plugin config-dir terry.herdr-group-chat`. A missing
 file means defaults; an invalid value or unknown key fails the launch closed.
 
 ```toml
-layout = "grid"   # "compact" (default) keeps peers in the backstage workspace
+layout = "grid"   # one of "compact" (default), "grid", "grid2", "quad"
 opus = true       # default false; adds @opus to the default `new` action
 ```
 
@@ -619,7 +619,7 @@ and the probed split ratios keep the right-hand column at equal heights —
 then restores your workspace and tab. `/agents`
 focuses the first peer pane when the room is laid out in grid and the backstage
 workspace otherwise; `/show <role>` focuses that peer's pane. The room's
-`/layout compact|grid|grid2` command re-runs the placement step at any time.
+`/layout compact|grid|grid2|quad` command re-runs the placement step at any time.
 
 With `layout = "grid2"`, the room pane stays as the left column and the peers
 fill two columns of equal width to its right in roster order, left to right
@@ -631,16 +631,26 @@ peer area into its two columns, and every later peer drops below the peer two
 positions before it with that column's probed ratio, so each column finishes
 at equal heights; your workspace and tab are restored exactly as in grid.
 
+With `layout = "quad"`, the room pane keeps the top-left cell of a
+two-by-two grid and the peers fill the other three cells in roster order:
+peer 1 top-right, peer 2 bottom-left, peer 3 bottom-right, all four cells
+equal — every split keeps half for the target pane. The same placement
+step moves each owned peer that is not already in the room tab; your
+workspace and tab are restored exactly as in grid. `quad` holds at most
+three peers, and a fourth fails the placement closed before any pane
+moves; use `grid2` for larger rooms.
+
 ### Switching layout
 
-`/layout grid`, `/layout grid2` and `/layout compact` in the room re-run the
+`/layout grid`, `/layout grid2`, `/layout quad` and `/layout compact` in the room re-run the
 launcher's placement step for the recorded room: grid stacks every owned peer
 in the room tab beside the room pane, grid2 arranges them in two columns
-beside it, and compact moves each one back into an
+beside it, quad splits the tab into four equal cells with the room pane
+top-left, and compact moves each one back into an
 `agents · group-chat` workspace as its own tab. The room command is refused
 while a council round is running; it never moves a pane itself, records the
 result as one system line in the transcript, and placement restores your
-workspace and tab when it finishes. `./new-room --place <compact|grid|grid2>`
+workspace and tab when it finishes. `./new-room --place <compact|grid|grid2|quad>`
 does the same from a terminal.
 
 With `opus = true`, `New group chat` launches the `astra-fable-grok-opus-pi`
