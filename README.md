@@ -620,7 +620,9 @@ Peers still start and verify in the backstage workspace exactly as in compact
 layout; once every participant is owned, the placement step moves each peer
 that is not already in the room tab into it — the room pane anchors the stack,
 and the probed split ratios keep the right-hand column at equal heights —
-then restores your workspace and tab. `/agents`
+then restores your workspace and tab. The in-room layouts close the backstage
+`agents · group-chat` workspace once every peer has moved into the room tab;
+`compact` keeps it. `/agents`
 focuses the first peer pane when the room is laid out in grid and the backstage
 workspace otherwise; `/show <role>` focuses that peer's pane. The room's
 `/layout compact|grid|grid2|quad` command re-runs the placement step at any time.

@@ -1332,6 +1332,39 @@ def ensure_agents_workspace(
     )
 
 
+def close_emptied_agents_workspace(herdr_bin: str, agents_workspace_id: str) -> bool:
+    """Close the backstage workspace once no pane in it reports an agent.
+
+    Herdr auto-closes only a truly empty workspace, so the default shell tab
+    a workspace is born with keeps an emptied backstage alive; after an
+    in-room placement the launcher closes it itself. Any pane still carrying
+    an agent — owned, stale or unknown — keeps the workspace open, and a
+    workspace Herdr already auto-closed simply reports `False`.
+    """
+    if not agents_workspace_id:
+        return False
+    try:
+        listed = run_json(herdr_bin, ["pane", "list", "--workspace", agents_workspace_id])
+    except BootstrapError as error:
+        # Herdr auto-closes an emptied workspace; with it gone there is
+        # nothing left to close.
+        if error.code != "workspace_not_found":
+            raise
+        return False
+    for pane in listed.get("result", {}).get("panes", []):
+        if isinstance(pane, dict) and str(pane.get("agent") or ""):
+            return False
+    try:
+        run_json(herdr_bin, ["workspace", "close", agents_workspace_id])
+    except BootstrapError as error:
+        raise BootstrapError(
+            f"failed to close the emptied {AGENTS_WORKSPACE_LABEL} workspace "
+            f"({agents_workspace_id})",
+            code="place_failed",
+        ) from error
+    return True
+
+
 def plugin_context() -> dict[str, Any]:
     try:
         context = json.loads(os.environ.get("HERDR_PLUGIN_CONTEXT_JSON", "{}"))
@@ -1631,7 +1664,7 @@ def place(
     room_pane_id: str,
     room_tab_id: str,
     room_workspace_id: str,
-) -> list[str]:
+) -> tuple[list[str], bool]:
     """Place every owned peer for `layout`, from live state only.
 
     The step reads `agent get` for each participant, `pane layout` for the
@@ -1661,7 +1694,11 @@ def place(
     order, all four cells equal, and a fourth peer fails closed before any
     pane is moved.
     The caller's focused workspace and tab are recorded before the first
-    move and restored after the last. No workspace is ever closed.
+    move and restored after the last. Once every mover sits in the room tab
+    and focus is back with the caller, the in-room layouts close the recorded
+    backstage workspace when no pane in it reports an agent; `compact` never
+    closes it. The close is the last command so a failure cannot leave the
+    caller's focus elsewhere.
     """
     if layout not in LAYOUTS:
         raise BootstrapError(f"unknown layout {layout!r}", code="settings_invalid")
@@ -1797,7 +1834,12 @@ def place(
             # moves ran; Herdr owns the lifecycle, so "already gone" is fine.
             if error.code not in {"workspace_not_found", "tab_not_found"}:
                 raise
-    return moved
+    backstage_closed = False
+    if layout in {"grid", "grid2", "quad"}:
+        backstage_closed = close_emptied_agents_workspace(
+            herdr_bin, str(state.get("agents_workspace_id") or "")
+        )
+    return moved, backstage_closed
 
 
 def launch_room(open_existing: bool, profile: str | None = None) -> int:
@@ -2742,7 +2784,7 @@ def place_layout(layout: str) -> int:
         state = load_launcher_state(state_dir, state_path)
         profile = str(state.get("selected_profile") or "") or None
         participants = resolve_profile(profile) if profile else resolve_profile(None)
-        moved = place(
+        moved, backstage_closed = place(
             herdr_bin,
             layout,
             state,
@@ -2753,7 +2795,15 @@ def place_layout(layout: str) -> int:
         )
         save_launcher_state(state_dir, state, state_path)
     print(
-        json.dumps({"layout": layout, "moved": moved}, sort_keys=True, separators=(",", ":")),
+        json.dumps(
+            {
+                "layout": layout,
+                "moved": moved,
+                "backstage_closed": backstage_closed,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
         flush=True,
     )
     return 0

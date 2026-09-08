@@ -6648,11 +6648,207 @@ def test_place_mode_reads_recorded_ids_and_prints_one_json_line(
     assert module.run_launcher(["--place", "grid"]) == 0
 
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
-    assert lines == ['{"layout":"grid","moved":["astra"]}']
+    # No backstage workspace is recorded, so nothing is closed.
+    assert lines == ['{"backstage_closed":false,"layout":"grid","moved":["astra"]}']
     moves = [call for call in calls if call[:2] == ["pane", "move"]]
     assert [move[2] for move in moves] == ["w-room:p-astra-peer"]
     assert moves[0][moves[0].index("--target-pane") + 1] == "w-chat:p-room"
     assert load_launcher_state(tmp_path)["layout"] == "grid"
+
+
+def run_place_quad_with_backstage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    backstage_panes: list[dict] | BootstrapError,
+) -> tuple[list[list[str]], list[str]]:
+    """Run `--place quad` for three peers with a recorded backstage workspace.
+
+    Every peer starts in the backstage workspace, so all three move into the
+    room tab. `backstage_panes` is what `pane list --workspace w-backstage`
+    answers: a pane list, or a BootstrapError raised for the command.
+    """
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    save_launcher_state(
+        tmp_path,
+        {
+            "room_pane_id": "w-chat:p-room",
+            "room_tab_id": "w-chat:t-room",
+            "chat_workspace_id": "w-chat",
+            "selected_profile": "astra-fable-grok",
+            "agents_cwd": PLACE_AGENTS_CWD,
+            "agents_workspace_id": "w-backstage",
+        },
+    )
+    calls: list[list[str]] = []
+    moved: set[str] = set()
+    kinds = {"astra-peer": "pi", "fable-peer": "claude", "grok46-peer": "grok"}
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["workspace", "list"]:
+            return {
+                "result": {
+                    "workspaces": [
+                        {"workspace_id": "w-chat", "focused": False},
+                        {
+                            "workspace_id": "w-caller",
+                            "focused": True,
+                            "active_tab_id": "w-caller:t9",
+                        },
+                    ]
+                }
+            }
+        if arguments[:2] == ["agent", "get"]:
+            name = arguments[2]
+            # A moved pane keeps its pane id; only its tab and workspace change.
+            return place_agent_record(
+                name,
+                kinds[name],
+                pane_id=f"w-backstage:p-{name}",
+                tab_id="w-chat:t-room" if name in moved else f"w-backstage:t-{name}",
+                workspace_id="w-chat" if name in moved else "w-backstage",
+            )
+        if arguments[:2] == ["pane", "move"]:
+            moved.add(arguments[2].rsplit(":p-", 1)[1])
+            return {"result": {"type": "ok"}}
+        if arguments == ["pane", "list", "--workspace", "w-backstage"]:
+            if isinstance(backstage_panes, BootstrapError):
+                raise backstage_panes
+            return {"result": {"panes": backstage_panes}}
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    assert module.run_launcher(["--place", "quad"]) == 0
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    return calls, lines
+
+
+def test_place_quad_closes_the_emptied_backstage_workspace_last(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The emptied backstage workspace is closed exactly once, after the last
+    move and after both focus-restore commands."""
+    calls, lines = run_place_quad_with_backstage(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        # Only the default shell tab is left behind, carrying no agent.
+        [{"pane_id": "w-backstage:p-shell", "agent": ""}],
+    )
+    moves = [call for call in calls if call[:2] == ["pane", "move"]]
+    assert [move[2] for move in moves] == [
+        "w-backstage:p-astra-peer",
+        "w-backstage:p-fable-peer",
+        "w-backstage:p-grok46-peer",
+    ]
+    closes = [call for call in calls if call[:2] == ["workspace", "close"]]
+    assert closes == [["workspace", "close", "w-backstage"]]
+    assert calls.index(closes[0]) > calls.index(moves[-1])
+    assert calls.index(closes[0]) > calls.index(["workspace", "focus", "w-caller"])
+    assert calls.index(closes[0]) > calls.index(["tab", "focus", "w-caller:t9"])
+    assert calls[-1] == closes[0]
+    assert lines == ['{"backstage_closed":true,"layout":"quad","moved":["astra","fable","grok"]}']
+
+
+def test_place_quad_keeps_the_backstage_workspace_while_an_agent_pane_remains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A pane still reporting an agent — owned, stale or unknown — blocks the close."""
+    calls, lines = run_place_quad_with_backstage(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        [{"pane_id": "w-backstage:p-ghost", "agent": "pi"}],
+    )
+    assert ["pane", "list", "--workspace", "w-backstage"] in calls
+    assert not any(call[:2] == ["workspace", "close"] for call in calls)
+    assert lines == ['{"backstage_closed":false,"layout":"quad","moved":["astra","fable","grok"]}']
+
+
+def test_place_quad_tolerates_a_backstage_workspace_herdr_already_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An auto-closed backstage workspace issues no close and records false."""
+    calls, lines = run_place_quad_with_backstage(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        BootstrapError("gone", code="workspace_not_found"),
+    )
+    assert ["pane", "list", "--workspace", "w-backstage"] in calls
+    assert not any(call[:2] == ["workspace", "close"] for call in calls)
+    assert lines == ['{"backstage_closed":false,"layout":"quad","moved":["astra","fable","grok"]}']
+
+
+def test_place_compact_never_closes_the_backstage_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """compact keeps the labelled backstage workspace: peers move into it, not out."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    save_launcher_state(
+        tmp_path,
+        {
+            "room_pane_id": "w-chat:p-room",
+            "room_tab_id": "w-chat:t-room",
+            "chat_workspace_id": "w-chat",
+            "selected_profile": "astra-fable",
+            "agents_cwd": PLACE_AGENTS_CWD,
+            "agents_workspace_id": "w-backstage",
+        },
+    )
+    calls: list[list[str]] = []
+    moved: set[str] = set()
+
+    def fake_run_json(_herdr_bin: str, arguments: list[str], timeout: float | None = 30) -> dict:
+        del timeout
+        calls.append(arguments)
+        if arguments == ["workspace", "list"]:
+            return {
+                "result": {
+                    "workspaces": [
+                        {"workspace_id": "w-chat", "focused": False},
+                        {
+                            "workspace_id": "w-backstage",
+                            "label": module.AGENTS_WORKSPACE_LABEL,
+                            "focused": False,
+                        },
+                        {
+                            "workspace_id": "w-caller",
+                            "focused": True,
+                            "active_tab_id": "w-caller:t9",
+                        },
+                    ]
+                }
+            }
+        if arguments[:2] == ["agent", "get"]:
+            name = arguments[2]
+            kind = "claude" if name == "fable-peer" else "pi"
+            return place_agent_record(
+                name,
+                kind,
+                pane_id=f"w-backstage:p-{name}"
+                if name in moved or name == "fable-peer"
+                else f"w-old:p-{name}",
+                tab_id=f"w-backstage:t-{name}"
+                if name in moved or name == "fable-peer"
+                else "w-old:t-room",
+                workspace_id="w-backstage" if name in moved or name == "fable-peer" else "w-old",
+            )
+        if arguments[:2] == ["pane", "move"]:
+            moved.add(arguments[2].rsplit(":p-", 1)[1])
+            return {"result": {"type": "ok"}}
+        return {"result": {"type": "ok"}}
+
+    monkeypatch.setattr(module, "run_json", fake_run_json)
+    assert module.run_launcher(["--place", "compact"]) == 0
+    moves = [call for call in calls if call[:2] == ["pane", "move"]]
+    assert [move[2] for move in moves] == ["w-old:p-astra-peer"]
+    assert not any(call[:2] == ["pane", "list"] for call in calls)
+    assert not any(call[:2] == ["workspace", "close"] for call in calls)
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert lines == ['{"backstage_closed":false,"layout":"compact","moved":["astra"]}']
 
 
 # --- settings, grid layout and the Opus participant ------------------------------------
@@ -6825,7 +7021,7 @@ def test_place_grid_moves_new_peers_in_roster_order_and_restores_focus(
             "grok": "w-gone:t-grok",
         },
     }
-    moved_roles = module.place(
+    moved_roles, backstage_closed = module.place(
         "herdr",
         "grid",
         state,
@@ -6835,6 +7031,8 @@ def test_place_grid_moves_new_peers_in_roster_order_and_restores_focus(
         room_workspace_id="w-chat",
     )
     assert moved_roles == ["fable", "grok"]
+    # No backstage workspace is recorded, so nothing is closed.
+    assert backstage_closed is False
     moves = [call for call in calls if call[:2] == ["pane", "move"]]
     assert moves == [
         [
@@ -6949,7 +7147,7 @@ def test_place_grid2_moves_new_peers_in_roster_order_and_restores_focus(
             "opus": "w-gone:t-opus",
         },
     }
-    moved_roles = module.place(
+    moved_roles, _backstage_closed = module.place(
         "herdr",
         "grid2",
         state,
@@ -7096,7 +7294,7 @@ def test_place_quad_moves_new_peers_in_roster_order_and_restores_focus(
             "grok": "w-gone:t-grok",
         },
     }
-    moved_roles = module.place(
+    moved_roles, _backstage_closed = module.place(
         "herdr",
         "quad",
         state,
@@ -7184,18 +7382,15 @@ def test_place_grid_is_idempotent_on_an_immediate_rerun(
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
     state: dict = {"agents_cwd": PLACE_AGENTS_CWD}
-    assert (
-        module.place(
-            "herdr",
-            "grid",
-            state,
-            module.resolve_profile("astra-fable"),
-            room_pane_id="w-chat:p-room",
-            room_tab_id="w-chat:t-room",
-            room_workspace_id="w-chat",
-        )
-        == []
-    )
+    assert module.place(
+        "herdr",
+        "grid",
+        state,
+        module.resolve_profile("astra-fable"),
+        room_pane_id="w-chat:p-room",
+        room_tab_id="w-chat:t-room",
+        room_workspace_id="w-chat",
+    ) == ([], False)
     assert [call for call in calls if call[:2] == ["pane", "move"]] == []
     assert not any(call[:2] in (["workspace", "focus"], ["tab", "focus"]) for call in calls)
 
@@ -7357,7 +7552,7 @@ def test_place_compact_moves_only_unplaced_peers_into_the_labelled_workspace(
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
     state: dict = {"agents_cwd": PLACE_AGENTS_CWD}
-    moved_roles = module.place(
+    moved_roles, backstage_closed = module.place(
         "herdr",
         "compact",
         state,
@@ -7367,6 +7562,8 @@ def test_place_compact_moves_only_unplaced_peers_into_the_labelled_workspace(
         room_workspace_id="w-chat",
     )
     assert moved_roles == ["fable", "grok"]
+    # compact never closes the backstage workspace.
+    assert backstage_closed is False
     moves = [call for call in calls if call[:2] == ["pane", "move"]]
     assert moves == [
         [
@@ -7435,7 +7632,7 @@ def test_place_compact_creates_the_labelled_workspace_on_demand(
 
     monkeypatch.setattr(module, "run_json", fake_run_json)
     state: dict = {"agents_cwd": PLACE_AGENTS_CWD}
-    moved_roles = module.place(
+    moved_roles, backstage_closed = module.place(
         "herdr",
         "compact",
         state,
@@ -7445,6 +7642,7 @@ def test_place_compact_creates_the_labelled_workspace_on_demand(
         room_workspace_id="",
     )
     assert moved_roles == ["astra", "fable"]
+    assert backstage_closed is False
     create = next(call for call in calls if call[:2] == ["workspace", "create"])
     assert create[create.index("--cwd") + 1] == PLACE_AGENTS_CWD
     moves = [call for call in calls if call[:2] == ["pane", "move"]]
@@ -7452,18 +7650,15 @@ def test_place_compact_creates_the_labelled_workspace_on_demand(
 
     # An immediate rerun against the now-labelled workspace issues no move.
     calls.clear()
-    assert (
-        module.place(
-            "herdr",
-            "compact",
-            state,
-            module.resolve_profile("astra-fable"),
-            room_pane_id="",
-            room_tab_id="",
-            room_workspace_id="",
-        )
-        == []
-    )
+    assert module.place(
+        "herdr",
+        "compact",
+        state,
+        module.resolve_profile("astra-fable"),
+        room_pane_id="",
+        room_tab_id="",
+        room_workspace_id="",
+    ) == ([], False)
     assert not any(call[:2] in (["pane", "move"], ["workspace", "create"]) for call in calls)
 
 
@@ -7525,7 +7720,7 @@ def test_place_compact_recreates_a_workspace_that_vanished_mid_placement(
         room_pane_id="",
         room_tab_id="",
         room_workspace_id="",
-    ) == ["astra"]
+    ) == (["astra"], False)
     assert [
         "workspace",
         "create",
@@ -7667,7 +7862,7 @@ def test_place_tolerates_a_vanished_caller_workspace_and_tab_on_restore(
         module, "focused_workspace_and_tab", lambda _herdr_bin: ("w-gone", "w-gone:t-x")
     )
     state: dict = {"agents_cwd": PLACE_AGENTS_CWD}
-    moved_roles = module.place(
+    moved_roles, backstage_closed = module.place(
         "herdr",
         "grid",
         state,
@@ -7677,6 +7872,7 @@ def test_place_tolerates_a_vanished_caller_workspace_and_tab_on_restore(
         room_workspace_id="w-chat",
     )
     assert moved_roles == ["astra", "fable"]
+    assert backstage_closed is False
     assert ["workspace", "focus", "w-gone"] in calls
     assert ["tab", "focus", "w-gone:t-x"] in calls
 
@@ -7809,11 +8005,11 @@ CLAUDE_OPUS_PROCESS = [
 ]
 
 
-def test_grid_relaunch_reuses_live_peers_and_leaves_lifecycle_to_herdr(
+def test_grid_relaunch_reuses_live_peers_and_closes_the_emptied_backstage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """End to end: peers in the recorded room workspace are reused, rearranged
-    into the new room tab, and no workspace is ever closed by the launcher."""
+    into the new room tab, and the emptied backstage workspace is closed once."""
     captured: dict[str, object] = {}
     profile_launch_env(tmp_path, monkeypatch, captured)
     monkeypatch.setenv(module.PROFILE_ENV, "astra-fable-grok")
@@ -7968,10 +8164,15 @@ def test_grid_relaunch_reuses_live_peers_and_leaves_lifecycle_to_herdr(
     assert not any(call[:2] in (["tab", "create"], ["agent", "start"]) for call in calls)
     moves = [call for call in calls if call[:2] == ["pane", "move"]]
     assert [move[2] for move in moves] == ["w-room:p-astra", "w-room:p-fable", "w-room:p-grok"]
-    # The placeholder tab is closed, but the emptied backstage workspace is
-    # Herdr's to close; the launcher never issues a workspace close.
+    # The emptied backstage workspace holds no agent pane, so the launch path
+    # closes it exactly once, after the last move.
+    closes = [call for call in calls if call[:2] == ["workspace", "close"]]
+    assert closes == [["workspace", "close", "w-backstage"]]
+    assert calls.index(closes[0]) > calls.index(moves[-1])
+    # The tracked placeholder tab close still runs after the placement; with
+    # the workspace already closed Herdr answers tab_not_found, which is
+    # tolerated, so the launch keeps its existing cleanup.
     assert ["tab", "close", "w-backstage:t-ph"] in calls
-    assert not any(call[:2] == ["workspace", "close"] for call in calls)
     argv = captured["argv"]
     assert "--agents-workspace" not in argv
     final_state = load_launcher_state(tmp_path)

@@ -63,3 +63,13 @@ all three. Three costs surfaced:
 
 Minor release (0.11.0) under standing authority once the full candidate and
 installed smokes pass for both layouts. Not a tonight change.
+
+## Open option: in-room launch (not built)
+
+Recorded 8 September 2026 after the emptied backstage workspace was found alive with a default shell tab. Terry asked whether the in-room layouts should stop creating the backstage workspace altogether and launch each peer directly in the room tab.
+
+The mechanism exists: `herdr pane split <pane> --direction right|down --ratio r --cwd --env` creates a shell pane in the same tab, and `herdr agent start <name> --kind <kind> --pane <id>` starts the peer there, so the `grid2_moves` and `quad_moves` tables could drive splits instead of moves.
+
+It was not built because the backstage workspace gives failure isolation (a peer that fails native-UI verification never appears in the room tab and the launch fails closed with the room untouched), the `pane move` ratio semantics are probed and encoded while `pane split --ratio` would need a fresh live probe in an isolated `hgc-probe-*` session, and `compact` would keep the backstage path anyway, leaving two launch paths. The user-visible benefit is small: the backstage workspace is created `--no-focus` and now closes as soon as the peers have moved.
+
+Revisit if the brief appearance of the backstage workspace becomes a problem, or if a layout needs peers that cannot be moved. The first step is the split-ratio probe; the second is a cleanup path that closes every created pane when a peer fails verification.
