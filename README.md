@@ -465,6 +465,10 @@ The standalone CLI remains available:
 ./herdr-group-chat --show
 ```
 
+A second process can open a live profile room from a plain terminal: the
+verified receipt is persisted in the room's `.state.json` at open, so
+`--once` falls back to it when `HERDR_GROUP_CHAT_PROFILE_RECEIPT` is absent.
+
 Set `HERDR_GROUP_CHAT_SYNTHESIZER` or pass `--synthesizer` to select Pi,
 Claude, Codex, or Grok for phase two. `--agent-timeout NAME=MILLISECONDS`
 overrides the default timeout for one participant and may be repeated.
@@ -651,7 +655,9 @@ top-left, and compact moves each one back into an
 while a council round is running; it never moves a pane itself, records the
 result as one system line in the transcript, and placement restores your
 workspace and tab when it finishes. `./new-room --place <compact|grid|grid2|quad>`
-does the same from a terminal.
+does the same from a terminal. The launcher owns layout-name validation: the
+room passes any single layout token through to it and surfaces its error
+line verbatim.
 
 With `opus = true`, `New group chat` launches the `astra-fable-grok-opus-pi`
 profile: `@astra`, `@fable` and `@grok` as before plus `@opus` running Claude

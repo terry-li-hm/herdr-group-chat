@@ -5,6 +5,9 @@ All notable changes to this project are documented here.
 ### Unreleased
 
 - Add `quad` layout: room top-left, up to three peers in the other cells, equal sizes; `/layout quad`, `--place quad`, `layout = "quad"`.
+- **Persist the profile receipt in the room's `.state.json`** so a second process can open a live profile room from a plain terminal when `HERDR_GROUP_CHAT_PROFILE_RECEIPT` is absent; the environment receipt still wins and a mismatched payload fails closed.
+- **The launcher owns `/layout` validation**: the room passes any single layout token to `./new-room --place` and surfaces the launcher's error line verbatim instead of rejecting names its baked-in list does not know.
+- **A live plugin room is marked in the standalone default state directory**, so a terminal `--once` appends to the open room's transcript instead of forking a same-named room the open TUI never sees.
 
 ## [0.15.0] - 2026-09-08
 

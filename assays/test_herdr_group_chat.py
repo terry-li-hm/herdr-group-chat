@@ -2323,31 +2323,65 @@ def test_layout_command_renders_the_launcher_error_line(
     assert records[-1]["body"] == line
 
 
-def test_layout_command_is_blocked_during_a_round_and_rejects_unknown_modes(
+def test_layout_command_is_blocked_during_a_round_and_rejects_malformed_modes(
     tmp_path: Path,
 ) -> None:
     chat, _, transcript = make_chat(tmp_path)
 
     def fail_run(_arguments: list[str], **_kwargs: object) -> Completed:
-        raise AssertionError("the launcher must not spawn during a blocked or invalid /layout")
+        raise AssertionError("the launcher must not spawn during a blocked or malformed /layout")
 
     assert (
         handle_local_command("/layout grid", chat, ActiveReviewStub(), fail_run)
         == "A council round is running; use /cancel or wait before sending."
     )
-    assert handle_local_command("/layout wide", chat, None, fail_run) == (
-        "Usage: /layout compact|grid|grid2|quad"
-    )
-    assert handle_local_command("/layout", chat, None, fail_run) == (
-        "Usage: /layout compact|grid|grid2|quad"
-    )
+    usage = "Usage: /layout compact|grid|grid2|quad"
+    assert handle_local_command("/layout", chat, None, fail_run) == usage
+    assert handle_local_command("/layout two tokens", chat, None, fail_run) == usage
+    assert handle_local_command("/layout WIDE", chat, None, fail_run) == usage
+    assert handle_local_command("/layout ../escape", chat, None, fail_run) == usage
     assert transcript.read() == []
 
 
-def test_place_room_layout_rejects_unknown_modes_with_usage() -> None:
-    """The ChatError usage line names every layout the command accepts."""
+def test_layout_command_passes_unknown_tokens_to_the_launcher_error_line(
+    tmp_path: Path,
+) -> None:
+    """The launcher, not the TUI, is the authority on layout names."""
+    chat, _, transcript = make_chat(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(arguments: list[str], **_kwargs: object) -> Completed:
+        calls.append(list(arguments))
+        return Completed(
+            stderr="new-room: --place requires exactly one layout: compact|grid|grid2|quad\n",
+            returncode=2,
+        )
+
+    line = handle_local_command("/layout wide", chat, None, fake_run)
+
+    assert line == ("new-room: --place requires exactly one layout: compact|grid|grid2|quad")
+    assert calls == [["./new-room", "--place", "wide"]]
+    records = transcript.read()
+    assert records[-1]["sender"] == "system"
+    assert records[-1]["body"] == line
+
+
+def test_place_room_layout_rejects_malformed_modes_with_usage() -> None:
+    """The ChatError usage line names every layout the launcher knows."""
     with pytest.raises(ChatError, match=r"Usage: /layout compact\|grid\|grid2\|quad"):
-        module.place_room_layout("wide")
+        module.place_room_layout("two tokens")
+    with pytest.raises(ChatError, match=r"Usage: /layout compact\|grid\|grid2\|quad"):
+        module.place_room_layout("Wide")
+
+
+def test_place_room_layout_surfaces_the_launcher_error_for_unknown_layouts() -> None:
+    launcher_error = "--place requires exactly one layout: compact|grid|grid2|quad\n"
+
+    def fake_run(_arguments: list[str], **_kwargs: object) -> Completed:
+        return Completed(stderr=launcher_error, returncode=2)
+
+    with pytest.raises(ChatError, match="--place requires exactly one layout"):
+        module.place_room_layout("wide", fake_run)
 
 
 def test_agents_command_focuses_first_peer_in_grid_and_backstage_in_compact(
@@ -3035,6 +3069,53 @@ def test_state_dir_precedence(tmp_path: Path) -> None:
     assert resolve_state_dir(explicit, {"HERDR_PLUGIN_STATE_DIR": str(plugin)}) == explicit
     assert resolve_state_dir(None, {"HERDR_PLUGIN_STATE_DIR": str(plugin)}) == plugin
     assert resolve_state_dir(None, {}) == Path("~/.local/state/herdr-group-chat")
+
+
+def test_room_state_dir_follows_the_live_room_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plain terminal resolves a live plugin room before the default directory."""
+    standalone = tmp_path / "standalone"
+    live = tmp_path / "plugin-state"
+    live.mkdir()
+    monkeypatch.setattr(module, "DEFAULT_STATE_DIR", standalone)
+    resolve_room = namespace["resolve_room_state_dir"]
+    pointer = namespace["live_room_pointer_path"]
+
+    # Without a pointer the default directory stands, and a bad room id never
+    # touches the pointer path.
+    assert resolve_room(None, "plain-room", {}) == standalone
+    assert resolve_room(None, "../escape", {}) == standalone
+
+    module_write_pointer = namespace["write_live_room_pointer"]
+    module_write_pointer("live-room", live)
+    assert json.loads(pointer("live-room").read_text()) == {
+        "room": "live-room",
+        "state_dir": str(live.resolve()),
+    }
+    assert resolve_room(None, "live-room", {}) == live
+
+    # Explicit --state-dir and a plugin environment both outrank the pointer.
+    explicit = tmp_path / "explicit path"
+    other_plugin = tmp_path / "other-plugin"
+    assert resolve_room(explicit, "live-room", {"HERDR_PLUGIN_STATE_DIR": str(other_plugin)}) == (
+        explicit
+    )
+    assert resolve_room(None, "live-room", {"HERDR_PLUGIN_STATE_DIR": str(other_plugin)}) == (
+        other_plugin
+    )
+
+    # Unreadable, mismatched, or stale pointers are ignored, never fatal.
+    pointer("live-room").write_text("not json")
+    assert resolve_room(None, "live-room", {}) == standalone
+    pointer("live-room").write_text(json.dumps({"room": "other-room", "state_dir": str(live)}))
+    assert resolve_room(None, "live-room", {}) == standalone
+    pointer("live-room").write_text(
+        json.dumps({"room": "live-room", "state_dir": str(tmp_path / "gone")})
+    )
+    assert resolve_room(None, "live-room", {}) == standalone
+    pointer("live-room").write_text(json.dumps({"room": "live-room", "state_dir": "relative/path"}))
+    assert resolve_room(None, "live-room", {}) == standalone
 
 
 def test_extract_reply_uses_the_last_marker_pair() -> None:
@@ -5466,6 +5547,32 @@ def test_transcript_render_cache_is_reused_and_invalidated_on_append(tmp_path: P
     second = transcript.rendered_lines(80)
     assert second is not first
     assert "pi> second" in second
+
+
+def test_external_process_appends_render_in_the_open_transcript(tmp_path: Path) -> None:
+    """A second process appending to the same room must render in the open view.
+
+    Regression for the room run on 8 September 2026: --once rounds appended by
+    another process have to appear in the already-open TUI. The open
+    instance's rendered_lines cache is keyed on the transcript file's
+    (mtime_ns, size) stamp and re-reads on any change, and no view cursor
+    filters items out of the human view.
+    """
+    open_view = Transcript(tmp_path, "external-room")
+    open_view.append("system", ("human",), "profile receipt line")
+    first = open_view.rendered_lines(80)
+    assert "system> profile receipt line" in first
+
+    second_process = Transcript(tmp_path, "external-room")
+    second_process.append("human", ("pi",), "from the terminal")
+    second_process.append("pi", ("human",), "reply from the room")
+
+    refreshed = open_view.rendered_lines(80)
+    assert refreshed is not first
+    assert "human> from the terminal" in refreshed
+    assert "pi> reply from the room" in refreshed
+    # No per-room view cursor pins the open instance to its opening seq.
+    assert open_view.cursors() == {}
 
 
 def test_herdr_turn_submits_then_polls_for_token_bound_reply(
@@ -8639,6 +8746,257 @@ def test_exact_two_role_mapping_runs_and_receipt_is_recorded_once(
     assert "attest" not in body.lower()
     senders = [item["sender"] for item in items]
     assert senders.count("astra") == 2 and senders.count("fable") == 2  # both turns, one receipt
+
+
+def test_receipt_is_persisted_on_open_and_read_back_with_empty_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The validated environment receipt lands in .state.json and reopens the room."""
+
+    class StaticClient(ProfileClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(module, "HerdrClient", StaticClient)
+    valid_receipt_env(monkeypatch)
+    base = [
+        "--state-dir",
+        str(tmp_path),
+        "--room",
+        "persist-room",
+        "--profile",
+        "astra-fable",
+        "--agent",
+        "astra=astra-peer",
+        "--agent",
+        "fable=fable-peer",
+    ]
+
+    assert main([*base, "--once", "@all hello"]) == 0
+
+    transcript = Transcript(tmp_path, "persist-room")
+    persisted = transcript.profile_receipt()
+    assert persisted == {
+        "profile": "astra-fable",
+        "verified": [VALID_RECEIPT["verified"][0], VALID_RECEIPT["verified"][1]],
+    }
+    state = json.loads((tmp_path / "persist-room.state.json").read_text())
+    assert state["profile_receipt"] == persisted
+    # The receipt rides beside cursor seqs and stays invisible to cursor readers.
+    transcript.advance_cursor("astra", 4)
+    cursors = transcript.cursors()
+    assert cursors == {"astra": 4, "fable": 2}
+    assert "profile_receipt" not in cursors
+    assert Transcript(tmp_path, "persist-room").profile_receipt() == persisted
+
+    # A second process with no environment receipt opens from the persisted payload.
+    monkeypatch.delenv(namespace["PROFILE_RECEIPT_ENV"], raising=False)
+    agents = {"astra": "astra-peer", "fable": "fable-peer"}
+    loaded = namespace["load_profile_receipt"](
+        "astra-fable", agents, {}, persisted, room="persist-room"
+    )
+    assert loaded == persisted
+    assert main([*base, "--once", "@all again without the environment"]) == 0
+    human = [item for item in transcript.read() if item["sender"] == "human"]
+    assert [item["body"] for item in human] == ["hello", "again without the environment"]
+
+
+def test_environment_receipt_wins_over_the_persisted_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcript = Transcript(tmp_path, "win-room")
+    stale = {
+        "profile": "astra-fable",
+        "verified": [
+            VALID_RECEIPT["verified"][0],
+            {**VALID_RECEIPT["verified"][1], "target": "fable-elsewhere"},
+        ],
+    }
+    transcript.set_profile_receipt(stale)
+    agents = {"astra": "astra-peer", "fable": "fable-peer"}
+
+    loaded = namespace["load_profile_receipt"](
+        "astra-fable", agents, {namespace["PROFILE_RECEIPT_ENV"]: valid_receipt_json}, stale
+    )
+    assert loaded == {
+        "profile": "astra-fable",
+        "verified": VALID_RECEIPT["verified"],
+    }
+
+    # A present-but-invalid environment receipt fails closed; it never falls
+    # back to the persisted payload.
+    with pytest.raises(ChatError, match="the profile receipt payload is invalid"):
+        namespace["load_profile_receipt"](
+            "astra-fable", agents, {namespace["PROFILE_RECEIPT_ENV"]: "not json"}, stale
+        )
+
+
+def test_mismatched_persisted_receipt_fails_the_room_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StaticClient(ProfileClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(module, "HerdrClient", StaticClient)
+    monkeypatch.delenv(namespace["PROFILE_RECEIPT_ENV"], raising=False)
+    agents = {"astra": "astra-peer", "fable": "fable-peer"}
+    transcript = Transcript(tmp_path, "stale-room")
+
+    roster_mismatch = {
+        "profile": "astra-fable",
+        "verified": [
+            VALID_RECEIPT["verified"][0],
+            {**VALID_RECEIPT["verified"][1], "target": "someone-else"},
+        ],
+    }
+    transcript.set_profile_receipt(roster_mismatch)
+    with pytest.raises(ChatError, match="does not match this room's agent mappings"):
+        namespace["load_profile_receipt"](
+            "astra-fable", agents, {}, transcript.profile_receipt(), room="stale-room"
+        )
+
+    profile_mismatch = {**roster_mismatch, "profile": "astra-fable-grok"}
+    transcript.set_profile_receipt(profile_mismatch)
+    with pytest.raises(ChatError, match="the profile receipt payload is invalid"):
+        namespace["load_profile_receipt"](
+            "astra-fable", agents, {}, transcript.profile_receipt(), room="stale-room"
+        )
+
+    base = [
+        "--state-dir",
+        str(tmp_path),
+        "--room",
+        "stale-room",
+        "--profile",
+        "astra-fable",
+        "--agent",
+        "astra=astra-peer",
+        "--agent",
+        "fable=fable-peer",
+        "--once",
+        "hi",
+    ]
+    assert main(base) == 2
+    assert Transcript(tmp_path, "stale-room").read() == []
+
+
+def test_absent_receipt_error_names_both_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class StaticClient(ProfileClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(module, "HerdrClient", StaticClient)
+    monkeypatch.delenv(namespace["PROFILE_RECEIPT_ENV"], raising=False)
+
+    assert (
+        main(
+            [
+                "--state-dir",
+                str(tmp_path),
+                "--room",
+                "empty-room",
+                "--profile",
+                "astra-fable",
+                "--agent",
+                "astra=astra-peer",
+                "--agent",
+                "fable=fable-peer",
+                "--once",
+                "hi",
+            ]
+        )
+        == 2
+    )
+    message = capsys.readouterr().err.strip()
+    assert message == (
+        "herdr-group-chat: the astra-fable profile room has no verified receipt in "
+        "HERDR_GROUP_CHAT_PROFILE_RECEIPT or empty-room.state.json; refusing to open"
+    )
+    assert Transcript(tmp_path, "empty-room").read() == []
+
+
+def make_static_default_client() -> type:
+    class StaticDefaultClient(FakeClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    return StaticDefaultClient
+
+
+def test_plugin_room_marks_the_live_room_for_terminal_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A room opened under Herdr records its state dir in the default directory."""
+    monkeypatch.setattr(module, "HerdrClient", make_static_default_client())
+    standalone = tmp_path / "standalone"
+    live = tmp_path / "plugin-state"
+    monkeypatch.setattr(module, "DEFAULT_STATE_DIR", standalone)
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(live))
+
+    assert main(["--room", "live-room", "--once", "@pi hello from the plugin room"]) == 0
+
+    pointer = json.loads((standalone / "live-room.live-dir.json").read_text())
+    assert pointer == {"room": "live-room", "state_dir": str(live.resolve())}
+    items = Transcript(live, "live-room").read()
+    assert items[0]["sender"] == "human"
+    assert items[0]["body"] == "hello from the plugin room"
+    assert not (standalone / "live-room.jsonl").exists()
+
+
+def test_terminal_once_appends_to_the_live_room_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plain-terminal --once round renders in the open room, not a fork.
+
+    This is the 8 September 2026 friction: the live room lives under the
+    plugin state directory a terminal does not inherit, so --once appended to
+    a same-named room in the default directory and the open TUI never saw
+    the items. The live-room pointer routes the second process to the open
+    room's transcript, whose stamp-checked render already re-reads external
+    appends.
+    """
+    monkeypatch.setattr(module, "HerdrClient", make_static_default_client())
+    standalone = tmp_path / "standalone"
+    live = tmp_path / "plugin-state"
+    monkeypatch.setattr(module, "DEFAULT_STATE_DIR", standalone)
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(live))
+    assert main(["--room", "live-room", "--once", "@pi hello from the plugin room"]) == 0
+
+    # A plain terminal: no plugin environment, no explicit --state-dir.
+    monkeypatch.delenv("HERDR_PLUGIN_STATE_DIR", raising=False)
+    assert main(["--room", "live-room", "--once", "@pi round from the terminal"]) == 0
+
+    live_view = Transcript(live, "live-room")
+    human = [item["body"] for item in live_view.read() if item["sender"] == "human"]
+    assert human == ["hello from the plugin room", "round from the terminal"]
+    assert "human> round from the terminal" in live_view.rendered_lines(100)
+    assert not (standalone / "live-room.jsonl").exists()
+
+
+def test_show_follows_the_live_room_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Read-only utilities address the same live room the pointer marks."""
+    standalone = tmp_path / "standalone"
+    live = tmp_path / "plugin-state"
+    live.mkdir(mode=0o700)
+    monkeypatch.setattr(module, "DEFAULT_STATE_DIR", standalone)
+    monkeypatch.delenv("HERDR_PLUGIN_STATE_DIR", raising=False)
+    namespace["write_live_room_pointer"]("show-room", live)
+    Transcript(live, "show-room").append("human", ("pi",), "live only line")
+
+    assert main(["--room", "show-room", "--show"]) == 0
+    assert "live only line" in capsys.readouterr().out
+
+    # Without a pointer the same invocation reads the default directory.
+    Transcript(standalone, "plain-room").append("human", ("pi",), "standalone line")
+    assert main(["--room", "plain-room", "--show"]) == 0
+    assert "standalone line" in capsys.readouterr().out
 
 
 def test_missing_receipt_fails_the_profile_room_closed(

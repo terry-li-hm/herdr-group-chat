@@ -76,6 +76,7 @@ AGENTS_WORKSPACE_ENV = "HERDR_GROUP_CHAT_AGENTS_WORKSPACE_ID"
 SETUP_FAILURES_ENV = "HERDR_GROUP_CHAT_SETUP_FAILURES"
 ROOM_TAB_ENV = "HERDR_TAB_ID"
 ROOM_LAYOUTS = ("compact", "grid", "grid2", "quad")
+LAYOUT_MODE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
 PLUGIN_ROOT = Path(__file__).resolve().parent
 LAYOUT_PLACE_TIMEOUT_S = 180
 ROOM_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
@@ -1139,8 +1140,10 @@ class Transcript:
         intent_flag = data.get("intent_enabled", True)
         if not isinstance(intent_flag, bool):
             raise ChatError("invalid room state")
+        if "profile_receipt" in data and not isinstance(data["profile_receipt"], dict):
+            raise ChatError("invalid room state")
         for key, value in data.items():
-            if key == "intent_enabled":
+            if key in {"intent_enabled", "profile_receipt"}:
                 continue
             if not isinstance(key, str) or not isinstance(value, int) or isinstance(value, bool):
                 raise ChatError("invalid room state")
@@ -1148,7 +1151,9 @@ class Transcript:
 
     def _cursors_unlocked(self) -> dict[str, int]:
         return {
-            key: value for key, value in self._state_unlocked().items() if key != "intent_enabled"
+            key: value
+            for key, value in self._state_unlocked().items()
+            if key not in {"intent_enabled", "profile_receipt"}
         }
 
     def intent_enabled(self) -> bool:
@@ -1191,6 +1196,19 @@ class Transcript:
                 os.close(descriptor)
             with suppress(FileNotFoundError):
                 os.unlink(temporary_name, dir_fd=directory_descriptor)
+
+    def profile_receipt(self) -> dict[str, Any] | None:
+        """Return the persisted receipt payload, or None when the room has none."""
+        with self._lock, self._process_lock():
+            payload = self._state_unlocked().get("profile_receipt")
+            return dict(payload) if isinstance(payload, dict) else None
+
+    def set_profile_receipt(self, payload: Mapping[str, Any]) -> None:
+        """Persist the validated receipt payload beside the cursor data."""
+        with self._lock, self._process_lock():
+            state = self._state_unlocked()
+            state["profile_receipt"] = dict(payload)
+            self._write_state_unlocked(state)
 
     def set_intent_enabled(self, enabled: bool) -> None:
         """Persist the front-door setting beside the cursor data."""
@@ -5358,23 +5376,10 @@ def parse_profile_agents(values: Sequence[str], roles: Sequence[str]) -> dict[st
     return agents
 
 
-def load_profile_receipt(
-    profile: str, agents: Mapping[str, str], environ: Mapping[str, str]
+def validate_profile_receipt_payload(
+    payload: object, profile: str, agents: Mapping[str, str]
 ) -> dict[str, Any]:
-    """Load and validate the launcher's verified receipt payload.
-
-    The payload exists only after complete native-ui verification in new-room;
-    the room fails closed without it or when its role/target set disagrees with
-    the explicit roster. Model, provider, and effort evidence is carried from
-    the single profile definition in new-room, never re-inferred here.
-    """
-    raw = environ.get(PROFILE_RECEIPT_ENV, "").strip()
-    if not raw:
-        raise ChatError(f"the {profile} profile room has no verified receipt; refusing to open")
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise ChatError("the profile receipt payload is invalid") from error
+    """Validate one receipt payload against the profile and explicit roster."""
     if not isinstance(payload, dict) or payload.get("profile") != profile:
         raise ChatError("the profile receipt payload is invalid")
     entries = payload.get("verified")
@@ -5396,6 +5401,40 @@ def load_profile_receipt(
     if len(receipt_mapping) != len(entries) or receipt_mapping != dict(agents):
         raise ChatError("the profile receipt does not match this room's agent mappings")
     return {"profile": profile, "verified": sorted(entries, key=lambda entry: entry["role"])}
+
+
+def load_profile_receipt(
+    profile: str,
+    agents: Mapping[str, str],
+    environ: Mapping[str, str],
+    persisted: Mapping[str, Any] | None = None,
+    *,
+    room: str | None = None,
+) -> dict[str, Any]:
+    """Load and validate the launcher's verified receipt payload.
+
+    The payload exists only after complete native-ui verification in new-room;
+    the room fails closed without it or when its role/target set disagrees with
+    the explicit roster. The environment receipt set by the launcher wins; a
+    plain terminal falls back to the payload persisted in the room's state
+    file at the last verified open. Model, provider, and effort evidence is
+    carried from the single profile definition in new-room, never re-inferred
+    here.
+    """
+    raw = environ.get(PROFILE_RECEIPT_ENV, "").strip()
+    if not raw:
+        if persisted is None:
+            state_file = f"{room}.state.json" if room else "the room state file"
+            raise ChatError(
+                f"the {profile} profile room has no verified receipt in "
+                f"{PROFILE_RECEIPT_ENV} or {state_file}; refusing to open"
+            )
+        return validate_profile_receipt_payload(persisted, profile, agents)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ChatError("the profile receipt payload is invalid") from error
+    return validate_profile_receipt_payload(payload, profile, agents)
 
 
 def profile_receipt_body(payload: Mapping[str, Any]) -> str:
@@ -5461,6 +5500,93 @@ def resolve_state_dir(
     if plugin_state:
         return Path(plugin_state)
     return DEFAULT_STATE_DIR
+
+
+def live_room_pointer_path(room: str) -> Path:
+    """Name the standalone pointer file that marks a plugin room as live."""
+    return DEFAULT_STATE_DIR.expanduser() / f"{room}.live-dir.json"
+
+
+def read_live_room_state_dir(room: str) -> Path | None:
+    """Return the state directory of the live plugin room, if one is marked.
+
+    A room opened under Herdr runs with HERDR_PLUGIN_STATE_DIR pointing at
+    the plugin's state directory, which a plain terminal does not have. The
+    room process marks the live room in the standalone default directory so
+    a second process can find the real transcript. Anything unreadable,
+    stale, or shaped wrong is ignored: the caller then falls back to the
+    default directory, and the Transcript constructor re-validates the
+    directory's ownership and permissions either way.
+    """
+    if ROOM_RE.fullmatch(room) is None:
+        return None
+    try:
+        with open(live_room_pointer_path(room), encoding="utf-8") as stream:
+            data = json.load(stream)
+    except (OSError, json.JSONDecodeError, UnicodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("room") != room:
+        return None
+    target = data.get("state_dir")
+    if not isinstance(target, str) or not target.strip():
+        return None
+    candidate = Path(target).expanduser()
+    if not candidate.is_absolute() or not candidate.is_dir():
+        return None
+    return candidate
+
+
+def write_live_room_pointer(room: str, state_dir: Path) -> None:
+    """Mark the live plugin room's state directory in the default directory."""
+    if ROOM_RE.fullmatch(room) is None:
+        raise ChatError("room must match [a-z0-9][a-z0-9_-]{0,31}")
+    directory = DEFAULT_STATE_DIR.expanduser()
+    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    pointer = live_room_pointer_path(room)
+    payload = (
+        json.dumps(
+            {"room": room, "state_dir": str(state_dir.resolve())},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    descriptor = os.open(
+        pointer, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def resolve_room_state_dir(
+    explicit: Path | None,
+    room: str,
+    environ: dict[str, str] | os._Environ[str] = os.environ,
+) -> Path:
+    """Resolve the state directory for one named room.
+
+    An explicit --state-dir always wins and a plugin process trusts its own
+    HERDR_PLUGIN_STATE_DIR. A plain terminal instead follows the live-room
+    pointer so a second process — for example --once — appends to the open
+    room's transcript instead of forking a same-named room in the default
+    directory, and only falls back to the default directory when no live
+    room is marked.
+    """
+    if explicit is not None:
+        return explicit
+    plugin_state = environ.get("HERDR_PLUGIN_STATE_DIR", "").strip()
+    if plugin_state:
+        return Path(plugin_state)
+    return read_live_room_state_dir(room) or DEFAULT_STATE_DIR
 
 
 def _message_meta(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -6364,21 +6490,26 @@ def focus_label(chat: GroupChat) -> str:
     return "To: @" + ",@".join(focus)
 
 
+def layout_usage() -> str:
+    """Render the /layout usage line from the one layout tuple."""
+    return f"Usage: /layout {'|'.join(ROOM_LAYOUTS)}"
+
+
 def place_room_layout(
     mode: str,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> str:
     """Re-run the launcher's placement step for `mode` and render its result.
 
-    The launcher owns placement, so the room never issues a pane command
-    itself: it waits for `./new-room --place <mode>` — run from the plugin
-    root with the room's own environment — and renders the single JSON
-    result line, or the launcher's error message when it exits non-zero.
-    Placement records the caller's focus and restores it, so this never
-    focuses anything in the room process.
+    The launcher owns placement and layout validation, so the room never
+    second-guesses the layout name: any single layout-shaped token is passed
+    through to `./new-room --place <mode>` — run from the plugin root with the
+    room's own environment — and the launcher's own error line is surfaced
+    verbatim when it exits non-zero. Placement records the caller's focus and
+    restores it, so this never focuses anything in the room process.
     """
-    if mode not in ROOM_LAYOUTS:
-        raise ChatError("Usage: /layout compact|grid|grid2|quad")
+    if LAYOUT_MODE_RE.fullmatch(mode) is None:
+        raise ChatError(layout_usage())
     try:
         result = runner(
             ["./new-room", "--place", mode],
@@ -6468,7 +6599,7 @@ def handle_local_command(
             "/goal [@agents] OBJECTIVE [--rounds N] [--budget MINUTES] · "
             "/retry <agent|synthesis> · /cancel · /agents · /intent on|off|status · "
             "/council status · /council export PATH · /council resume · /minutes [PATH] · "
-            "/show <agent> · /layout compact|grid|grid2|quad · /inbox · /lanes · /room · "
+            f"/show <agent> · /layout {'|'.join(ROOM_LAYOUTS)} · /inbox · /lanes · /room · "
             "PgUp/PgDn · mouse wheel scrolls "
             "· Home/End jump · @ opens a mention picker "
             "(Tab completes, Esc closes)"
@@ -6477,8 +6608,8 @@ def handle_local_command(
         if reviews is not None and reviews.is_active():
             return "A council round is running; use /cancel or wait before sending."
         mode = stripped.removeprefix("/layout").strip()
-        if mode not in ROOM_LAYOUTS:
-            return "Usage: /layout compact|grid|grid2|quad"
+        if LAYOUT_MODE_RE.fullmatch(mode) is None:
+            return layout_usage()
         try:
             line = place_room_layout(mode, layout_runner)
         except ChatError as error:
@@ -7173,7 +7304,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     transcript: Transcript | None = None
     try:
-        transcript = Transcript(resolve_state_dir(args.state_dir), args.room)
+        transcript = Transcript(resolve_room_state_dir(args.state_dir, args.room, os.environ), args.room)
         if args.council_status:
             terminal_print(council_status_message(transcript.read()))
             return 0
@@ -7191,7 +7322,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.profile:
             agents = parse_profile_agents(args.agent, PROFILE_ROLES[args.profile])
-            receipt = load_profile_receipt(args.profile, agents, os.environ)
+            receipt = load_profile_receipt(
+                args.profile,
+                agents,
+                os.environ,
+                transcript.profile_receipt(),
+                room=args.room,
+            )
+            if os.environ.get(PROFILE_RECEIPT_ENV, "").strip():
+                transcript.set_profile_receipt(receipt)
         else:
             agents = parse_agent_overrides(args.agent)
             receipt = None
@@ -7217,6 +7356,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             synthesizer=synthesizer,
             agent_timeouts=agent_timeouts,
         )
+        # A room process under Herdr knows the plugin state directory; a plain
+        # terminal does not, so mark the live room in the default directory
+        # before any room work so second processes append to this transcript.
+        plugin_state = os.environ.get("HERDR_PLUGIN_STATE_DIR", "").strip()
+        default_state = DEFAULT_STATE_DIR.expanduser().resolve()
+        if (
+            plugin_state
+            and Path(plugin_state).resolve() != default_state
+            and transcript.state_dir.resolve() != default_state
+        ):
+            with suppress(OSError):
+                write_live_room_pointer(args.room, transcript.state_dir)
         # An exact once-resume must stay append-free on every refusal path, so
         # it is detected before any launch-time transcript write and skips both
         # setup-failure and startup receipt records; the validated receipt is
