@@ -1470,11 +1470,17 @@ class HerdrClient:
                     self._complete_turn(reply_marker_id)
                     return submitted_status, reply
         else:
-            self._run_interruptible(
+            prompt_result = self._run_interruptible(
                 ["agent", "prompt", target, submitted_prompt],
                 cancel_event,
                 timeout=max(1, min(30, effective_timeout_ms / 1000)),
             )
+            # Bind the recipient to the exact session Herdr reported for the
+            # accepted submission when that record is valid; otherwise the
+            # first valid poll record binds. This observes Herdr's record and
+            # makes no cryptographic sender-identity claim.
+            submitted_agent = self._prompt_result_agent(prompt_result)
+        bound_identity = self._recipient_identity(target, submitted_agent)
         stable_unmarked = 0
         last_unmarked_read: str | None = None
         while True:
@@ -1502,10 +1508,34 @@ class HerdrClient:
                 raise ChatError("review cancelled")
             if status == "blocked":
                 return "blocked", ""
+            # A changed session, cwd, terminal, or harness identity must be
+            # rejected before any reader can use a replacement session. Once
+            # a valid binding exists, missing, malformed, or foreign-harness
+            # metadata is a changed identity too; the metadata-absent legacy
+            # fallback applies only before any binding was established.
+            identity = self._recipient_identity(target, agent_info)
+            if bound_identity is None:
+                bound_identity = identity
+            elif identity is None or identity != bound_identity:
+                raise ChatError(
+                    f"recipient identity changed for {target}; refusing to "
+                    "read a replacement session"
+                )
             if status == "working":
                 saw_working = True
                 stable_unmarked = 0
                 last_unmarked_read = None
+                # While still working, only the exact session readers may
+                # settle the turn; the terminal is never scrolled and the
+                # observed working status is reported truthfully.
+                reply = self._local_claude_reply(target, reply_marker_id, agent_info)
+                if reply is None:
+                    reply = self._local_pi_reply(target, reply_marker_id, agent_info)
+                if reply is not None:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise ChatError("review cancelled")
+                    self._complete_turn(reply_marker_id)
+                    return status, reply
             elif status in {"idle", "done"} and (
                 saw_working or time.monotonic() - submitted_at >= SUBMIT_GRACE_S
             ):
@@ -1535,7 +1565,7 @@ class HerdrClient:
                     try:
                         reply = extract_reply(terminal, reply_marker_id)
                     except ChatError:
-                        grok_reply = self._local_grok_reply(target, reply_marker_id)
+                        grok_reply = self._local_grok_reply(target, reply_marker_id, agent_info)
                         if grok_reply is not None:
                             self._complete_turn(reply_marker_id)
                             return status, grok_reply
@@ -1557,6 +1587,55 @@ class HerdrClient:
                 cancel_event.wait(pause)
             else:
                 time.sleep(pause)
+
+    @staticmethod
+    def _recipient_identity(target: str, agent: dict[str, Any] | None) -> tuple[Any, ...] | None:
+        """Return the observed Herdr record binding for a supported seat.
+
+        A valid record carries the harness, the working directory, and a
+        session descriptor validated against the harness's expected source
+        (pi, claude, codex, or grok); the descriptor's agent/kind and the
+        pane_id/terminal_id join the binding when Herdr reports them. Absent
+        or partial metadata yields None before any binding exists, so
+        terminal-only collection keeps its existing behavior. This binds
+        Herdr's observed record; it is not sender authentication.
+        """
+        if not isinstance(agent, dict) or agent.get("agent") not in (
+            "pi",
+            "claude",
+            "codex",
+            "grok",
+        ):
+            return None
+        name = agent.get("name")
+        pane_id = agent.get("pane_id")
+        if name != target and not (
+            isinstance(name, str) and isinstance(pane_id, str) and pane_id == target
+        ):
+            return None
+        cwd = agent.get("cwd")
+        session = agent.get("agent_session")
+        if not isinstance(cwd, str) or not isinstance(session, dict):
+            return None
+        expected_source = {
+            "pi": "herdr:pi",
+            "claude": "herdr:claude",
+            "codex": "herdr:codex",
+            "grok": "herdr:grok",
+        }[agent["agent"]]
+        if session.get("source") != expected_source or not isinstance(session.get("value"), str):
+            return None
+        identity: list[Any] = [agent["agent"], cwd, session["source"], session["value"]]
+        for source, key in (
+            (session, "agent"),
+            (session, "kind"),
+            (agent, "pane_id"),
+            (agent, "terminal_id"),
+        ):
+            value = source.get(key)
+            if isinstance(value, str):
+                identity.append((key, value))
+        return tuple(identity)
 
     @staticmethod
     def _turn_nudge(agent: str, token: str, path: Path) -> str:
@@ -1709,11 +1788,19 @@ class HerdrClient:
         except (ChatError, KeyError, TypeError, json.JSONDecodeError, OSError):
             return None
 
-    def _local_grok_reply(self, target: str, token: str) -> str | None:
-        """Recover a Grok reply hidden above its alternate-screen viewport."""
+    def _local_grok_reply(
+        self, target: str, token: str, agent: dict[str, Any] | None = None
+    ) -> str | None:
+        """Recover a Grok reply hidden above its alternate-screen viewport.
+
+        When the caller already holds an identity-validated poll record, that
+        exact record is used; the direct lookup remains the default so a
+        standalone call never invents metadata.
+        """
         try:
-            result = self._run(["agent", "get", target])
-            agent = json.loads(result.stdout)["result"]["agent"]
+            if agent is None:
+                result = self._run(["agent", "get", target])
+                agent = json.loads(result.stdout)["result"]["agent"]
             session = agent["agent_session"]
             if agent["agent"] != "grok" or session["source"] != "herdr:grok":
                 return None
@@ -7304,7 +7391,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     transcript: Transcript | None = None
     try:
-        transcript = Transcript(resolve_room_state_dir(args.state_dir, args.room, os.environ), args.room)
+        transcript = Transcript(
+            resolve_room_state_dir(args.state_dir, args.room, os.environ), args.room
+        )
         if args.council_status:
             terminal_print(council_status_message(transcript.read()))
             return 0

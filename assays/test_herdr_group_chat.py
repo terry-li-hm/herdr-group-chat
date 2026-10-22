@@ -3318,7 +3318,7 @@ def test_turn_prefers_exact_claude_session_over_contaminated_terminal(
 
     status, body = client.turn("claude-peer", prompt, timeout_ms=5_000)
 
-    assert status == "idle"
+    assert status == "working"
     assert body == "clean Claude reply"
     # Direct terminal extraction of the same contaminated capture would include
     # the prompt-summary artifact, proving the clean session was preferred.
@@ -3584,7 +3584,7 @@ def test_turn_prefers_exact_pi_session_over_quiet_terminal(
 
     status, body = client.turn("pi-peer", prompt, timeout_ms=5_000)
 
-    assert (status, body) == ("idle", "clean Pi reply")
+    assert (status, body) == ("working", "clean Pi reply")
     # The exact session is preferred before the terminal is read at all, so
     # the quiet pane can never reach the unmarked-stability failure.
     assert not any(call[1:3] == ["agent", "read"] for call in calls)

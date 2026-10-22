@@ -550,7 +550,14 @@ route and records a non-secret `ROUTE_RECEIPT`; addressing `@all` never
 transfers one agent's eligibility to another.
 
 The relay waits up to ten minutes for an agent turn so an interactive approval
-can be completed in the native agent pane. Grok's alternate-screen TUI can hide
+can be completed in the native agent pane. For Pi and Claude, a complete
+request-token-matched reply in the exact session record can finish collection
+while the native agent remains working. The collector preserves that observed
+status and never scrolls a working terminal. Once a valid recipient identity
+is bound, changed or missing session, harness, cwd or terminal metadata stops
+collection before a replacement session can be read. These checks bind Herdr's
+observed record; they do not authenticate the sender or validate its answer.
+Grok's alternate-screen TUI can hide
 a completed reply above the visible viewport; when that happens, the plugin
 recovers only the token-bound reply from the active local Grok session history.
 
