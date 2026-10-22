@@ -56,9 +56,10 @@ with a nonzero exit.
 # links it under a unique temporary plugin id, and unlinks only that id.
 ./release-smoke candidate --plugin-root . --agent-cwd <isolated caller cwd>
 
-# Installed plugin: verifies the exact version and never links or unlinks.
+# Installed plugin: use the version read from that installation's manifest.
+# This command verifies the exact version and never links or unlinks.
 ./release-smoke installed --plugin-id terry.herdr-group-chat \
-  --expected-version 0.10.6 --agent-cwd <isolated caller cwd>
+  --expected-version <installed-version> --agent-cwd <isolated caller cwd>
 ```
 
 Each run starts a unique named Herdr session (its name is preflighted for
